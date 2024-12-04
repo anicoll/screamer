@@ -56,11 +56,11 @@ func ScreamCommand() *cli.Command {
 			Value:       "",
 			DefaultText: "End timestamp with RFC3339 format (default: indefinite)",
 		},
-		&cli.StringFlag{
+		&cli.DurationFlag{
 			Name:     "heartbeat-interval",
 			EnvVars:  []string{"HEARTBEAT_INTERVAL"},
 			Required: false,
-			Value:    "10",
+			Value:    10,
 		},
 		&cli.StringFlag{
 			Name:        "partition-dsn",
