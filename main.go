@@ -4,7 +4,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/anicoll/scream/cmd"
+	"github.com/anicoll/screamer/cmd"
 	"github.com/urfave/cli/v2"
 )
 

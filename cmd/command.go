@@ -12,10 +12,10 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
-	"github.com/anicoll/scream/pkg/model"
-	"github.com/anicoll/scream/pkg/partitionstorage"
-	"github.com/anicoll/scream/pkg/scream"
-	"github.com/anicoll/scream/pkg/signal"
+	"github.com/anicoll/screamer/pkg/model"
+	"github.com/anicoll/screamer/pkg/partitionstorage"
+	"github.com/anicoll/screamer/pkg/scream"
+	"github.com/anicoll/screamer/pkg/signal"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sync/errgroup"
 )

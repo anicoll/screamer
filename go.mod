@@ -1,4 +1,4 @@
-module github.com/anicoll/scream
+module github.com/anicoll/screamer
 
 go 1.23.2
 

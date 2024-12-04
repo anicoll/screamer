@@ -2,4 +2,4 @@
 
 .PHONY: build
 build:
-	go build -o .bin/scream main.go
+	go build -o .bin/screamer main.go

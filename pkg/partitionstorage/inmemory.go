@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anicoll/scream/pkg/model"
-	"github.com/anicoll/scream/pkg/scream"
+	"github.com/anicoll/screamer/pkg/model"
+	"github.com/anicoll/screamer/pkg/scream"
 )
 
 // InmemoryPartitionStorage implements PartitionStorage that stores PartitionMetadata in memory.

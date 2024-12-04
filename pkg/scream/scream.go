@@ -9,7 +9,7 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
-	"github.com/anicoll/scream/pkg/model"
+	"github.com/anicoll/screamer/pkg/model"
 	"golang.org/x/sync/errgroup"
 )
 

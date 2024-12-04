@@ -9,8 +9,8 @@ import (
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
-	"github.com/anicoll/scream/pkg/model"
-	"github.com/anicoll/scream/pkg/scream"
+	"github.com/anicoll/screamer/pkg/model"
+	"github.com/anicoll/screamer/pkg/scream"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 )

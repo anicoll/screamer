@@ -1,6 +1,6 @@
 package scream
 
-import "github.com/anicoll/scream/pkg/model"
+import "github.com/anicoll/screamer/pkg/model"
 
 // Consumer is the interface to consume the DataChangeRecord.
 //
