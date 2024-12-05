@@ -10,7 +10,7 @@ import (
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/anicoll/screamer/pkg/model"
-	"github.com/anicoll/screamer/pkg/scream"
+	"github.com/anicoll/screamer/pkg/screamer"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 )
@@ -292,4 +292,4 @@ func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition
 }
 
 // Assert that SpannerPartitionStorage implements PartitionStorage.
-var _ scream.PartitionStorage = (*SpannerPartitionStorage)(nil)
+var _ screamer.PartitionStorage = (*SpannerPartitionStorage)(nil)

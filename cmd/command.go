@@ -14,7 +14,7 @@ import (
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/anicoll/screamer/pkg/model"
 	"github.com/anicoll/screamer/pkg/partitionstorage"
-	"github.com/anicoll/screamer/pkg/scream"
+	"github.com/anicoll/screamer/pkg/screamer"
 	"github.com/anicoll/screamer/pkg/signal"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sync/errgroup"
@@ -22,7 +22,7 @@ import (
 
 var defaultHeartbeatInterval time.Duration = 10
 
-func ScreamCommand() *cli.Command {
+func ScreamerCommand() *cli.Command {
 	flags := []cli.Flag{
 		&cli.StringFlag{
 			Name:     "dsn",
@@ -97,8 +97,8 @@ func ScreamCommand() *cli.Command {
 	}
 }
 
-func buildConfig(c *cli.Context) *scream.Config {
-	cfg := &scream.Config{}
+func buildConfig(c *cli.Context) *screamer.Config {
+	cfg := &screamer.Config{}
 	cfg.DSN = c.String("dsn")
 
 	if c.IsSet("heartbeat-interval") {
@@ -147,7 +147,7 @@ func (l *jsonOutputConsumer) Consume(change *model.DataChangeRecord) error {
 	return json.NewEncoder(l.out).Encode(change)
 }
 
-func run(ctx context.Context, cfg *scream.Config) error {
+func run(ctx context.Context, cfg *screamer.Config) error {
 	spannerClient, err := spanner.NewClient(ctx, cfg.DSN)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -155,7 +155,7 @@ func run(ctx context.Context, cfg *scream.Config) error {
 	}
 	defer spannerClient.Close()
 
-	var partitionStorage scream.PartitionStorage
+	var partitionStorage screamer.PartitionStorage
 	if *cfg.MetadataTable == "" {
 		partitionStorage = partitionstorage.NewInmemory()
 	} else {
@@ -172,21 +172,21 @@ func run(ctx context.Context, cfg *scream.Config) error {
 		partitionStorage = ps
 	}
 
-	options := []scream.Option{}
+	options := []screamer.Option{}
 	if cfg.Start != nil && !cfg.Start.IsZero() {
-		options = append(options, scream.WithStartTimestamp(*cfg.Start))
+		options = append(options, screamer.WithStartTimestamp(*cfg.Start))
 	}
 	if cfg.End != nil && !cfg.End.IsZero() {
-		options = append(options, scream.WithEndTimestamp(*cfg.End))
+		options = append(options, screamer.WithEndTimestamp(*cfg.End))
 	}
 	if *cfg.HeartbeatInterval != 0 {
-		options = append(options, scream.WithHeartbeatInterval(*cfg.HeartbeatInterval))
+		options = append(options, screamer.WithHeartbeatInterval(*cfg.HeartbeatInterval))
 	}
 	if cfg.Priority != int32(spannerpb.RequestOptions_PRIORITY_UNSPECIFIED) {
-		options = append(options, scream.WithSpannerRequestPriotiry(spannerpb.RequestOptions_Priority(cfg.Priority)))
+		options = append(options, screamer.WithSpannerRequestPriotiry(spannerpb.RequestOptions_Priority(cfg.Priority)))
 	}
 
-	subscriber := scream.NewSubscriber(spannerClient, cfg.Stream, partitionStorage, options...)
+	subscriber := screamer.NewSubscriber(spannerClient, cfg.Stream, partitionStorage, options...)
 	consumer := &jsonOutputConsumer{out: os.Stdout}
 
 	return subscriber.Subscribe(ctx, consumer)

@@ -1,4 +1,4 @@
-package scream
+package screamer
 
 import "time"
 

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/anicoll/screamer/pkg/model"
-	"github.com/anicoll/screamer/pkg/scream"
+	"github.com/anicoll/screamer/pkg/screamer"
 )
 
 // InmemoryPartitionStorage implements PartitionStorage that stores PartitionMetadata in memory.
@@ -150,4 +150,4 @@ func (s *InmemoryPartitionStorage) UpdateWatermark(ctx context.Context, partitio
 }
 
 // Assert that InmemoryPartitionStorage implements PartitionStorage.
-var _ scream.PartitionStorage = (*InmemoryPartitionStorage)(nil)
+var _ screamer.PartitionStorage = (*InmemoryPartitionStorage)(nil)
