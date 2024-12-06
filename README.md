@@ -32,6 +32,7 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"github.com/anicoll/screamer"
+	"github.com/anicoll/screamer/pkg/model"
 	"github.com/anicoll/screamer/partitionstorage"
 )
 
@@ -53,7 +54,7 @@ func main() {
 	}
 
 	changeStreamName := "FooStream"
-	subscriber := spream.NewSubscriber(spannerClient, changeStreamName, partitionStorage)
+	subscriber := screamer.NewSubscriber(spannerClient, changeStreamName, partitionStorage)
 
 	fmt.Fprintf(os.Stderr, "Reading the stream...\n")
 	logger := &Logger{out: os.Stdout}
@@ -67,7 +68,7 @@ type Logger struct {
 	mu  sync.Mutex
 }
 
-func (l *Logger) Consume(change *spream.DataChangeRecord) error {
+func (l *Logger) Consume(change *model.DataChangeRecord) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return json.NewEncoder(l.out).Encode(change)
