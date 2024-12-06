@@ -135,6 +135,7 @@ func (c *consumer) Consume(change *model.DataChangeRecord) error {
 }
 
 func (s *IntegrationTestSuite) TestSubscriber() {
+	s.T().Skip("Skip integration test until resolution for emulator issue")
 	ctx := context.Background()
 
 	spannerClient, err := spanner.NewClient(ctx, s.dsn)
