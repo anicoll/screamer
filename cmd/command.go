@@ -20,7 +20,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var defaultHeartbeatInterval time.Duration = 10
+var defaultHeartbeatInterval time.Duration = 10 * time.Second
 
 func ScreamerCommand() *cli.Command {
 	flags := []cli.Flag{
@@ -47,20 +47,20 @@ func ScreamerCommand() *cli.Command {
 			EnvVars:     []string{"START"},
 			Required:    false,
 			Value:       "",
-			DefaultText: "Start timestamp with RFC3339 format (default: current timestamp)",
+			DefaultText: "Start timestamp with RFC3339 format, default: current timestamp",
 		},
 		&cli.StringFlag{
 			Name:        "end",
 			EnvVars:     []string{"END"},
 			Required:    false,
 			Value:       "",
-			DefaultText: "End timestamp with RFC3339 format (default: indefinite)",
+			DefaultText: "End timestamp with RFC3339 format default: indefinite",
 		},
 		&cli.DurationFlag{
 			Name:     "heartbeat-interval",
 			EnvVars:  []string{"HEARTBEAT_INTERVAL"},
 			Required: false,
-			Value:    10,
+			Value:    defaultHeartbeatInterval,
 		},
 		&cli.StringFlag{
 			Name:        "partition-dsn",
@@ -71,7 +71,7 @@ func ScreamerCommand() *cli.Command {
 		},
 	}
 	return &cli.Command{
-		Name:  "sop-pipeline",
+		Name:  "screamer",
 		Flags: flags,
 		Action: func(c *cli.Context) error {
 			cfg := buildConfig(c)
@@ -104,10 +104,7 @@ func buildConfig(c *cli.Context) *screamer.Config {
 	if c.IsSet("heartbeat-interval") {
 		dur := c.Duration("heartbeat-interval")
 		cfg.HeartbeatInterval = &dur
-	} else {
-		cfg.HeartbeatInterval = &defaultHeartbeatInterval
 	}
-
 	cfg.MetadataTable = nillableString(c, "metadata-table")
 	cfg.PartitionDSN = nillableString(c, "partition-dsn")
 	if cfg.PartitionDSN == nil {
