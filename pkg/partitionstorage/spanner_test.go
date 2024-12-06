@@ -13,6 +13,7 @@ import (
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
 	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
+	"github.com/anicoll/screamer/internal/helper"
 	"github.com/anicoll/screamer/pkg/model"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
@@ -49,7 +50,7 @@ func (s *SpannerTestSuite) SetupSuite() {
 
 	envVars := make(map[string]string)
 	var err error
-	s.container, err = NewTestContainer(s.ctx, image, envVars, ports, wait.ForLog("gRPC server listening at"))
+	s.container, err = helper.NewTestContainer(s.ctx, image, envVars, ports, wait.ForLog("gRPC server listening at"))
 	s.NoError(err)
 
 	mappedPort, err := s.container.MappedPort(s.ctx, "9010")
