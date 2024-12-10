@@ -2,6 +2,7 @@ package screamer_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"testing"
@@ -129,8 +130,12 @@ type consumer struct {
 	changes []*model.DataChangeRecord
 }
 
-func (c *consumer) Consume(change *model.DataChangeRecord) error {
-	c.changes = append(c.changes, change)
+func (c *consumer) Consume(change []byte) error {
+	dcr := &model.DataChangeRecord{}
+	if err := json.Unmarshal(change, dcr); err != nil {
+		return err
+	}
+	c.changes = append(c.changes, dcr)
 	return nil
 }
 
