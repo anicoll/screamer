@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
-	"github.com/anicoll/screamer/pkg/model"
 	"github.com/anicoll/screamer/pkg/partitionstorage"
 	"github.com/anicoll/screamer/pkg/screamer"
 	"github.com/anicoll/screamer/pkg/signal"
@@ -138,10 +136,11 @@ type jsonOutputConsumer struct {
 	mu  sync.Mutex
 }
 
-func (l *jsonOutputConsumer) Consume(change *model.DataChangeRecord) error {
+func (l *jsonOutputConsumer) Consume(change []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return json.NewEncoder(l.out).Encode(change)
+	_, err := l.out.Write(change)
+	return err
 }
 
 func run(ctx context.Context, cfg *screamer.Config) error {

@@ -2,6 +2,7 @@ package screamer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -303,7 +304,11 @@ func (s *Subscriber) handle(ctx context.Context, p *model.PartitionMetadata, rec
 	var watermarker watermarker
 	for _, cr := range records {
 		for _, record := range cr.DataChangeRecords {
-			if err := s.consumer.Consume(record.DecodeToNonSpannerType()); err != nil {
+			out, err := json.Marshal(record.DecodeToNonSpannerType())
+			if err != nil {
+				return err
+			}
+			if err := s.consumer.Consume(out); err != nil {
 				return err
 			}
 			watermarker.set(record.CommitTimestamp)
