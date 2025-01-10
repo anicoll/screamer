@@ -7,7 +7,7 @@ require (
 	github.com/go-faker/faker/v4 v4.5.0
 	github.com/google/go-cmp v0.6.0
 	github.com/stretchr/testify v1.10.0
-	github.com/testcontainers/testcontainers-go v0.34.0
+	github.com/testcontainers/testcontainers-go v0.35.0
 	github.com/urfave/cli/v2 v2.27.5
 	golang.org/x/sync v0.10.0
 	google.golang.org/api v0.216.0
