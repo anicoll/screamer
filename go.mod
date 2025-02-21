@@ -3,7 +3,7 @@ module github.com/anicoll/screamer
 go 1.23.2
 
 require (
-	cloud.google.com/go/spanner v1.76.0
+	cloud.google.com/go/spanner v1.76.1
 	github.com/go-faker/faker/v4 v4.6.0
 	github.com/google/go-cmp v0.6.0
 	github.com/stretchr/testify v1.10.0
