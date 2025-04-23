@@ -10,7 +10,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.36.0
 	github.com/urfave/cli/v2 v2.27.6
 	golang.org/x/sync v0.13.0
-	google.golang.org/api v0.229.0
+	google.golang.org/api v0.230.0
 	google.golang.org/grpc v1.72.0
 )
 
