@@ -4,7 +4,7 @@ go 1.23.2
 
 require (
 	cloud.google.com/go/spanner v1.80.0
-	github.com/go-faker/faker/v4 v4.6.0
+	github.com/go-faker/faker/v4 v4.6.1
 	github.com/google/go-cmp v0.7.0
 	github.com/stretchr/testify v1.10.0
 	github.com/testcontainers/testcontainers-go v0.37.0
