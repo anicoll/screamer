@@ -9,6 +9,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/testcontainers/testcontainers-go v0.37.0
 	github.com/urfave/cli/v2 v2.27.6
+	github.com/urfave/cli/v3 v3.3.3
 	golang.org/x/sync v0.14.0
 	google.golang.org/api v0.232.0
 	google.golang.org/grpc v1.72.0
