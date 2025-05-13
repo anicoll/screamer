@@ -18,7 +18,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var defaultHeartbeatInterval time.Duration = 10 * time.Second
+var defaultHeartbeatInterval time.Duration = 3 * time.Second
 
 func ScreamerCommand() *cli.Command {
 	flags := []cli.Flag{
@@ -72,7 +72,10 @@ func ScreamerCommand() *cli.Command {
 		Name:  "screamer",
 		Flags: flags,
 		Action: func(c *cli.Context) error {
-			cfg := buildConfig(c)
+			cfg, err := buildConfig(c)
+			if err != nil {
+				return err
+			}
 
 			eg, ctx := errgroup.WithContext(c.Context)
 
@@ -95,24 +98,36 @@ func ScreamerCommand() *cli.Command {
 	}
 }
 
-func buildConfig(c *cli.Context) *screamer.Config {
+func buildConfig(c *cli.Context) (*screamer.Config, error) {
 	cfg := &screamer.Config{}
 	cfg.DSN = c.String("dsn")
+	cfg.Stream = c.String("stream")
 
-	if c.IsSet("heartbeat-interval") {
-		dur := c.Duration("heartbeat-interval")
-		cfg.HeartbeatInterval = &dur
-	}
+	dur := c.Duration("heartbeat-interval")
+	cfg.HeartbeatInterval = &dur
+
 	cfg.MetadataTable = nillableString(c, "metadata-table")
 	cfg.PartitionDSN = nillableString(c, "partition-dsn")
 	if cfg.PartitionDSN == nil {
 		cfg.PartitionDSN = &cfg.DSN
 	}
 
-	cfg.End = nillableTimestamp(c, "end")
-	cfg.Start = nillableTimestamp(c, "start")
+	if endTime := nillableString(c, "end"); endTime != nil {
+		t, err := time.Parse(time.RFC3339, *endTime)
+		if err != nil {
+			return nil, err
+		}
+		cfg.End = &t
+	}
+	if startTime := nillableString(c, "start"); startTime != nil {
+		t, err := time.Parse(time.RFC3339, *startTime)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Start = &t
+	}
 
-	return cfg
+	return cfg, nil
 }
 
 func nillableString(c *cli.Context, str string) *string {
@@ -153,17 +168,17 @@ func run(ctx context.Context, cfg *screamer.Config) error {
 
 	var partitionStorage screamer.PartitionStorage
 	if *cfg.MetadataTable == "" {
-		partitionStorage = partitionstorage.NewInmemory()
+		// partitionStorage = partitionstorage.NewInmemory()
 	} else {
 		partitionSpannerClient, err := spanner.NewClient(ctx, *cfg.PartitionDSN)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 		ps := partitionstorage.NewSpanner(partitionSpannerClient, *cfg.MetadataTable)
 		if err := ps.CreateTableIfNotExists(ctx); err != nil {
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 		partitionStorage = ps
 	}

@@ -14,6 +14,7 @@ type PartitionMetadata struct {
 	ScheduledAt     *time.Time `spanner:"ScheduledAt" json:"scheduled_at,omitempty"`
 	RunningAt       *time.Time `spanner:"RunningAt" json:"running_at,omitempty"`
 	FinishedAt      *time.Time `spanner:"FinishedAt" json:"finished_at,omitempty"`
+	RunnerID        *string    `spanner:"RunnerID" json:"runner_id,omitempty"`
 }
 
 type State string

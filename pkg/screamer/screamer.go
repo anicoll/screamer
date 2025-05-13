@@ -11,6 +11,7 @@ import (
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/anicoll/screamer/pkg/model"
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -18,9 +19,10 @@ type PartitionStorage interface {
 	GetUnfinishedMinWatermarkPartition(ctx context.Context) (*model.PartitionMetadata, error)
 	GetInterruptedPartitions(ctx context.Context) ([]*model.PartitionMetadata, error)
 	InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error
-	GetSchedulablePartitions(ctx context.Context, minWatermark time.Time) ([]*model.PartitionMetadata, error)
+	// GetSchedulablePartitions(ctx context.Context, minWatermark time.Time) ([]*model.PartitionMetadata, error)
+	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*model.PartitionMetadata, error)
 	AddChildPartitions(ctx context.Context, parentPartition *model.PartitionMetadata, childPartitionsRecord *model.ChildPartitionsRecord) error
-	UpdateToScheduled(ctx context.Context, partitions []*model.PartitionMetadata) error
+	// UpdateToScheduled(ctx context.Context, partitions []*model.PartitionMetadata) error
 	UpdateToRunning(ctx context.Context, partition *model.PartitionMetadata) error
 	UpdateToFinished(ctx context.Context, partition *model.PartitionMetadata) error
 	UpdateWatermark(ctx context.Context, partition *model.PartitionMetadata, watermark time.Time) error
@@ -30,6 +32,7 @@ type PartitionStorage interface {
 type Subscriber struct {
 	spannerClient          *spanner.Client
 	streamName             string
+	runnerID               string
 	startTimestamp         time.Time
 	endTimestamp           time.Time
 	heartbeatInterval      time.Duration
@@ -136,6 +139,7 @@ func NewSubscriber(
 		heartbeatInterval:      c.heartbeatInterval,
 		spannerRequestPriority: c.spannerRequestPriority,
 		partitionStorage:       partitionStorage,
+		runnerID:               uuid.NewString(),
 	}
 }
 
@@ -222,17 +226,25 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 		return errDone
 	}
 
-	// To make sure changes for a key is processed in timestamp order, wait until the records returned from all parents have been processed.
-	partitions, err := s.partitionStorage.GetSchedulablePartitions(ctx, minWatermarkPartition.Watermark)
+	// // To make sure changes for a key is processed in timestamp order, wait until the records returned from all parents have been processed.
+	// partitions, err := s.partitionStorage.GetSchedulablePartitions(ctx, minWatermarkPartition.Watermark)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to get schedulable partitions: %w", err)
+	// }
+	// if len(partitions) == 0 {
+	// 	return nil
+	// }
+
+	// if err := s.partitionStorage.UpdateToScheduled(ctx, partitions); err != nil {
+	// 	return fmt.Errorf("failed to update to scheduled: %w", err)
+	// }
+
+	partitions, err := s.partitionStorage.GetAndSchedulePartitions(ctx, minWatermarkPartition.Watermark, s.runnerID)
 	if err != nil {
 		return fmt.Errorf("failed to get schedulable partitions: %w", err)
 	}
 	if len(partitions) == 0 {
 		return nil
-	}
-
-	if err := s.partitionStorage.UpdateToScheduled(ctx, partitions); err != nil {
-		return fmt.Errorf("failed to update to scheduled: %w", err)
 	}
 
 	for _, p := range partitions {

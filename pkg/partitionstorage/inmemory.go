@@ -80,6 +80,26 @@ func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context,
 	return partitions, nil
 }
 
+func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*model.PartitionMetadata, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	partitions := []*model.PartitionMetadata{}
+	now := time.Now()
+
+	for _, p := range s.m {
+		if p.State == model.StateCreated && !minWatermark.After(p.StartTimestamp) {
+			p = s.m[p.PartitionToken]
+			p.ScheduledAt = &now
+			p.State = model.StateScheduled
+			p.RunnerID = &runnerID
+			partitions = append(partitions, p)
+		}
+	}
+
+	return partitions, nil
+}
+
 func (s *InmemoryPartitionStorage) AddChildPartitions(ctx context.Context, parent *model.PartitionMetadata, r *model.ChildPartitionsRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

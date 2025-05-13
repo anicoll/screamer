@@ -68,6 +68,7 @@ const (
 	columnScheduledAt     = "ScheduledAt"
 	columnRunningAt       = "RunningAt"
 	columnFinishedAt      = "FinishedAt"
+	columnRunnerID        = "RunnerID"
 )
 
 func (s *SpannerPartitionStorage) CreateTableIfNotExists(ctx context.Context) error {
@@ -89,6 +90,7 @@ func (s *SpannerPartitionStorage) CreateTableIfNotExists(ctx context.Context) er
   %[10]s TIMESTAMP OPTIONS (allow_commit_timestamp=true),
   %[11]s TIMESTAMP OPTIONS (allow_commit_timestamp=true),
   %[12]s TIMESTAMP OPTIONS (allow_commit_timestamp=true),
+  %[13]s STRING(MAX),
 ) PRIMARY KEY (%[2]s), ROW DELETION POLICY (OLDER_THAN(%[12]s, INTERVAL 1 DAY))`,
 		s.tableName,
 		columnPartitionToken,
@@ -102,6 +104,7 @@ func (s *SpannerPartitionStorage) CreateTableIfNotExists(ctx context.Context) er
 		columnScheduledAt,
 		columnRunningAt,
 		columnFinishedAt,
+		columnRunnerID,
 	)
 
 	req := &databasepb.UpdateDatabaseDdlRequest{
@@ -191,6 +194,52 @@ func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, s
 
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority))
 	return err
+}
+
+func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*model.PartitionMetadata, error) {
+	var partitions []*model.PartitionMetadata
+
+	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+		partitions = make([]*model.PartitionMetadata, 0)
+		mutations := make([]*spanner.Mutation, 0, len(partitions))
+
+		stmt := spanner.Statement{
+			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC FOR UPDATE", s.tableName),
+			Params: map[string]interface{}{
+				"state":        model.StateCreated,
+				"minWatermark": minWatermark,
+			},
+		}
+
+		iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority})
+
+		if err := iter.Do(func(r *spanner.Row) error {
+			p := new(model.PartitionMetadata)
+			if err := r.ToStruct(p); err != nil {
+				return err
+			}
+
+			m := spanner.UpdateMap(s.tableName, map[string]interface{}{
+				columnPartitionToken: p.PartitionToken,
+				columnState:          model.StateScheduled,
+				columnScheduledAt:    spanner.CommitTimestamp,
+				columnRunnerID:       runnerID,
+			})
+			mutations = append(mutations, m)
+
+			partitions = append(partitions, p)
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		// writes the updates to spanner.
+		return tx.BufferWrite(mutations)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return partitions, nil
 }
 
 func (s *SpannerPartitionStorage) GetSchedulablePartitions(ctx context.Context, minWatermark time.Time) ([]*model.PartitionMetadata, error) {
