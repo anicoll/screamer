@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,11 +15,15 @@ import (
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
 	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	"github.com/anicoll/screamer/internal/helper"
+	"github.com/anicoll/screamer/pkg/interceptor"
 	"github.com/anicoll/screamer/pkg/model"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -161,7 +166,9 @@ func existsTable(ctx context.Context, client *spanner.Client, tableName string) 
 
 func (s *SpannerTestSuite) setupSpannerPartitionStorage(ctx context.Context, tableName string) *SpannerPartitionStorage {
 	var err error
-	s.client, err = spanner.NewClient(ctx, s.dsn)
+	proxy := interceptor.NewQueueInterceptor(100)
+
+	s.client, err = spanner.NewClient(ctx, s.dsn, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(proxy.UnaryInterceptor)))
 	s.NoError(err)
 
 	storage := &SpannerPartitionStorage{
@@ -305,6 +312,137 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read() {
 		if !reflect.DeepEqual(got, want) {
 			s.T().Errorf("GetSchedulablePartitions(ctx, %q) = %+v, want = %+v", timestamp, got, want)
 		}
+	})
+}
+
+func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read_race() {
+	ctx := context.Background()
+	storage := s.setupSpannerPartitionStorage(ctx, "Read")
+
+	timestamp := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	insert := func(token string, start time.Time, state model.State) *spanner.Mutation {
+		return spanner.InsertMap(storage.tableName, map[string]interface{}{
+			columnPartitionToken:  token,
+			columnParentTokens:    []string{},
+			columnStartTimestamp:  start,
+			columnEndTimestamp:    time.Time{},
+			columnHeartbeatMillis: 0,
+			columnState:           state,
+			columnWatermark:       start,
+			columnCreatedAt:       spanner.CommitTimestamp,
+		})
+	}
+
+	_, err := storage.client.Apply(ctx, []*spanner.Mutation{
+		insert("created1", timestamp, model.StateCreated),
+		insert("created2", timestamp.Add(-2*time.Second), model.StateCreated),
+		insert("scheduled", timestamp.Add(time.Second), model.StateScheduled),
+		insert("running", timestamp.Add(2*time.Second), model.StateRunning),
+		insert("finished", timestamp.Add(-time.Second), model.StateFinished),
+	})
+	s.NoError(err)
+
+	// s.Run("GetUnfinishedMinWatermarkPartition", func() {
+	// 	got, err := storage.GetUnfinishedMinWatermarkPartition(ctx)
+	// 	s.NoError(err)
+
+	// 	want := "created2"
+	// 	if got.PartitionToken != want {
+	// 		s.T().Errorf("GetUnfinishedMinWatermarkPartition(ctx) = %v, want = %v", got.PartitionToken, want)
+	// 	}
+	// })
+
+	s.Run("ConcurrentGetUnfinishedMinWatermarkPartition", func() {
+		var wg sync.WaitGroup
+		results := make([]*model.PartitionMetadata, 3)
+		errors := make([]error, 3)
+		m := sync.Mutex{}
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				result, err := storage.GetUnfinishedMinWatermarkPartition(ctx)
+				m.Lock()
+				defer m.Unlock()
+				results[index] = result
+				errors[index] = err
+			}(i)
+		}
+
+		wg.Wait()
+
+		for i, err := range errors {
+			s.NoError(err, "Error in goroutine %d", i)
+		}
+
+		for i, result := range results {
+			s.NotNil(result, "Result in goroutine %d is nil", i)
+		}
+	})
+}
+
+func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions() {
+	s.T().Skip("This test is skipped because Spanner emulator cannot handle FOR UPDATE query.")
+	ctx := context.Background()
+	storage := s.setupSpannerPartitionStorage(ctx, "Read")
+	runnerID := uuid.NewString()
+	timestamp := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	insert := func(token string, start time.Time, state model.State) *spanner.Mutation {
+		return spanner.InsertMap(storage.tableName, map[string]interface{}{
+			columnPartitionToken:  token,
+			columnParentTokens:    []string{},
+			columnStartTimestamp:  start,
+			columnEndTimestamp:    time.Time{},
+			columnHeartbeatMillis: 0,
+			columnState:           state,
+			columnWatermark:       start,
+			columnCreatedAt:       spanner.CommitTimestamp,
+		})
+	}
+
+	_, err := storage.client.Apply(ctx, []*spanner.Mutation{
+		insert("created1", timestamp, model.StateCreated),
+		insert("created2", timestamp.Add(-2*time.Second), model.StateCreated),
+		insert("scheduled", timestamp.Add(time.Second), model.StateScheduled),
+		insert("running", timestamp.Add(2*time.Second), model.StateRunning),
+		insert("finished", timestamp.Add(-time.Second), model.StateFinished),
+	})
+	s.NoError(err)
+
+	s.Run("GetUnfinishedMinWatermarkPartition", func() {
+		got, err := storage.GetUnfinishedMinWatermarkPartition(ctx)
+		s.NoError(err)
+
+		want := "created2"
+		if got.PartitionToken != want {
+			s.T().Errorf("GetUnfinishedMinWatermarkPartition(ctx) = %v, want = %v", got.PartitionToken, want)
+		}
+	})
+
+	s.Run("GetInterruptedPartitions", func() {
+		partitions, err := storage.GetInterruptedPartitions(ctx)
+		s.NoError(err)
+		got := []string{}
+		for _, p := range partitions {
+			got = append(got, p.PartitionToken)
+		}
+
+		want := []string{"scheduled", "running"}
+		if !reflect.DeepEqual(got, want) {
+			s.T().Errorf("GetInterruptedPartitions(ctx) = %+v, want = %+v", got, want)
+		}
+	})
+
+	s.Run("GetAndSchedulePartitions", func() {
+		partitions, err := storage.GetAndSchedulePartitions(ctx, timestamp, runnerID)
+		s.NoError(err)
+
+		s.Len(partitions, 1)
+		p := partitions[0]
+		s.Equal(p.PartitionToken, "created1")
+		s.Equal(p.RunnerID, runnerID)
 	})
 }
 

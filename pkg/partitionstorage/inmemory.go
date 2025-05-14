@@ -42,7 +42,7 @@ func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx contex
 	return partitions[0], nil
 }
 
-func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context) ([]*model.PartitionMetadata, error) {
+func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*model.PartitionMetadata, error) {
 	// InmemoryPartitionStorage can't return any partitions
 	return nil, nil
 }

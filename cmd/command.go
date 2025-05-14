@@ -138,14 +138,6 @@ func nillableString(c *cli.Context, str string) *string {
 	return nil
 }
 
-func nillableTimestamp(c *cli.Context, str string) *time.Time {
-	s := c.Timestamp(str)
-	if c.IsSet(str) {
-		return s
-	}
-	return nil
-}
-
 type jsonOutputConsumer struct {
 	out io.Writer
 	mu  sync.Mutex

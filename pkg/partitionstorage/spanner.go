@@ -60,6 +60,7 @@ const (
 	columnPartitionToken  = "PartitionToken"
 	columnParentTokens    = "ParentTokens"
 	columnStartTimestamp  = "StartTimestamp"
+	columnUpdatedAt       = "UpdatedAt"
 	columnEndTimestamp    = "EndTimestamp"
 	columnHeartbeatMillis = "HeartbeatMillis"
 	columnState           = "State"
@@ -83,6 +84,7 @@ func (s *SpannerPartitionStorage) CreateTableIfNotExists(ctx context.Context) er
   %[3]s ARRAY<STRING(MAX)> NOT NULL,
   %[4]s TIMESTAMP NOT NULL,
   %[5]s TIMESTAMP NOT NULL,
+  %[14]s TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
   %[6]s INT64 NOT NULL,
   %[7]s STRING(MAX) NOT NULL,
   %[8]s TIMESTAMP NOT NULL,
@@ -105,6 +107,7 @@ func (s *SpannerPartitionStorage) CreateTableIfNotExists(ctx context.Context) er
 		columnRunningAt,
 		columnFinishedAt,
 		columnRunnerID,
+		columnUpdatedAt,
 	)
 
 	req := &databasepb.UpdateDatabaseDdlRequest{
@@ -152,23 +155,41 @@ func (s *SpannerPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context
 	return partition, nil
 }
 
-func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context) ([]*model.PartitionMetadata, error) {
-	stmt := spanner.Statement{
-		SQL: fmt.Sprintf("SELECT * FROM %s WHERE State IN UNNEST(@states) ORDER BY Watermark ASC", s.tableName),
-		Params: map[string]interface{}{
-			"states": []model.State{model.StateScheduled, model.StateRunning},
-		},
-	}
+func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*model.PartitionMetadata, error) {
+	var partitions []*model.PartitionMetadata
 
-	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority})
+	if _, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+		partitions = make([]*model.PartitionMetadata, 0)
+		stmt := spanner.Statement{
+			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State IN UNNEST(@states) ORDER BY Watermark ASC FOR UPDATE", s.tableName),
+			Params: map[string]interface{}{
+				"states": []model.State{model.StateScheduled, model.StateRunning},
+			},
+		}
 
-	partitions := []*model.PartitionMetadata{}
-	if err := iter.Do(func(r *spanner.Row) error {
-		p := new(model.PartitionMetadata)
-		if err := r.ToStruct(p); err != nil {
+		iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority})
+
+		if err := iter.Do(func(r *spanner.Row) error {
+			p := new(model.PartitionMetadata)
+			if err := r.ToStruct(p); err != nil {
+				return err
+			}
+			// dont process if taken by another runner and still running.
+			if (p.RunnerID != nil && *p.RunnerID != runnerID) && time.Since(p.UpdatedAt) <= 4*time.Second {
+				return nil
+			}
+			partitions = append(partitions, p)
+
+			m := spanner.UpdateMap(s.tableName, map[string]interface{}{
+				columnPartitionToken: p.PartitionToken,
+				columnRunnerID:       runnerID,
+				columnUpdatedAt:      spanner.CommitTimestamp,
+			})
+
+			return tx.BufferWrite([]*spanner.Mutation{m})
+		}); err != nil {
 			return err
 		}
-		partitions = append(partitions, p)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -187,6 +208,7 @@ func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, s
 		columnState:           model.StateCreated,
 		columnWatermark:       startTimestamp,
 		columnCreatedAt:       spanner.CommitTimestamp,
+		columnUpdatedAt:       spanner.CommitTimestamp,
 		columnScheduledAt:     nil,
 		columnRunningAt:       nil,
 		columnFinishedAt:      nil,
@@ -224,6 +246,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 				columnState:          model.StateScheduled,
 				columnScheduledAt:    spanner.CommitTimestamp,
 				columnRunnerID:       runnerID,
+				columnUpdatedAt:      spanner.CommitTimestamp,
 			})
 			mutations = append(mutations, m)
 
@@ -242,32 +265,6 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 	return partitions, nil
 }
 
-func (s *SpannerPartitionStorage) GetSchedulablePartitions(ctx context.Context, minWatermark time.Time) ([]*model.PartitionMetadata, error) {
-	stmt := spanner.Statement{
-		SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC", s.tableName),
-		Params: map[string]interface{}{
-			"state":        model.StateCreated,
-			"minWatermark": minWatermark,
-		},
-	}
-
-	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority})
-
-	partitions := []*model.PartitionMetadata{}
-	if err := iter.Do(func(r *spanner.Row) error {
-		p := new(model.PartitionMetadata)
-		if err := r.ToStruct(p); err != nil {
-			return err
-		}
-		partitions = append(partitions, p)
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-
-	return partitions, nil
-}
-
 func (s *SpannerPartitionStorage) AddChildPartitions(ctx context.Context, parent *model.PartitionMetadata, r *model.ChildPartitionsRecord) error {
 	for _, p := range r.ChildPartitions {
 		m := spanner.InsertMap(s.tableName, map[string]interface{}{
@@ -279,6 +276,7 @@ func (s *SpannerPartitionStorage) AddChildPartitions(ctx context.Context, parent
 			columnState:           model.StateCreated,
 			columnWatermark:       r.StartTimestamp,
 			columnCreatedAt:       spanner.CommitTimestamp,
+			columnUpdatedAt:       spanner.CommitTimestamp,
 		})
 
 		if _, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority)); err != nil {
@@ -300,6 +298,7 @@ func (s *SpannerPartitionStorage) UpdateToScheduled(ctx context.Context, partiti
 			columnPartitionToken: p.PartitionToken,
 			columnState:          model.StateScheduled,
 			columnScheduledAt:    spanner.CommitTimestamp,
+			columnUpdatedAt:      spanner.CommitTimestamp,
 		})
 		mutations = append(mutations, m)
 	}
@@ -313,6 +312,7 @@ func (s *SpannerPartitionStorage) UpdateToRunning(ctx context.Context, partition
 		columnPartitionToken: partition.PartitionToken,
 		columnState:          model.StateRunning,
 		columnRunningAt:      spanner.CommitTimestamp,
+		columnUpdatedAt:      spanner.CommitTimestamp,
 	})
 
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority))
@@ -324,6 +324,7 @@ func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partitio
 		columnPartitionToken: partition.PartitionToken,
 		columnState:          model.StateFinished,
 		columnFinishedAt:     spanner.CommitTimestamp,
+		columnUpdatedAt:      spanner.CommitTimestamp,
 	})
 
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority))
@@ -334,6 +335,7 @@ func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition
 	m := spanner.UpdateMap(s.tableName, map[string]interface{}{
 		columnPartitionToken: partition.PartitionToken,
 		columnWatermark:      watermark,
+		columnUpdatedAt:      spanner.CommitTimestamp,
 	})
 
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority))
