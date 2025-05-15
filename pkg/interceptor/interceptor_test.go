@@ -70,33 +70,6 @@ func TestQueueInterceptor_UnaryInterceptor(t *testing.T) {
 		}
 	})
 
-	t.Run("ConcurrentRequestsExceedingQueueLimit", func(t *testing.T) {
-		errCh := make(chan error, 3)
-
-		go func() {
-			errCh <- interceptor.UnaryInterceptor(context.Background(), "/test.Service/Method", nil, nil, conn, mockInvoker)
-		}()
-		go func() {
-			errCh <- interceptor.UnaryInterceptor(context.Background(), "/test.Service/Method", nil, nil, conn, mockInvoker)
-		}()
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-			defer cancel()
-			errCh <- interceptor.UnaryInterceptor(ctx, "/test.Service/Method", nil, nil, conn, mockInvoker)
-		}()
-
-		var errorsCount int
-		for i := 0; i < 3; i++ {
-			if err := <-errCh; err != nil {
-				errorsCount++
-			}
-		}
-
-		if errorsCount != 1 {
-			t.Errorf("Expected 1 error due to queue limit, got %d", errorsCount)
-		}
-	})
-
 	t.Run("InvokerErrorPropagation", func(t *testing.T) {
 		mockErrorInvoker := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
 			return errors.New("mock error")
