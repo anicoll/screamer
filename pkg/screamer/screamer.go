@@ -11,16 +11,16 @@ import (
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/anicoll/screamer/pkg/model"
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
 type PartitionStorage interface {
 	GetUnfinishedMinWatermarkPartition(ctx context.Context) (*model.PartitionMetadata, error)
-	GetInterruptedPartitions(ctx context.Context) ([]*model.PartitionMetadata, error)
+	GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*model.PartitionMetadata, error)
 	InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error
-	GetSchedulablePartitions(ctx context.Context, minWatermark time.Time) ([]*model.PartitionMetadata, error)
+	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*model.PartitionMetadata, error)
 	AddChildPartitions(ctx context.Context, parentPartition *model.PartitionMetadata, childPartitionsRecord *model.ChildPartitionsRecord) error
-	UpdateToScheduled(ctx context.Context, partitions []*model.PartitionMetadata) error
 	UpdateToRunning(ctx context.Context, partition *model.PartitionMetadata) error
 	UpdateToFinished(ctx context.Context, partition *model.PartitionMetadata) error
 	UpdateWatermark(ctx context.Context, partition *model.PartitionMetadata, watermark time.Time) error
@@ -30,6 +30,7 @@ type PartitionStorage interface {
 type Subscriber struct {
 	spannerClient          *spanner.Client
 	streamName             string
+	runnerID               string
 	startTimestamp         time.Time
 	endTimestamp           time.Time
 	heartbeatInterval      time.Duration
@@ -107,7 +108,7 @@ func WithSpannerRequestPriotiry(priority spannerpb.RequestOptions_Priority) Opti
 
 var (
 	defaultEndTimestamp      = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC) // Maximum value of Spanner TIMESTAMP type.
-	defaultHeartbeatInterval = 10 * time.Second
+	defaultHeartbeatInterval = 3 * time.Second
 
 	nowFunc = time.Now
 )
@@ -136,12 +137,13 @@ func NewSubscriber(
 		heartbeatInterval:      c.heartbeatInterval,
 		spannerRequestPriority: c.spannerRequestPriority,
 		partitionStorage:       partitionStorage,
+		runnerID:               uuid.NewString(),
 	}
 }
 
 // Subscribe starts subscribing to the change stream.
 func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
-	eg, ctx := s.initErrGroup(ctx)
+	ctx = s.initErrGroup(ctx)
 	s.consumer = consumer
 
 	// Initialize root partition if this is the first run or if the previous run has already been completed.
@@ -155,7 +157,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 		}
 	}
 
-	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx)
+	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx, s.runnerID)
 	if err != nil {
 		return fmt.Errorf("failed to get interrupted partitions: %w", err)
 	}
@@ -166,7 +168,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 		})
 	}
 
-	eg.Go(func() error {
+	s.eg.Go(func() error {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
@@ -182,12 +184,13 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 					return err
 				}
 			case <-ctx.Done():
-				return ctx.Err()
+				err := ctx.Err()
+				return err
 			}
 		}
 	})
 
-	return eg.Wait()
+	return s.eg.Wait()
 }
 
 // SubscribeFunc is an adapter to allow the use of ordinary functions as Consumer.
@@ -197,7 +200,7 @@ func (s *Subscriber) SubscribeFunc(ctx context.Context, f ConsumerFunc) error {
 	return s.Subscribe(ctx, f)
 }
 
-func (s *Subscriber) initErrGroup(ctx context.Context) (*errgroup.Group, context.Context) {
+func (s *Subscriber) initErrGroup(ctx context.Context) context.Context {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -207,7 +210,7 @@ func (s *Subscriber) initErrGroup(ctx context.Context) (*errgroup.Group, context
 
 	eg, ctx := errgroup.WithContext(ctx)
 	s.eg = eg
-	return eg, ctx
+	return ctx
 }
 
 var errDone = errors.New("all partitions have been processed")
@@ -222,17 +225,12 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 		return errDone
 	}
 
-	// To make sure changes for a key is processed in timestamp order, wait until the records returned from all parents have been processed.
-	partitions, err := s.partitionStorage.GetSchedulablePartitions(ctx, minWatermarkPartition.Watermark)
+	partitions, err := s.partitionStorage.GetAndSchedulePartitions(ctx, minWatermarkPartition.Watermark, s.runnerID)
 	if err != nil {
 		return fmt.Errorf("failed to get schedulable partitions: %w", err)
 	}
 	if len(partitions) == 0 {
 		return nil
-	}
-
-	if err := s.partitionStorage.UpdateToScheduled(ctx, partitions); err != nil {
-		return fmt.Errorf("failed to update to scheduled: %w", err)
 	}
 
 	for _, p := range partitions {

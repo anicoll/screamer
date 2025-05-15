@@ -42,7 +42,7 @@ func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx contex
 	return partitions[0], nil
 }
 
-func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context) ([]*model.PartitionMetadata, error) {
+func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*model.PartitionMetadata, error) {
 	// InmemoryPartitionStorage can't return any partitions
 	return nil, nil
 }
@@ -73,6 +73,26 @@ func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context,
 	partitions := []*model.PartitionMetadata{}
 	for _, p := range s.m {
 		if p.State == model.StateCreated && !minWatermark.After(p.StartTimestamp) {
+			partitions = append(partitions, p)
+		}
+	}
+
+	return partitions, nil
+}
+
+func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*model.PartitionMetadata, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	partitions := []*model.PartitionMetadata{}
+	now := time.Now()
+
+	for _, p := range s.m {
+		if p.State == model.StateCreated && !minWatermark.After(p.StartTimestamp) {
+			p = s.m[p.PartitionToken]
+			p.ScheduledAt = &now
+			p.State = model.StateScheduled
+			p.RunnerID = &runnerID
 			partitions = append(partitions, p)
 		}
 	}
