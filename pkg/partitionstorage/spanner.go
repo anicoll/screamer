@@ -161,9 +161,12 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 		partitions = make([]*screamer.PartitionMetadata, 0)
 		stmt := spanner.Statement{
 			SQL: fmt.Sprintf(
-				"SELECT * FROM %s WHERE State IN ('Scheduled', 'Running') AND UpdatedAt < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 SECOND) ORDER BY Watermark ASC FOR UPDATE",
+				"SELECT * FROM %s WHERE State IN UNNEST(@states) AND UpdatedAt < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 SECOND) ORDER BY Watermark ASC FOR UPDATE",
 				s.tableName,
 			),
+			Params: map[string]interface{}{
+				"states": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
+			},
 		}
 
 		iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority})
@@ -173,10 +176,7 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 			if err := r.ToStruct(p); err != nil {
 				return err
 			}
-			// dont process if taken by another runner and still running.
-			if p.RunnerID != nil && *p.RunnerID != runnerID {
-				return nil
-			}
+
 			partitions = append(partitions, p)
 
 			m := spanner.UpdateMap(s.tableName, map[string]interface{}{
