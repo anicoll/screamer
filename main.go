@@ -1,21 +1,7 @@
 package main
 
 import (
-	"log"
-	"os"
-
-	"github.com/anicoll/screamer/cmd"
-	"github.com/urfave/cli/v2"
+	_ "github.com/anicoll/screamer/pkg/model"
+	_ "github.com/anicoll/screamer/pkg/partitionstorage"
+	_ "github.com/anicoll/screamer/pkg/screamer"
 )
-
-func main() {
-	app := &cli.App{
-		Commands: []*cli.Command{
-			cmd.ScreamerCommand(),
-		},
-	}
-
-	if err := app.Run(os.Args); err != nil {
-		log.Fatal(err)
-	}
-}
