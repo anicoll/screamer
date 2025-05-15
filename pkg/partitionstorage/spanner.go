@@ -176,10 +176,7 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 			if err := r.ToStruct(p); err != nil {
 				return err
 			}
-			// dont process if taken by another runner and still running.
-			if p.RunnerID != nil && *p.RunnerID != runnerID {
-				return nil
-			}
+
 			partitions = append(partitions, p)
 
 			m := spanner.UpdateMap(s.tableName, map[string]interface{}{
