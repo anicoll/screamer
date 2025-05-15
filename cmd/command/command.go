@@ -14,7 +14,7 @@ import (
 	"github.com/anicoll/screamer"
 	"github.com/anicoll/screamer/pkg/partitionstorage"
 	"github.com/anicoll/screamer/pkg/signal"
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -24,45 +24,45 @@ func ScreamerCommand() *cli.Command {
 	flags := []cli.Flag{
 		&cli.StringFlag{
 			Name:     "dsn",
-			EnvVars:  []string{"DSN"},
+			Sources:  cli.EnvVars("DSN"),
 			Required: true,
 			Value:    "",
 		},
 		&cli.StringFlag{
 			Name:     "stream",
-			EnvVars:  []string{"STREAM"},
+			Sources:  cli.EnvVars("STREAM"),
 			Required: true,
 			Value:    "",
 		},
 		&cli.StringFlag{
 			Name:     "metadata-table",
-			EnvVars:  []string{"METADATA_TABLE"},
+			Sources:  cli.EnvVars("METADATA_TABLE"),
 			Required: false,
 			Value:    "",
 		},
 		&cli.StringFlag{
 			Name:        "start",
-			EnvVars:     []string{"START"},
+			Sources:     cli.EnvVars("START"),
 			Required:    false,
 			Value:       "",
 			DefaultText: "Start timestamp with RFC3339 format, default: current timestamp",
 		},
 		&cli.StringFlag{
 			Name:        "end",
-			EnvVars:     []string{"END"},
+			Sources:     cli.EnvVars("END"),
 			Required:    false,
 			Value:       "",
 			DefaultText: "End timestamp with RFC3339 format default: indefinite",
 		},
 		&cli.DurationFlag{
 			Name:     "heartbeat-interval",
-			EnvVars:  []string{"HEARTBEAT_INTERVAL"},
+			Sources:  cli.EnvVars("HEARTBEAT_INTERVAL"),
 			Required: false,
 			Value:    defaultHeartbeatInterval,
 		},
 		&cli.StringFlag{
 			Name:        "partition-dsn",
-			EnvVars:     []string{"PARTITION_DSN"},
+			Sources:     cli.EnvVars("PARTITION_DSN"),
 			Required:    false,
 			Value:       "",
 			DefaultText: "Database dsn for use by the partition metadata table. If not provided, the main dsn will be used.",
@@ -71,13 +71,13 @@ func ScreamerCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "screamer",
 		Flags: flags,
-		Action: func(c *cli.Context) error {
+		Action: func(ctx context.Context, c *cli.Command) error {
 			cfg, err := buildConfig(c)
 			if err != nil {
 				return err
 			}
 
-			eg, ctx := errgroup.WithContext(c.Context)
+			eg, ctx := errgroup.WithContext(ctx)
 
 			eg.Go(func() error {
 				return signal.SignalHandler(ctx)
@@ -98,7 +98,7 @@ func ScreamerCommand() *cli.Command {
 	}
 }
 
-func buildConfig(c *cli.Context) (*screamer.Config, error) {
+func buildConfig(c *cli.Command) (*screamer.Config, error) {
 	cfg := &screamer.Config{}
 	cfg.DSN = c.String("dsn")
 	cfg.Stream = c.String("stream")
@@ -130,7 +130,7 @@ func buildConfig(c *cli.Context) (*screamer.Config, error) {
 	return cfg, nil
 }
 
-func nillableString(c *cli.Context, str string) *string {
+func nillableString(c *cli.Command, str string) *string {
 	s := c.String(str)
 	if c.IsSet(str) {
 		return &s
