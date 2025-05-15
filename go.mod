@@ -2,8 +2,6 @@ module github.com/anicoll/screamer
 
 go 1.24
 
-toolchain go1.24.3
-
 require (
 	cloud.google.com/go/spanner v1.81.0
 	github.com/go-faker/faker/v4 v4.6.1

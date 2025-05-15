@@ -11,10 +11,9 @@ import (
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
+	"github.com/anicoll/screamer"
 	"github.com/anicoll/screamer/internal/helper"
-	"github.com/anicoll/screamer/pkg/model"
 	"github.com/anicoll/screamer/pkg/partitionstorage"
-	"github.com/anicoll/screamer/pkg/screamer"
 	"github.com/go-faker/faker/v4"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -127,11 +126,11 @@ func createTableAndChangeStream(ctx context.Context, databaseName string) (strin
 }
 
 type consumer struct {
-	changes []*model.DataChangeRecord
+	changes []*screamer.DataChangeRecord
 }
 
 func (c *consumer) Consume(change []byte) error {
-	dcr := &model.DataChangeRecord{}
+	dcr := &screamer.DataChangeRecord{}
 	if err := json.Unmarshal(change, dcr); err != nil {
 		return err
 	}
@@ -154,7 +153,7 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 
 	tests := map[string]struct {
 		statements []string
-		expected   []*model.DataChangeRecord
+		expected   []*screamer.DataChangeRecord
 	}{
 		"change": {
 			statements: []string{
@@ -185,32 +184,32 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 				fmt.Sprintf(`UPDATE %s SET Bool = FALSE WHERE Int64 = 1`, tableName),
 				fmt.Sprintf(`DELETE FROM %s WHERE Int64 = 1`, tableName),
 			},
-			expected: []*model.DataChangeRecord{
+			expected: []*screamer.DataChangeRecord{
 				{
 					RecordSequence:                       "00000000",
 					IsLastRecordInTransactionInPartition: false,
 					TableName:                            tableName,
-					ColumnTypes: []*model.ColumnType{
-						{Name: "Int64", Type: model.Type{Code: model.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
-						{Name: "Bool", Type: model.Type{Code: model.TypeCode_BOOL}, OrdinalPosition: 1},
-						{Name: "Float64", Type: model.Type{Code: model.TypeCode_FLOAT64}, OrdinalPosition: 3},
-						{Name: "Timestamp", Type: model.Type{Code: model.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
-						{Name: "Date", Type: model.Type{Code: model.TypeCode_DATE}, OrdinalPosition: 5},
-						{Name: "String", Type: model.Type{Code: model.TypeCode_STRING}, OrdinalPosition: 6},
-						{Name: "Bytes", Type: model.Type{Code: model.TypeCode_BYTES}, OrdinalPosition: 7},
-						{Name: "Numeric", Type: model.Type{Code: model.TypeCode_NUMERIC}, OrdinalPosition: 8},
-						{Name: "Json", Type: model.Type{Code: model.TypeCode_JSON}, OrdinalPosition: 9},
-						{Name: "BoolArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_BOOL}, OrdinalPosition: 10},
-						{Name: "Int64Array", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_INT64}, OrdinalPosition: 11},
-						{Name: "Float64Array", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_FLOAT64}, OrdinalPosition: 12},
-						{Name: "TimestampArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_TIMESTAMP}, OrdinalPosition: 13},
-						{Name: "DateArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_DATE}, OrdinalPosition: 14},
-						{Name: "StringArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_STRING}, OrdinalPosition: 15},
-						{Name: "BytesArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_BYTES}, OrdinalPosition: 16},
-						{Name: "NumericArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_NUMERIC}, OrdinalPosition: 17},
-						{Name: "JsonArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_JSON}, OrdinalPosition: 18},
+					ColumnTypes: []*screamer.ColumnType{
+						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
+						{Name: "Bool", Type: screamer.Type{Code: screamer.TypeCode_BOOL}, OrdinalPosition: 1},
+						{Name: "Float64", Type: screamer.Type{Code: screamer.TypeCode_FLOAT64}, OrdinalPosition: 3},
+						{Name: "Timestamp", Type: screamer.Type{Code: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
+						{Name: "Date", Type: screamer.Type{Code: screamer.TypeCode_DATE}, OrdinalPosition: 5},
+						{Name: "String", Type: screamer.Type{Code: screamer.TypeCode_STRING}, OrdinalPosition: 6},
+						{Name: "Bytes", Type: screamer.Type{Code: screamer.TypeCode_BYTES}, OrdinalPosition: 7},
+						{Name: "Numeric", Type: screamer.Type{Code: screamer.TypeCode_NUMERIC}, OrdinalPosition: 8},
+						{Name: "Json", Type: screamer.Type{Code: screamer.TypeCode_JSON}, OrdinalPosition: 9},
+						{Name: "BoolArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BOOL}, OrdinalPosition: 10},
+						{Name: "Int64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_INT64}, OrdinalPosition: 11},
+						{Name: "Float64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_FLOAT64}, OrdinalPosition: 12},
+						{Name: "TimestampArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 13},
+						{Name: "DateArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_DATE}, OrdinalPosition: 14},
+						{Name: "StringArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_STRING}, OrdinalPosition: 15},
+						{Name: "BytesArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BYTES}, OrdinalPosition: 16},
+						{Name: "NumericArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_NUMERIC}, OrdinalPosition: 17},
+						{Name: "JsonArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_JSON}, OrdinalPosition: 18},
 					},
-					Mods: []*model.Mod{
+					Mods: []*screamer.Mod{
 						{
 							Keys: map[string]interface{}{"Int64": "1"},
 							NewValues: map[string]interface{}{
@@ -235,7 +234,7 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 							OldValues: map[string]interface{}{},
 						},
 					},
-					ModType:                         model.ModType_INSERT,
+					ModType:                         screamer.ModType_INSERT,
 					ValueCaptureType:                "OLD_AND_NEW_VALUES",
 					NumberOfRecordsInTransaction:    3,
 					NumberOfPartitionsInTransaction: 1,
@@ -246,18 +245,18 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 					RecordSequence:                       "00000001",
 					IsLastRecordInTransactionInPartition: false,
 					TableName:                            tableName,
-					ColumnTypes: []*model.ColumnType{
-						{Name: "Int64", Type: model.Type{Code: model.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
-						{Name: "Bool", Type: model.Type{Code: model.TypeCode_BOOL}, OrdinalPosition: 1},
+					ColumnTypes: []*screamer.ColumnType{
+						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
+						{Name: "Bool", Type: screamer.Type{Code: screamer.TypeCode_BOOL}, OrdinalPosition: 1},
 					},
-					Mods: []*model.Mod{
+					Mods: []*screamer.Mod{
 						{
 							Keys:      map[string]interface{}{"Int64": "1"},
 							NewValues: map[string]interface{}{"Bool": false},
 							OldValues: map[string]interface{}{"Bool": true},
 						},
 					},
-					ModType:                         model.ModType_UPDATE,
+					ModType:                         screamer.ModType_UPDATE,
 					ValueCaptureType:                "OLD_AND_NEW_VALUES",
 					NumberOfRecordsInTransaction:    3,
 					NumberOfPartitionsInTransaction: 1,
@@ -268,27 +267,27 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 					RecordSequence:                       "00000002",
 					IsLastRecordInTransactionInPartition: true,
 					TableName:                            tableName,
-					ColumnTypes: []*model.ColumnType{
-						{Name: "Int64", Type: model.Type{Code: model.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
-						{Name: "Bool", Type: model.Type{Code: model.TypeCode_BOOL}, OrdinalPosition: 1},
-						{Name: "Float64", Type: model.Type{Code: model.TypeCode_FLOAT64}, OrdinalPosition: 3},
-						{Name: "Timestamp", Type: model.Type{Code: model.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
-						{Name: "Date", Type: model.Type{Code: model.TypeCode_DATE}, OrdinalPosition: 5},
-						{Name: "String", Type: model.Type{Code: model.TypeCode_STRING}, OrdinalPosition: 6},
-						{Name: "Bytes", Type: model.Type{Code: model.TypeCode_BYTES}, OrdinalPosition: 7},
-						{Name: "Numeric", Type: model.Type{Code: model.TypeCode_NUMERIC}, OrdinalPosition: 8},
-						{Name: "Json", Type: model.Type{Code: model.TypeCode_JSON}, OrdinalPosition: 9},
-						{Name: "BoolArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_BOOL}, OrdinalPosition: 10},
-						{Name: "Int64Array", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_INT64}, OrdinalPosition: 11},
-						{Name: "Float64Array", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_FLOAT64}, OrdinalPosition: 12},
-						{Name: "TimestampArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_TIMESTAMP}, OrdinalPosition: 13},
-						{Name: "DateArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_DATE}, OrdinalPosition: 14},
-						{Name: "StringArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_STRING}, OrdinalPosition: 15},
-						{Name: "BytesArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_BYTES}, OrdinalPosition: 16},
-						{Name: "NumericArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_NUMERIC}, OrdinalPosition: 17},
-						{Name: "JsonArray", Type: model.Type{Code: model.TypeCode_ARRAY, ArrayElementType: model.TypeCode_JSON}, OrdinalPosition: 18},
+					ColumnTypes: []*screamer.ColumnType{
+						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
+						{Name: "Bool", Type: screamer.Type{Code: screamer.TypeCode_BOOL}, OrdinalPosition: 1},
+						{Name: "Float64", Type: screamer.Type{Code: screamer.TypeCode_FLOAT64}, OrdinalPosition: 3},
+						{Name: "Timestamp", Type: screamer.Type{Code: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
+						{Name: "Date", Type: screamer.Type{Code: screamer.TypeCode_DATE}, OrdinalPosition: 5},
+						{Name: "String", Type: screamer.Type{Code: screamer.TypeCode_STRING}, OrdinalPosition: 6},
+						{Name: "Bytes", Type: screamer.Type{Code: screamer.TypeCode_BYTES}, OrdinalPosition: 7},
+						{Name: "Numeric", Type: screamer.Type{Code: screamer.TypeCode_NUMERIC}, OrdinalPosition: 8},
+						{Name: "Json", Type: screamer.Type{Code: screamer.TypeCode_JSON}, OrdinalPosition: 9},
+						{Name: "BoolArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BOOL}, OrdinalPosition: 10},
+						{Name: "Int64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_INT64}, OrdinalPosition: 11},
+						{Name: "Float64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_FLOAT64}, OrdinalPosition: 12},
+						{Name: "TimestampArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 13},
+						{Name: "DateArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_DATE}, OrdinalPosition: 14},
+						{Name: "StringArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_STRING}, OrdinalPosition: 15},
+						{Name: "BytesArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BYTES}, OrdinalPosition: 16},
+						{Name: "NumericArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_NUMERIC}, OrdinalPosition: 17},
+						{Name: "JsonArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_JSON}, OrdinalPosition: 18},
 					},
-					Mods: []*model.Mod{
+					Mods: []*screamer.Mod{
 						{
 							Keys:      map[string]interface{}{"Int64": "1"},
 							NewValues: map[string]interface{}{},
@@ -313,7 +312,7 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 							},
 						},
 					},
-					ModType:                         model.ModType_DELETE,
+					ModType:                         screamer.ModType_DELETE,
 					ValueCaptureType:                "OLD_AND_NEW_VALUES",
 					NumberOfRecordsInTransaction:    3,
 					NumberOfPartitionsInTransaction: 1,
@@ -352,7 +351,7 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 		time.Sleep(time.Second * 5)
 		cancel()
 
-		opt := cmpopts.IgnoreFields(model.DataChangeRecord{}, "CommitTimestamp", "ServerTransactionID")
+		opt := cmpopts.IgnoreFields(screamer.DataChangeRecord{}, "CommitTimestamp", "ServerTransactionID")
 
 		diff := cmp.Diff(test.expected, consumer.changes, opt)
 		s.Empty(diff)

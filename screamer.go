@@ -10,20 +10,19 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
-	"github.com/anicoll/screamer/pkg/model"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
 type PartitionStorage interface {
-	GetUnfinishedMinWatermarkPartition(ctx context.Context) (*model.PartitionMetadata, error)
-	GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*model.PartitionMetadata, error)
+	GetUnfinishedMinWatermarkPartition(ctx context.Context) (*PartitionMetadata, error)
+	GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*PartitionMetadata, error)
 	InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error
-	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*model.PartitionMetadata, error)
-	AddChildPartitions(ctx context.Context, parentPartition *model.PartitionMetadata, childPartitionsRecord *model.ChildPartitionsRecord) error
-	UpdateToRunning(ctx context.Context, partition *model.PartitionMetadata) error
-	UpdateToFinished(ctx context.Context, partition *model.PartitionMetadata) error
-	UpdateWatermark(ctx context.Context, partition *model.PartitionMetadata, watermark time.Time) error
+	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*PartitionMetadata, error)
+	AddChildPartitions(ctx context.Context, parentPartition *PartitionMetadata, childPartitionsRecord *ChildPartitionsRecord) error
+	UpdateToRunning(ctx context.Context, partition *PartitionMetadata) error
+	UpdateToFinished(ctx context.Context, partition *PartitionMetadata) error
+	UpdateWatermark(ctx context.Context, partition *PartitionMetadata, watermark time.Time) error
 }
 
 // Subscriber subscribes change stream.
@@ -243,7 +242,7 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 	return nil
 }
 
-func (s *Subscriber) queryChangeStream(ctx context.Context, p *model.PartitionMetadata) error {
+func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata) error {
 	if err := s.partitionStorage.UpdateToRunning(ctx, p); err != nil {
 		return fmt.Errorf("failed to update to running: %w", err)
 	}
@@ -265,7 +264,7 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *model.PartitionMe
 
 	iter := s.spannerClient.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.spannerRequestPriority})
 	if err := iter.Do(func(r *spanner.Row) error {
-		records := []*model.ChangeRecord{}
+		records := []*ChangeRecord{}
 		if err := r.Columns(&records); err != nil {
 			return err
 		}
@@ -298,7 +297,7 @@ func (w *watermarker) get() time.Time {
 	return w.watermark
 }
 
-func (s *Subscriber) handle(ctx context.Context, p *model.PartitionMetadata, records []*model.ChangeRecord) error {
+func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records []*ChangeRecord) error {
 	var watermarker watermarker
 	for _, cr := range records {
 		for _, record := range cr.DataChangeRecords {

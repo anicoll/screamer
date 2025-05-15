@@ -1,17 +1,17 @@
-package main
+package screamer
 
 import (
 	"log"
 	"os"
 
-	"github.com/anicoll/screamer/cmd"
+	"github.com/anicoll/screamer/cmd/command"
 	"github.com/urfave/cli/v2"
 )
 
 func main() {
 	app := &cli.App{
 		Commands: []*cli.Command{
-			cmd.ScreamerCommand(),
+			command.ScreamerCommand(),
 		},
 	}
 
