@@ -18,7 +18,7 @@ This library aims to make reading change streams native for non beam/dataflow us
 ## Example Usage
 
 ```go
-package main
+package screamer
 
 import (
 	"context"
@@ -32,7 +32,6 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"github.com/anicoll/screamer"
-	"github.com/anicoll/screamer/pkg/model"
 	"github.com/anicoll/screamer/partitionstorage"
 )
 
@@ -68,7 +67,8 @@ type Logger struct {
 	mu  sync.Mutex
 }
 
-func (l *Logger) Consume(change *model.DataChangeRecord) error {
+// []byte is marshalled screamer.DataChangeRecord
+func (l *Logger) Consume(change []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return json.NewEncoder(l.out).Encode(change)

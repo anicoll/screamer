@@ -14,9 +14,9 @@ import (
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
 	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
+	"github.com/anicoll/screamer"
 	"github.com/anicoll/screamer/internal/helper"
 	"github.com/anicoll/screamer/pkg/interceptor"
-	"github.com/anicoll/screamer/pkg/model"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
@@ -207,19 +207,19 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_InitializeRootPartition()
 		startTimestamp    time.Time
 		endTimestamp      time.Time
 		heartbeatInterval time.Duration
-		want              model.PartitionMetadata
+		want              screamer.PartitionMetadata
 	}{
 		"one": {
 			startTimestamp:    time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC),
 			endTimestamp:      time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC),
 			heartbeatInterval: 10 * time.Second,
-			want: model.PartitionMetadata{
-				PartitionToken:  model.RootPartitionToken,
+			want: screamer.PartitionMetadata{
+				PartitionToken:  screamer.RootPartitionToken,
 				ParentTokens:    []string{},
 				StartTimestamp:  time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC),
 				EndTimestamp:    time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC),
 				HeartbeatMillis: 10000,
-				State:           model.StateCreated,
+				State:           screamer.StateCreated,
 				Watermark:       time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC),
 			},
 		},
@@ -227,13 +227,13 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_InitializeRootPartition()
 			startTimestamp:    time.Date(2023, 12, 31, 23, 59, 59, 999999999, time.UTC),
 			endTimestamp:      time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
 			heartbeatInterval: time.Hour,
-			want: model.PartitionMetadata{
-				PartitionToken:  model.RootPartitionToken,
+			want: screamer.PartitionMetadata{
+				PartitionToken:  screamer.RootPartitionToken,
 				ParentTokens:    []string{},
 				StartTimestamp:  time.Date(2023, 12, 31, 23, 59, 59, 999999999, time.UTC),
 				EndTimestamp:    time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
 				HeartbeatMillis: 3600000,
-				State:           model.StateCreated,
+				State:           screamer.StateCreated,
 				Watermark:       time.Date(2023, 12, 31, 23, 59, 59, 999999999, time.UTC),
 			},
 		},
@@ -246,13 +246,13 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_InitializeRootPartition()
 			}
 
 			columns := []string{columnPartitionToken, columnParentTokens, columnStartTimestamp, columnEndTimestamp, columnHeartbeatMillis, columnState, columnWatermark}
-			row, err := storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{model.RootPartitionToken}, columns)
+			row, err := storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{screamer.RootPartitionToken}, columns)
 			if err != nil {
 				s.T().Errorf("InitializeRootPartition(%q, %q, %q): %v", test.startTimestamp, test.endTimestamp, test.heartbeatInterval, err)
 				return
 			}
 
-			got := model.PartitionMetadata{}
+			got := screamer.PartitionMetadata{}
 			if err := row.ToStruct(&got); err != nil {
 				s.T().Errorf("InitializeRootPartition(%q, %q, %q): %v", test.startTimestamp, test.endTimestamp, test.heartbeatInterval, err)
 				return
@@ -272,7 +272,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read() {
 	runnerID := uuid.NewString()
 	timestamp := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	insert := func(token string, start time.Time, state model.State) *spanner.Mutation {
+	insert := func(token string, start time.Time, state screamer.State) *spanner.Mutation {
 		return spanner.InsertMap(storage.tableName, map[string]interface{}{
 			columnPartitionToken:  token,
 			columnParentTokens:    []string{},
@@ -287,11 +287,11 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read() {
 	}
 
 	_, err := storage.client.Apply(ctx, []*spanner.Mutation{
-		insert("created1", timestamp, model.StateCreated),
-		insert("created2", timestamp.Add(-2*time.Second), model.StateCreated),
-		insert("scheduled", timestamp.Add(time.Second), model.StateScheduled),
-		insert("running", timestamp.Add(2*time.Second), model.StateRunning),
-		insert("finished", timestamp.Add(-time.Second), model.StateFinished),
+		insert("created1", timestamp, screamer.StateCreated),
+		insert("created2", timestamp.Add(-2*time.Second), screamer.StateCreated),
+		insert("scheduled", timestamp.Add(time.Second), screamer.StateScheduled),
+		insert("running", timestamp.Add(2*time.Second), screamer.StateRunning),
+		insert("finished", timestamp.Add(-time.Second), screamer.StateFinished),
 	})
 	s.NoError(err)
 
@@ -328,7 +328,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read_race() {
 
 	timestamp := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	insert := func(token string, start time.Time, state model.State) *spanner.Mutation {
+	insert := func(token string, start time.Time, state screamer.State) *spanner.Mutation {
 		return spanner.InsertMap(storage.tableName, map[string]interface{}{
 			columnPartitionToken:  token,
 			columnParentTokens:    []string{},
@@ -343,17 +343,17 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read_race() {
 	}
 
 	_, err := storage.client.Apply(ctx, []*spanner.Mutation{
-		insert("created1", timestamp, model.StateCreated),
-		insert("created2", timestamp.Add(-2*time.Second), model.StateCreated),
-		insert("scheduled", timestamp.Add(time.Second), model.StateScheduled),
-		insert("running", timestamp.Add(2*time.Second), model.StateRunning),
-		insert("finished", timestamp.Add(-time.Second), model.StateFinished),
+		insert("created1", timestamp, screamer.StateCreated),
+		insert("created2", timestamp.Add(-2*time.Second), screamer.StateCreated),
+		insert("scheduled", timestamp.Add(time.Second), screamer.StateScheduled),
+		insert("running", timestamp.Add(2*time.Second), screamer.StateRunning),
+		insert("finished", timestamp.Add(-time.Second), screamer.StateFinished),
 	})
 	s.NoError(err)
 
 	s.Run("ConcurrentGetUnfinishedMinWatermarkPartition", func() {
 		var wg sync.WaitGroup
-		results := make([]*model.PartitionMetadata, 3)
+		results := make([]*screamer.PartitionMetadata, 3)
 		errors := make([]error, 3)
 		m := sync.Mutex{}
 		for i := 0; i < 3; i++ {
@@ -389,7 +389,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 	runnerID := uuid.NewString()
 	timestamp := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	insert := func(token string, start time.Time, state model.State) *spanner.Mutation {
+	insert := func(token string, start time.Time, state screamer.State) *spanner.Mutation {
 		return spanner.InsertMap(storage.tableName, map[string]interface{}{
 			columnPartitionToken:  token,
 			columnParentTokens:    []string{},
@@ -404,11 +404,11 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 	}
 
 	_, err := storage.client.Apply(ctx, []*spanner.Mutation{
-		insert("created1", timestamp, model.StateCreated),
-		insert("created2", timestamp.Add(-2*time.Second), model.StateCreated),
-		insert("scheduled", timestamp.Add(time.Second), model.StateScheduled),
-		insert("running", timestamp.Add(2*time.Second), model.StateRunning),
-		insert("finished", timestamp.Add(-time.Second), model.StateFinished),
+		insert("created1", timestamp, screamer.StateCreated),
+		insert("created2", timestamp.Add(-2*time.Second), screamer.StateCreated),
+		insert("scheduled", timestamp.Add(time.Second), screamer.StateScheduled),
+		insert("running", timestamp.Add(2*time.Second), screamer.StateRunning),
+		insert("finished", timestamp.Add(-time.Second), screamer.StateFinished),
 	})
 	s.NoError(err)
 
@@ -456,18 +456,18 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_AddChildPartitions() {
 	endTimestamp := time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
 	var heartbeatMillis int64 = 10000
 
-	parent := &model.PartitionMetadata{
+	parent := &screamer.PartitionMetadata{
 		PartitionToken:  "parent1",
 		ParentTokens:    []string{},
 		StartTimestamp:  time.Time{},
 		EndTimestamp:    endTimestamp,
 		HeartbeatMillis: heartbeatMillis,
-		State:           model.StateRunning,
+		State:           screamer.StateRunning,
 		Watermark:       time.Time{},
 	}
-	record := &model.ChildPartitionsRecord{
+	record := &screamer.ChildPartitionsRecord{
 		StartTimestamp: childStartTimestamp,
-		ChildPartitions: []*model.ChildPartition{
+		ChildPartitions: []*screamer.ChildPartition{
 			{Token: "token1", ParentPartitionTokens: []string{"parent1"}},
 			{Token: "token2", ParentPartitionTokens: []string{"parent1"}},
 		},
@@ -477,9 +477,9 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_AddChildPartitions() {
 
 	columns := []string{columnPartitionToken, columnParentTokens, columnStartTimestamp, columnEndTimestamp, columnHeartbeatMillis, columnState, columnWatermark}
 
-	got := []model.PartitionMetadata{}
+	got := []screamer.PartitionMetadata{}
 	err = storage.client.Single().Read(ctx, storage.tableName, spanner.AllKeys(), columns).Do(func(r *spanner.Row) error {
-		p := model.PartitionMetadata{}
+		p := screamer.PartitionMetadata{}
 		if err := r.ToStruct(&p); err != nil {
 			return err
 		}
@@ -488,14 +488,14 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_AddChildPartitions() {
 	})
 	s.NoError(err)
 
-	want := []model.PartitionMetadata{
+	want := []screamer.PartitionMetadata{
 		{
 			PartitionToken:  "token1",
 			ParentTokens:    []string{"parent1"},
 			StartTimestamp:  childStartTimestamp,
 			EndTimestamp:    endTimestamp,
 			HeartbeatMillis: heartbeatMillis,
-			State:           model.StateCreated,
+			State:           screamer.StateCreated,
 			Watermark:       childStartTimestamp,
 		},
 		{
@@ -504,7 +504,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_AddChildPartitions() {
 			StartTimestamp:  childStartTimestamp,
 			EndTimestamp:    endTimestamp,
 			HeartbeatMillis: heartbeatMillis,
-			State:           model.StateCreated,
+			State:           screamer.StateCreated,
 			Watermark:       childStartTimestamp,
 		},
 	}
@@ -518,19 +518,19 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 	storage := s.setupSpannerPartitionStorage(ctx, "Update")
 	defer storage.CleanupData(ctx)
 
-	create := func(token string) *model.PartitionMetadata {
-		return &model.PartitionMetadata{
+	create := func(token string) *screamer.PartitionMetadata {
+		return &screamer.PartitionMetadata{
 			PartitionToken:  token,
 			ParentTokens:    []string{},
 			StartTimestamp:  time.Time{},
 			EndTimestamp:    time.Time{},
 			HeartbeatMillis: 0,
-			State:           model.StateCreated,
+			State:           screamer.StateCreated,
 			Watermark:       time.Time{},
 		}
 	}
 
-	insert := func(p *model.PartitionMetadata) *spanner.Mutation {
+	insert := func(p *screamer.PartitionMetadata) *spanner.Mutation {
 		return spanner.InsertMap(storage.tableName, map[string]interface{}{
 			columnPartitionToken:  p.PartitionToken,
 			columnParentTokens:    p.ParentTokens,
@@ -544,7 +544,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 		})
 	}
 
-	partitions := []*model.PartitionMetadata{create("token1"), create("token2")}
+	partitions := []*screamer.PartitionMetadata{create("token1"), create("token2")}
 
 	_, err := storage.client.Apply(ctx, []*spanner.Mutation{
 		insert(partitions[0]),
@@ -559,8 +559,8 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 		columns := []string{columnPartitionToken, columnState}
 
 		type partition struct {
-			PartitionToken string      `spanner:"PartitionToken"`
-			State          model.State `spanner:"State"`
+			PartitionToken string         `spanner:"PartitionToken"`
+			State          screamer.State `spanner:"State"`
 		}
 		got := []partition{}
 
@@ -575,8 +575,8 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 		s.NoError(err)
 
 		want := []partition{
-			{PartitionToken: "token1", State: model.StateScheduled},
-			{PartitionToken: "token2", State: model.StateScheduled},
+			{PartitionToken: "token1", State: screamer.StateScheduled},
+			{PartitionToken: "token2", State: screamer.StateScheduled},
 		}
 		if !reflect.DeepEqual(got, want) {
 			s.T().Errorf("UpdateToScheduled(ctx, %+v): got = %+v, want %+v", partitions, got, want)
@@ -590,8 +590,8 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 		columns := []string{columnPartitionToken, columnState}
 
 		type partition struct {
-			PartitionToken string      `spanner:"PartitionToken"`
-			State          model.State `spanner:"State"`
+			PartitionToken string         `spanner:"PartitionToken"`
+			State          screamer.State `spanner:"State"`
 		}
 
 		r, err := storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{"token1"}, columns)
@@ -601,7 +601,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 		err = r.ToStruct(&got)
 		s.NoError(err)
 
-		want := partition{PartitionToken: "token1", State: model.StateRunning}
+		want := partition{PartitionToken: "token1", State: screamer.StateRunning}
 		if !reflect.DeepEqual(got, want) {
 			s.T().Errorf("UpdateToRunning(ctx, %+v): got = %+v, want %+v", partitions[0], got, want)
 		}
@@ -614,8 +614,8 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 		columns := []string{columnPartitionToken, columnState}
 
 		type partition struct {
-			PartitionToken string      `spanner:"PartitionToken"`
-			State          model.State `spanner:"State"`
+			PartitionToken string         `spanner:"PartitionToken"`
+			State          screamer.State `spanner:"State"`
 		}
 
 		r, err := storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{"token1"}, columns)
@@ -625,7 +625,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 		err = r.ToStruct(&got)
 		s.NoError(err)
 
-		want := partition{PartitionToken: "token1", State: model.StateFinished}
+		want := partition{PartitionToken: "token1", State: screamer.StateFinished}
 		if !reflect.DeepEqual(got, want) {
 			s.T().Errorf("UpdateToFinished(ctx, %+v): got = %+v, want %+v", partitions[0], got, want)
 		}

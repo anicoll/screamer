@@ -6,30 +6,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anicoll/screamer/pkg/model"
-	"github.com/anicoll/screamer/pkg/screamer"
+	"github.com/anicoll/screamer"
 )
 
 // InmemoryPartitionStorage implements PartitionStorage that stores PartitionMetadata in memory.
 type InmemoryPartitionStorage struct {
 	mu sync.Mutex
-	m  map[string]*model.PartitionMetadata
+	m  map[string]*screamer.PartitionMetadata
 }
 
 // NewInmemory creates new instance of InmemoryPartitionStorage
 func NewInmemory() *InmemoryPartitionStorage {
 	return &InmemoryPartitionStorage{
-		m: make(map[string]*model.PartitionMetadata),
+		m: make(map[string]*screamer.PartitionMetadata),
 	}
 }
 
-func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context.Context) (*model.PartitionMetadata, error) {
+func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context.Context) (*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	partitions := []*model.PartitionMetadata{}
+	partitions := []*screamer.PartitionMetadata{}
 	for _, p := range s.m {
-		if p.State != model.StateFinished {
+		if p.State != screamer.StateFinished {
 			partitions = append(partitions, p)
 		}
 	}
@@ -42,7 +41,7 @@ func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx contex
 	return partitions[0], nil
 }
 
-func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*model.PartitionMetadata, error) {
+func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
 	// InmemoryPartitionStorage can't return any partitions
 	return nil, nil
 }
@@ -51,13 +50,13 @@ func (s *InmemoryPartitionStorage) InitializeRootPartition(ctx context.Context, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	p := &model.PartitionMetadata{
-		PartitionToken:  model.RootPartitionToken,
+	p := &screamer.PartitionMetadata{
+		PartitionToken:  screamer.RootPartitionToken,
 		ParentTokens:    []string{},
 		StartTimestamp:  startTimestamp,
 		EndTimestamp:    endTimestamp,
 		HeartbeatMillis: heartbeatInterval.Milliseconds(),
-		State:           model.StateCreated,
+		State:           screamer.StateCreated,
 		Watermark:       startTimestamp,
 		CreatedAt:       time.Now(),
 	}
@@ -66,13 +65,13 @@ func (s *InmemoryPartitionStorage) InitializeRootPartition(ctx context.Context, 
 	return nil
 }
 
-func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context, minWatermark time.Time) ([]*model.PartitionMetadata, error) {
+func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context, minWatermark time.Time) ([]*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	partitions := []*model.PartitionMetadata{}
+	partitions := []*screamer.PartitionMetadata{}
 	for _, p := range s.m {
-		if p.State == model.StateCreated && !minWatermark.After(p.StartTimestamp) {
+		if p.State == screamer.StateCreated && !minWatermark.After(p.StartTimestamp) {
 			partitions = append(partitions, p)
 		}
 	}
@@ -80,18 +79,18 @@ func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context,
 	return partitions, nil
 }
 
-func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*model.PartitionMetadata, error) {
+func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	partitions := []*model.PartitionMetadata{}
+	partitions := []*screamer.PartitionMetadata{}
 	now := time.Now()
 
 	for _, p := range s.m {
-		if p.State == model.StateCreated && !minWatermark.After(p.StartTimestamp) {
+		if p.State == screamer.StateCreated && !minWatermark.After(p.StartTimestamp) {
 			p = s.m[p.PartitionToken]
 			p.ScheduledAt = &now
-			p.State = model.StateScheduled
+			p.State = screamer.StateScheduled
 			p.RunnerID = &runnerID
 			partitions = append(partitions, p)
 		}
@@ -100,18 +99,18 @@ func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context,
 	return partitions, nil
 }
 
-func (s *InmemoryPartitionStorage) AddChildPartitions(ctx context.Context, parent *model.PartitionMetadata, r *model.ChildPartitionsRecord) error {
+func (s *InmemoryPartitionStorage) AddChildPartitions(ctx context.Context, parent *screamer.PartitionMetadata, r *screamer.ChildPartitionsRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, v := range r.ChildPartitions {
-		p := &model.PartitionMetadata{
+		p := &screamer.PartitionMetadata{
 			PartitionToken:  v.Token,
 			ParentTokens:    v.ParentPartitionTokens,
 			StartTimestamp:  r.StartTimestamp,
 			EndTimestamp:    parent.EndTimestamp,
 			HeartbeatMillis: parent.HeartbeatMillis,
-			State:           model.StateCreated,
+			State:           screamer.StateCreated,
 			Watermark:       r.StartTimestamp,
 		}
 		s.m[p.PartitionToken] = p
@@ -120,7 +119,7 @@ func (s *InmemoryPartitionStorage) AddChildPartitions(ctx context.Context, paren
 	return nil
 }
 
-func (s *InmemoryPartitionStorage) UpdateToScheduled(ctx context.Context, partitions []*model.PartitionMetadata) error {
+func (s *InmemoryPartitionStorage) UpdateToScheduled(ctx context.Context, partitions []*screamer.PartitionMetadata) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -128,13 +127,13 @@ func (s *InmemoryPartitionStorage) UpdateToScheduled(ctx context.Context, partit
 	for _, p := range partitions {
 		p = s.m[p.PartitionToken]
 		p.ScheduledAt = &now
-		p.State = model.StateScheduled
+		p.State = screamer.StateScheduled
 	}
 
 	return nil
 }
 
-func (s *InmemoryPartitionStorage) UpdateToRunning(ctx context.Context, partition *model.PartitionMetadata) error {
+func (s *InmemoryPartitionStorage) UpdateToRunning(ctx context.Context, partition *screamer.PartitionMetadata) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -142,12 +141,12 @@ func (s *InmemoryPartitionStorage) UpdateToRunning(ctx context.Context, partitio
 
 	p := s.m[partition.PartitionToken]
 	p.RunningAt = &now
-	p.State = model.StateRunning
+	p.State = screamer.StateRunning
 
 	return nil
 }
 
-func (s *InmemoryPartitionStorage) UpdateToFinished(ctx context.Context, partition *model.PartitionMetadata) error {
+func (s *InmemoryPartitionStorage) UpdateToFinished(ctx context.Context, partition *screamer.PartitionMetadata) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -155,12 +154,12 @@ func (s *InmemoryPartitionStorage) UpdateToFinished(ctx context.Context, partiti
 
 	p := s.m[partition.PartitionToken]
 	p.FinishedAt = &now
-	p.State = model.StateFinished
+	p.State = screamer.StateFinished
 
 	return nil
 }
 
-func (s *InmemoryPartitionStorage) UpdateWatermark(ctx context.Context, partition *model.PartitionMetadata, watermark time.Time) error {
+func (s *InmemoryPartitionStorage) UpdateWatermark(ctx context.Context, partition *screamer.PartitionMetadata, watermark time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
