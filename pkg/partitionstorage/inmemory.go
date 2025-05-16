@@ -91,7 +91,6 @@ func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context,
 			p = s.m[p.PartitionToken]
 			p.ScheduledAt = &now
 			p.State = screamer.StateScheduled
-			p.RunnerID = &runnerID
 			partitions = append(partitions, p)
 		}
 	}

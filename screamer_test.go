@@ -17,6 +17,7 @@ import (
 	"github.com/go-faker/faker/v4"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -144,7 +145,7 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 
 	spannerClient, err := spanner.NewClient(ctx, s.dsn)
 	s.NoError(err)
-
+	runnerID := uuid.NewString()
 	s.T().Log("Creating table and change stream...")
 	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName())
 	s.NoError(err)
@@ -324,7 +325,7 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 	}
 	for _, test := range tests {
 		storage := partitionstorage.NewInmemory()
-		subscriber := screamer.NewSubscriber(spannerClient, streamName, storage, screamer.WithStartTimestamp(timeToStart))
+		subscriber := screamer.NewSubscriber(spannerClient, streamName, runnerID, storage, screamer.WithStartTimestamp(timeToStart))
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
