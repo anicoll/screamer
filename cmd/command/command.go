@@ -14,6 +14,7 @@ import (
 	"github.com/anicoll/screamer"
 	"github.com/anicoll/screamer/pkg/partitionstorage"
 	"github.com/anicoll/screamer/pkg/signal"
+	"github.com/google/uuid"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
 )
@@ -151,16 +152,18 @@ func (l *jsonOutputConsumer) Consume(change []byte) error {
 }
 
 func run(ctx context.Context, cfg *screamer.Config) error {
+	eg, ctx := errgroup.WithContext(ctx)
 	spannerClient, err := spanner.NewClient(ctx, cfg.DSN)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return err
 	}
 	defer spannerClient.Close()
+	runnerID := uuid.NewString()
 
 	var partitionStorage screamer.PartitionStorage
 	if *cfg.MetadataTable == "" {
-		// partitionStorage = partitionstorage.NewInmemory()
+		partitionStorage = partitionstorage.NewInmemory()
 	} else {
 		partitionSpannerClient, err := spanner.NewClient(ctx, *cfg.PartitionDSN)
 		if err != nil {
@@ -168,10 +171,30 @@ func run(ctx context.Context, cfg *screamer.Config) error {
 			return err
 		}
 		ps := partitionstorage.NewSpanner(partitionSpannerClient, *cfg.MetadataTable)
-		if err := ps.CreateTableIfNotExists(ctx); err != nil {
+		if err := ps.RunMigrations(ctx); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return err
 		}
+		if err := ps.RegisterRunner(ctx, runnerID); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return err
+		}
+		eg.Go(func() error {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-ticker.C:
+					if err := ps.RefreshRunner(ctx, runnerID); err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						return err
+					}
+				}
+			}
+		})
 		partitionStorage = ps
 	}
 
@@ -189,8 +212,12 @@ func run(ctx context.Context, cfg *screamer.Config) error {
 		options = append(options, screamer.WithSpannerRequestPriotiry(spannerpb.RequestOptions_Priority(cfg.Priority)))
 	}
 
-	subscriber := screamer.NewSubscriber(spannerClient, cfg.Stream, partitionStorage, options...)
+	subscriber := screamer.NewSubscriber(spannerClient, cfg.Stream, runnerID, partitionStorage, options...)
 	consumer := &jsonOutputConsumer{out: os.Stdout}
 
-	return subscriber.Subscribe(ctx, consumer)
+	eg.Go(func() error {
+		return subscriber.Subscribe(ctx, consumer)
+	})
+
+	return eg.Wait()
 }

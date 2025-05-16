@@ -118,7 +118,7 @@ func (s *SpannerTestSuite) createDatabase() {
 	s.NoError(err)
 }
 
-func (s *SpannerTestSuite) TestSpannerPartitionStorage_CreateTableIfNotExists() {
+func (s *SpannerTestSuite) TestSpannerPartitionStorage_RunMigrations() {
 	ctx := context.Background()
 	var err error
 	s.client, err = spanner.NewClient(ctx, s.dsn)
@@ -126,17 +126,17 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_CreateTableIfNotExists() 
 
 	storage := &SpannerPartitionStorage{
 		client:    s.client,
-		tableName: "CreateTableIfNotExists",
+		tableName: "RunMigrations",
 	}
 
-	err = storage.CreateTableIfNotExists(ctx)
+	err = storage.RunMigrations(ctx)
 	s.NoError(err)
 
 	iter := s.client.Single().Read(ctx, storage.tableName, spanner.AllKeys(), []string{columnPartitionToken})
 	defer iter.Stop()
 
 	if _, err := iter.Next(); err != iterator.Done {
-		s.T().Errorf("Read from %s after SpannerPartitionStorage.CreateTableIfNotExists() = %v, want %v", storage.tableName, err, iterator.Done)
+		s.T().Errorf("Read from %s after SpannerPartitionStorage.RunMigrations() = %v, want %v", storage.tableName, err, iterator.Done)
 	}
 
 	existsTable, err := existsTable(ctx, s.client, storage.tableName)
@@ -189,7 +189,7 @@ func (s *SpannerTestSuite) setupSpannerPartitionStorage(ctx context.Context, tab
 		tableName: tableName,
 	}
 
-	err = storage.CreateTableIfNotExists(ctx)
+	err = storage.RunMigrations(ctx)
 	s.NoError(err)
 
 	return &testStorage{
@@ -282,7 +282,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read() {
 			columnState:           state,
 			columnWatermark:       start,
 			columnCreatedAt:       spanner.CommitTimestamp,
-			columnUpdatedAt:       spanner.CommitTimestamp,
 		})
 	}
 
@@ -338,7 +337,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read_race() {
 			columnState:           state,
 			columnWatermark:       start,
 			columnCreatedAt:       spanner.CommitTimestamp,
-			columnUpdatedAt:       spanner.CommitTimestamp,
 		})
 	}
 
@@ -399,7 +397,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 			columnState:           state,
 			columnWatermark:       start,
 			columnCreatedAt:       spanner.CommitTimestamp,
-			columnUpdatedAt:       spanner.CommitTimestamp,
 		})
 	}
 
@@ -443,7 +440,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		s.Len(partitions, 1)
 		p := partitions[0]
 		s.Equal(p.PartitionToken, "created1")
-		s.Equal(p.RunnerID, runnerID)
 	})
 }
 
@@ -540,7 +536,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 			columnState:           p.State,
 			columnWatermark:       p.Watermark,
 			columnCreatedAt:       spanner.CommitTimestamp,
-			columnUpdatedAt:       spanner.CommitTimestamp,
 		})
 	}
 
@@ -551,37 +546,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 		insert(partitions[1]),
 	})
 	s.NoError(err)
-
-	s.Run("UpdateToScheduled", func() {
-		err := storage.UpdateToScheduled(ctx, partitions)
-		s.NoError(err)
-
-		columns := []string{columnPartitionToken, columnState}
-
-		type partition struct {
-			PartitionToken string         `spanner:"PartitionToken"`
-			State          screamer.State `spanner:"State"`
-		}
-		got := []partition{}
-
-		err = storage.client.Single().Read(ctx, storage.tableName, spanner.AllKeys(), columns).Do(func(r *spanner.Row) error {
-			p := partition{}
-			if err := r.ToStruct(&p); err != nil {
-				return err
-			}
-			got = append(got, p)
-			return nil
-		})
-		s.NoError(err)
-
-		want := []partition{
-			{PartitionToken: "token1", State: screamer.StateScheduled},
-			{PartitionToken: "token2", State: screamer.StateScheduled},
-		}
-		if !reflect.DeepEqual(got, want) {
-			s.T().Errorf("UpdateToScheduled(ctx, %+v): got = %+v, want %+v", partitions, got, want)
-		}
-	})
 
 	s.Run("UpdateToRunning", func() {
 		err := storage.UpdateToRunning(ctx, partitions[0])

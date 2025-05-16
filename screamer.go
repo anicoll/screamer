@@ -10,7 +10,6 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
-	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -115,7 +114,7 @@ var (
 // NewSubscriber creates a new subscriber of change streams.
 func NewSubscriber(
 	client *spanner.Client,
-	streamName string,
+	streamName, runnerID string,
 	partitionStorage PartitionStorage,
 	options ...Option,
 ) *Subscriber {
@@ -136,7 +135,7 @@ func NewSubscriber(
 		heartbeatInterval:      c.heartbeatInterval,
 		spannerRequestPriority: c.spannerRequestPriority,
 		partitionStorage:       partitionStorage,
-		runnerID:               uuid.NewString(),
+		runnerID:               runnerID,
 	}
 }
 
