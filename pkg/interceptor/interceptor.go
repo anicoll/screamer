@@ -20,7 +20,8 @@ func NewQueueInterceptor(queueSize int) *QueueInterceptor {
 	}
 }
 
-// UnaryInterceptor is the unary client interceptor implementation.
+// UnaryInterceptor is a unary client interceptor implementation that serializes requests and enforces queue limits.
+// It ensures only one request is processed at a time and respects context cancellation.
 func (qi *QueueInterceptor) UnaryInterceptor(
 	ctx context.Context,
 	method string,
@@ -55,7 +56,8 @@ func (qi *QueueInterceptor) UnaryInterceptor(
 	return invoker(ctx, method, req, reply, cc, opts...)
 }
 
-// StreamInterceptor is the stream client interceptor implementation.
+// StreamInterceptor is a stream client interceptor implementation that serializes requests and enforces queue limits.
+// It ensures only one stream is processed at a time and respects context cancellation.
 func (qi *QueueInterceptor) StreamInterceptor(
 	ctx context.Context,
 	desc *grpc.StreamDesc,
