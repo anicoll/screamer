@@ -20,6 +20,7 @@ type PartitionStorage interface {
 	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*PartitionMetadata, error)
 	AddChildPartitions(ctx context.Context, parentPartition *PartitionMetadata, childPartitionsRecord *ChildPartitionsRecord) error
 	UpdateToRunning(ctx context.Context, partition *PartitionMetadata) error
+	RefreshRunner(ctx context.Context, runnerID string) error
 	UpdateToFinished(ctx context.Context, partition *PartitionMetadata) error
 	UpdateWatermark(ctx context.Context, partition *PartitionMetadata, watermark time.Time) error
 }

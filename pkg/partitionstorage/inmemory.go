@@ -98,6 +98,10 @@ func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context,
 	return partitions, nil
 }
 
+func (s *InmemoryPartitionStorage) RefreshRunner(ctx context.Context, runnerID string) error {
+	return nil
+}
+
 func (s *InmemoryPartitionStorage) AddChildPartitions(ctx context.Context, parent *screamer.PartitionMetadata, r *screamer.ChildPartitionsRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
