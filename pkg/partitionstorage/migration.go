@@ -8,6 +8,8 @@ import (
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 )
 
+// RunMigrations creates or updates the necessary Spanner tables and indexes for partition and runner metadata management.
+// It is idempotent and can be safely called multiple times.
 func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 	databaseAdminClient, err := database.NewDatabaseAdminClient(ctx)
 	if err != nil {
