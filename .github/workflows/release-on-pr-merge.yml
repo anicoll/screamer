@@ -32,7 +32,7 @@ jobs:
         run: |
           label=$(echo "${{ toJson(github.event.pull_request.labels.*.name) }}" | grep -oE 'major|minor|patch' | head -n1)
           latest_tag=${{ steps.get_tag.outputs.latest_tag }}
-          version_no_v=${latest_tag#v}
+          version_no_v="${latest_tag#v}"
           IFS='.' read -r major minor patch <<< "$version_no_v"
           if [ "$label" = "major" ]; then
             major=$((major+1)); minor=0; patch=0
