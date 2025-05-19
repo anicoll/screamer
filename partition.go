@@ -13,9 +13,7 @@ type PartitionMetadata struct {
 	CreatedAt       time.Time  `spanner:"CreatedAt" json:"created_at"`
 	ScheduledAt     *time.Time `spanner:"ScheduledAt" json:"scheduled_at,omitempty"`
 	RunningAt       *time.Time `spanner:"RunningAt" json:"running_at,omitempty"`
-	UpdatedAt       time.Time  `spanner:"UpdatedAt" json:"updated_at,omitempty"`
 	FinishedAt      *time.Time `spanner:"FinishedAt" json:"finished_at,omitempty"`
-	RunnerID        *string    `spanner:"RunnerID" json:"runner_id,omitempty"`
 }
 
 type State string
