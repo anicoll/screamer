@@ -14,6 +14,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// NewTestContainer creates and starts a new test container with the specified image, environment variables, ports, wait strategy, and optional command arguments.
+// Returns a testcontainers.Container instance or an error.
 func NewTestContainer(ctx context.Context, image string, envVars map[string]string, ports []string, waitfor wait.Strategy, cmdArgs ...string) (testcontainers.Container, error) {
 	req := testcontainers.ContainerRequest{
 		SkipReaper:   true,
@@ -39,6 +41,8 @@ func NewTestContainer(ctx context.Context, image string, envVars map[string]stri
 	})
 }
 
+// CreateInstance creates a new Spanner instance with the given project and instance ID.
+// Returns the instance name or an error.
 func CreateInstance(ctx context.Context, parentProjectID, instanceID string) (string, error) {
 	instanceAdminClient, err := instance.NewInstanceAdminClient(ctx)
 	if err != nil {
@@ -67,6 +71,8 @@ func CreateInstance(ctx context.Context, parentProjectID, instanceID string) (st
 	return resp.Name, nil
 }
 
+// DeleteInstance deletes the specified Spanner instance.
+// Returns an error if the operation fails.
 func DeleteInstance(ctx context.Context, instanceName string) error {
 	instanceAdminClient, err := instance.NewInstanceAdminClient(ctx)
 	if err != nil {
@@ -79,6 +85,8 @@ func DeleteInstance(ctx context.Context, instanceName string) error {
 	})
 }
 
+// CreateDatabase creates a new Spanner database with the given parent instance name and database ID.
+// Returns the database name or an error.
 func CreateDatabase(ctx context.Context, parentInstanceName, databaseID string) (string, error) {
 	databaseAdminClient, err := database.NewDatabaseAdminClient(ctx)
 	if err != nil {

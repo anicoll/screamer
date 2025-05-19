@@ -5,6 +5,14 @@
 
 Cloud Spanner Change Streams Subscriber for Go
 
+---
+
+## New: Built-in Leader Election for Scalability
+
+Screamer now includes built-in leader election and runner liveness tracking. When you scale up and run multiple Screamer instances, partitions are automatically assigned to available runners, and failover is handled transparently. This enables robust, distributed processing of change streams with high availability.
+
+---
+
 ### Sypnosis
 
 This library is an implementation to subscribe a change stream's records of Google Cloud Spanner in Go.
@@ -38,6 +46,7 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	defer stop()
+	runnerID:= "runner-1"
 
 	database := fmt.Sprintf("projects/%s/instances/%s/databases/%s", "foo-project", "bar-instance", "baz-database")
 	spannerClient, err := spanner.NewClient(ctx, database)
@@ -48,10 +57,13 @@ func main() {
 
 	partitionMetadataTableName := "PartitionMetadata_FooStream"
 	partitionStorage := partitionstorage.NewSpanner(spannerClient, partitionMetadataTableName)
-	if err := partitionStorage.CreateTableIfNotExists(ctx); err != nil {
+	if err := partitionStorage.RunMigrations(ctx); err != nil {
 		panic(err)
 	}
-
+	if err := ps.RegisterRunner(ctx, runnerID); err != nil {
+		panic(err)
+	}
+	
 	changeStreamName := "FooStream"
 	subscriber := screamer.NewSubscriber(spannerClient, changeStreamName, partitionStorage)
 
@@ -110,4 +122,4 @@ OPTIONS:
 
 Heavily inspired by below projects.
 
-- spream (https://github.com/toga4/spream) 
+- spream (https://github.com/toga4/spream)

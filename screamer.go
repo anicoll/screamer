@@ -13,19 +13,30 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// PartitionStorage defines the interface for managing change stream partition metadata.
+// Implementations must be concurrency-safe.
 type PartitionStorage interface {
+	// GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark, or nil if none exist.
 	GetUnfinishedMinWatermarkPartition(ctx context.Context) (*PartitionMetadata, error)
+	// GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
 	GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*PartitionMetadata, error)
+	// InitializeRootPartition creates or updates the root partition metadata.
 	InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error
+	// GetAndSchedulePartitions finds partitions ready to be scheduled and assigns them to the given runnerID.
 	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*PartitionMetadata, error)
+	// AddChildPartitions adds new child partitions for a parent partition based on a ChildPartitionsRecord.
 	AddChildPartitions(ctx context.Context, parentPartition *PartitionMetadata, childPartitionsRecord *ChildPartitionsRecord) error
+	// UpdateToRunning marks the given partition as running.
 	UpdateToRunning(ctx context.Context, partition *PartitionMetadata) error
+	// RefreshRunner updates the liveness timestamp for the given runnerID.
 	RefreshRunner(ctx context.Context, runnerID string) error
+	// UpdateToFinished marks the given partition as finished.
 	UpdateToFinished(ctx context.Context, partition *PartitionMetadata) error
+	// UpdateWatermark updates the watermark for the given partition.
 	UpdateWatermark(ctx context.Context, partition *PartitionMetadata, watermark time.Time) error
 }
 
-// Subscriber subscribes change stream.
+// Subscriber subscribes to a change stream and manages partition processing.
 type Subscriber struct {
 	spannerClient          *spanner.Client
 	streamName             string
@@ -40,15 +51,16 @@ type Subscriber struct {
 	mu                     sync.Mutex
 }
 
+// Option configures a Subscriber via functional options.
+type Option interface {
+	Apply(*config)
+}
+
 type config struct {
 	startTimestamp         time.Time
 	endTimestamp           time.Time
 	heartbeatInterval      time.Duration
 	spannerRequestPriority spannerpb.RequestOptions_Priority
-}
-
-type Option interface {
-	Apply(*config)
 }
 
 type withStartTimestamp time.Time
@@ -57,8 +69,7 @@ func (o withStartTimestamp) Apply(c *config) {
 	c.startTimestamp = time.Time(o)
 }
 
-// WithStartTimestamp set the start timestamp option for read change streams.
-//
+// WithStartTimestamp sets the start timestamp option for reading change streams.
 // The value must be within the retention period of the change stream and before the current time.
 // Default value is current timestamp.
 func WithStartTimestamp(startTimestamp time.Time) Option {
@@ -71,10 +82,9 @@ func (o withEndTimestamp) Apply(c *config) {
 	c.endTimestamp = time.Time(o)
 }
 
-// WithEndTimestamp set the end timestamp option for read change streams.
-//
+// WithEndTimestamp sets the end timestamp option for reading change streams.
 // The value must be within the retention period of the change stream and must be after the start timestamp.
-// If not set, read latest changes until canceled.
+// If not set, reads latest changes until canceled.
 func WithEndTimestamp(endTimestamp time.Time) Option {
 	return withEndTimestamp(endTimestamp)
 }
@@ -85,8 +95,7 @@ func (o withHeartbeatInterval) Apply(c *config) {
 	c.heartbeatInterval = time.Duration(o)
 }
 
-// WithHeartbeatInterval set the heartbeat interval for read change streams.
-//
+// WithHeartbeatInterval sets the heartbeat interval for reading change streams.
 // Default value is 10 seconds.
 func WithHeartbeatInterval(heartbeatInterval time.Duration) Option {
 	return withHeartbeatInterval(heartbeatInterval)
@@ -98,8 +107,7 @@ func (o withSpannerRequestPriotiry) Apply(c *config) {
 	c.spannerRequestPriority = spannerpb.RequestOptions_Priority(o)
 }
 
-// WithSpannerRequestPriotiry set the request priority option for read change streams.
-//
+// WithSpannerRequestPriotiry sets the request priority option for reading change streams.
 // Default value is unspecified, equivalent to high.
 func WithSpannerRequestPriotiry(priority spannerpb.RequestOptions_Priority) Option {
 	return withSpannerRequestPriotiry(priority)
@@ -113,6 +121,7 @@ var (
 )
 
 // NewSubscriber creates a new subscriber of change streams.
+// The returned Subscriber is ready to start processing with Subscribe.
 func NewSubscriber(
 	client *spanner.Client,
 	streamName, runnerID string,
@@ -140,7 +149,8 @@ func NewSubscriber(
 	}
 }
 
-// Subscribe starts subscribing to the change stream.
+// Subscribe starts subscribing to the change stream and processing records using the provided Consumer.
+// This method blocks until all partitions are processed or the context is canceled.
 func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 	ctx = s.initErrGroup(ctx)
 	s.consumer = consumer
@@ -212,8 +222,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 }
 
 // SubscribeFunc is an adapter to allow the use of ordinary functions as Consumer.
-//
-// function might be called from multiple goroutines and must be re-entrant safe.
+// The function might be called from multiple goroutines and must be re-entrant safe.
 func (s *Subscriber) SubscribeFunc(ctx context.Context, f ConsumerFunc) error {
 	return s.Subscribe(ctx, f)
 }

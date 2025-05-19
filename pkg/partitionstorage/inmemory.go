@@ -15,13 +15,15 @@ type InmemoryPartitionStorage struct {
 	m  map[string]*screamer.PartitionMetadata
 }
 
-// NewInmemory creates new instance of InmemoryPartitionStorage
+// NewInmemory creates a new instance of InmemoryPartitionStorage.
 func NewInmemory() *InmemoryPartitionStorage {
 	return &InmemoryPartitionStorage{
 		m: make(map[string]*screamer.PartitionMetadata),
 	}
 }
 
+// GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark.
+// Returns nil if there are no unfinished partitions.
 func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context.Context) (*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -41,11 +43,13 @@ func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx contex
 	return partitions[0], nil
 }
 
+// GetInterruptedPartitions is a no-op for in-memory storage and always returns nil.
 func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
 	// InmemoryPartitionStorage can't return any partitions
 	return nil, nil
 }
 
+// InitializeRootPartition creates or updates the root partition metadata in memory.
 func (s *InmemoryPartitionStorage) InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -65,6 +69,7 @@ func (s *InmemoryPartitionStorage) InitializeRootPartition(ctx context.Context, 
 	return nil
 }
 
+// GetSchedulablePartitions returns partitions that are ready to be scheduled based on the minimum watermark.
 func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context, minWatermark time.Time) ([]*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -79,6 +84,7 @@ func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context,
 	return partitions, nil
 }
 
+// GetAndSchedulePartitions finds partitions ready to be scheduled and marks them as scheduled.
 func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -98,10 +104,12 @@ func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context,
 	return partitions, nil
 }
 
+// RefreshRunner is a no-op for in-memory storage.
 func (s *InmemoryPartitionStorage) RefreshRunner(ctx context.Context, runnerID string) error {
 	return nil
 }
 
+// AddChildPartitions adds new child partitions for a parent partition based on a ChildPartitionsRecord.
 func (s *InmemoryPartitionStorage) AddChildPartitions(ctx context.Context, parent *screamer.PartitionMetadata, r *screamer.ChildPartitionsRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -122,6 +130,7 @@ func (s *InmemoryPartitionStorage) AddChildPartitions(ctx context.Context, paren
 	return nil
 }
 
+// UpdateToScheduled marks the given partitions as scheduled and sets the ScheduledAt timestamp.
 func (s *InmemoryPartitionStorage) UpdateToScheduled(ctx context.Context, partitions []*screamer.PartitionMetadata) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,6 +145,7 @@ func (s *InmemoryPartitionStorage) UpdateToScheduled(ctx context.Context, partit
 	return nil
 }
 
+// UpdateToRunning marks the given partition as running and sets the RunningAt timestamp.
 func (s *InmemoryPartitionStorage) UpdateToRunning(ctx context.Context, partition *screamer.PartitionMetadata) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -149,6 +159,7 @@ func (s *InmemoryPartitionStorage) UpdateToRunning(ctx context.Context, partitio
 	return nil
 }
 
+// UpdateToFinished marks the given partition as finished and sets the FinishedAt timestamp.
 func (s *InmemoryPartitionStorage) UpdateToFinished(ctx context.Context, partition *screamer.PartitionMetadata) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -162,6 +173,7 @@ func (s *InmemoryPartitionStorage) UpdateToFinished(ctx context.Context, partiti
 	return nil
 }
 
+// UpdateWatermark updates the watermark for the given partition.
 func (s *InmemoryPartitionStorage) UpdateWatermark(ctx context.Context, partition *screamer.PartitionMetadata, watermark time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
