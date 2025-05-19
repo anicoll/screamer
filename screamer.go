@@ -20,6 +20,7 @@ type PartitionStorage interface {
 	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*PartitionMetadata, error)
 	AddChildPartitions(ctx context.Context, parentPartition *PartitionMetadata, childPartitionsRecord *ChildPartitionsRecord) error
 	UpdateToRunning(ctx context.Context, partition *PartitionMetadata) error
+	RefreshRunner(ctx context.Context, runnerID string) error
 	UpdateToFinished(ctx context.Context, partition *PartitionMetadata) error
 	UpdateWatermark(ctx context.Context, partition *PartitionMetadata, watermark time.Time) error
 }
@@ -143,6 +144,25 @@ func NewSubscriber(
 func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 	ctx = s.initErrGroup(ctx)
 	s.consumer = consumer
+
+	s.eg.Go(func() error {
+		ticker := time.NewTicker(time.Second * 2)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				err := s.partitionStorage.RefreshRunner(ctx, s.runnerID)
+				switch err {
+				case nil:
+					// continue
+				default:
+					return err
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
 
 	// Initialize root partition if this is the first run or if the previous run has already been completed.
 	minWatermarkPartition, err := s.partitionStorage.GetUnfinishedMinWatermarkPartition(ctx)

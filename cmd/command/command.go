@@ -189,7 +189,6 @@ func run(ctx context.Context, cfg *screamer.Config) error {
 					return ctx.Err()
 				case <-ticker.C:
 					if err := ps.RefreshRunner(ctx, runnerID); err != nil {
-						fmt.Fprintln(os.Stderr, err)
 						return err
 					}
 				}
