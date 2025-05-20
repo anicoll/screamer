@@ -56,6 +56,7 @@ func main() {
 	defer spannerClient.Close()
 
 	partitionMetadataTableName := "PartitionMetadata_FooStream"
+
 	partitionStorage := partitionstorage.NewSpanner(spannerClient, partitionMetadataTableName)
 	if err := partitionStorage.RunMigrations(ctx); err != nil {
 		panic(err)
@@ -63,7 +64,7 @@ func main() {
 	if err := ps.RegisterRunner(ctx, runnerID); err != nil {
 		panic(err)
 	}
-	
+
 	changeStreamName := "FooStream"
 	subscriber := screamer.NewSubscriber(spannerClient, changeStreamName, partitionStorage)
 
@@ -97,7 +98,7 @@ $ go install github.com/anicoll/screamer@latest
 
 ### Usage
 
-```                          
+```
 NAME:
    screamer screamer
 
@@ -116,7 +117,6 @@ OPTIONS:
 ```
 
 ### Example
-
 
 ## Credits
 
