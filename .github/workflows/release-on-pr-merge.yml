@@ -1,16 +1,25 @@
 name: Release on PR Merge
 
 on:
-  workflow_dispatch:
   pull_request:
     types:
       - closed
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "Release type"
+        required: true
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
 
 jobs:
   release:
-    if: github.event.pull_request.merged == true && (contains(github.event.pull_request.labels.*.name, 'major') || contains(github.event.pull_request.labels.*.name, 'minor') || contains(github.event.pull_request.labels.*.name, 'patch'))
+    if: (github.event_name == 'pull_request' && github.event.pull_request.merged == true && (contains(github.event.pull_request.labels.*.name, 'major') || contains(github.event.pull_request.labels.*.name, 'minor') || contains(github.event.pull_request.labels.*.name, 'patch'))) || (github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -31,7 +40,11 @@ jobs:
       - name: Bump version
         id: bump_version
         run: |
-          label=$(echo "${{ toJson(github.event.pull_request.labels.*.name) }}" | grep -oE 'major|minor|patch' | head -n1)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            label="${{ github.event.inputs.label }}"
+          else
+            label=$(echo "${{ toJson(github.event.pull_request.labels.*.name) }}" | grep -oE 'major|minor|patch' | head -n1)
+          fi
           latest_tag=${{ steps.get_tag.outputs.latest_tag }}
           version_no_v="${latest_tag#v}"
           IFS='.' read -r major minor patch <<< "$version_no_v"
