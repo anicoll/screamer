@@ -106,7 +106,7 @@ func (s *SpannerPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context
 }
 
 // RegisterRunner registers a runner in the Runner table with the given runnerID.
-// Used for leader election and partition assignment.
+// Used for distributed lock and partition assignment.
 func (s *SpannerPartitionStorage) RegisterRunner(ctx context.Context, runnerID string) error {
 	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		return tx.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdateMap(tableRunner, map[string]interface{}{

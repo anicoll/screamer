@@ -7,9 +7,9 @@ Cloud Spanner Change Streams Subscriber for Go
 
 ---
 
-## New: Built-in Leader Election for Scalability
+## New: Built-in Distributed Locking for Scalability
 
-Screamer now includes built-in leader election and runner liveness tracking. When you scale up and run multiple Screamer instances, partitions are automatically assigned to available runners, and failover is handled transparently. This enables robust, distributed processing of change streams with high availability.
+Screamer now includes built-in distributed locking and runner liveness tracking. When you scale up and run multiple Screamer instances, partitions are automatically assigned to available runners, and failover is handled transparently. This enables robust, distributed processing of change streams with high availability.
 
 ---
 
