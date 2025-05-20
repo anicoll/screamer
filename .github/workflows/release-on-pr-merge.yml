@@ -60,11 +60,11 @@ jobs:
           echo $new_tag
           echo "new_tag=$new_tag" >> $GITHUB_OUTPUT
 
-      # - name: Create Release
-      #   uses: softprops/action-gh-release@v2
-      #   with:
-      #     tag_name: ${{ steps.bump_version.outputs.new_tag }}
-      #     name: Release ${{ steps.bump_version.outputs.new_tag }}
-      #     body: "Automated release triggered by PR #${{ github.event.pull_request.number }} with label ${{ steps.bump_version.outputs.label }}."
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.bump_version.outputs.new_tag }}
+          name: Release ${{ steps.bump_version.outputs.new_tag }}
+          body: "Automated release triggered by PR #${{ github.event.pull_request.number }} with label ${{ steps.bump_version.outputs.label }}."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
