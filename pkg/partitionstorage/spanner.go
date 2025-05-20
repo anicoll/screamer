@@ -84,7 +84,7 @@ func (s *SpannerPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context
 		},
 	}
 
-	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority})
+	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "GetUnfinishedMinWatermarkPartition"})
 	defer iter.Stop()
 
 	r, err := iter.Next()
@@ -108,25 +108,21 @@ func (s *SpannerPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context
 // RegisterRunner registers a runner in the Runner table with the given runnerID.
 // Used for distributed lock and partition assignment.
 func (s *SpannerPartitionStorage) RegisterRunner(ctx context.Context, runnerID string) error {
-	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		return tx.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdateMap(tableRunner, map[string]interface{}{
-			columnRunnerID:  runnerID,
-			columnUpdatedAt: spanner.CommitTimestamp,
-			columnCreatedAt: spanner.CommitTimestamp,
-		})})
-	})
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdateMap(tableRunner, map[string]interface{}{
+		columnRunnerID:  runnerID,
+		columnUpdatedAt: spanner.CommitTimestamp,
+		columnCreatedAt: spanner.CommitTimestamp,
+	})}, spanner.TransactionTag("RegisterRunner"))
 	return err
 }
 
 // RefreshRunner updates the UpdatedAt timestamp for the given runnerID in the Runner table.
 // Used to indicate liveness of a runner.
 func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID string) error {
-	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		return tx.BufferWrite([]*spanner.Mutation{spanner.UpdateMap(tableRunner, map[string]interface{}{
-			columnRunnerID:  runnerID,
-			columnUpdatedAt: spanner.CommitTimestamp,
-		})})
-	})
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.UpdateMap(tableRunner, map[string]interface{}{
+		columnRunnerID:  runnerID,
+		columnUpdatedAt: spanner.CommitTimestamp,
+	})}, spanner.TransactionTag("RefreshRunner"))
 	return err
 }
 
@@ -135,7 +131,7 @@ func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID st
 func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
 	var partitions []*screamer.PartitionMetadata
 
-	if _, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+	if _, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		mutations := []*spanner.Mutation{}
 		partitions = make([]*screamer.PartitionMetadata, 0)
 		stmt := spanner.Statement{
@@ -186,7 +182,7 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 			return err
 		}
 		return tx.BufferWrite(mutations)
-	}); err != nil {
+	}, spanner.TransactionOptions{TransactionTag: "GetInterruptedPartitions"}); err != nil {
 		return nil, err
 	}
 
@@ -210,7 +206,7 @@ func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, s
 		columnFinishedAt:      nil,
 	})
 
-	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority))
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("InitializeRootPartition"))
 	return err
 }
 
@@ -219,7 +215,7 @@ func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, s
 func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
 	var partitions []*screamer.PartitionMetadata
 
-	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+	_, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		partitions = make([]*screamer.PartitionMetadata, 0)
 		mutations := make([]*spanner.Mutation, 0, len(partitions))
 
@@ -231,7 +227,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 			},
 		}
 
-		iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority})
+		iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "GetAndSchedulePartitions"})
 
 		if err := iter.Do(func(r *spanner.Row) error {
 			p := new(screamer.PartitionMetadata)
@@ -261,7 +257,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 
 		// writes the updates to spanner.
 		return tx.BufferWrite(mutations)
-	})
+	}, spanner.TransactionOptions{TransactionTag: "GetAndSchedulePartitions"})
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +279,7 @@ func (s *SpannerPartitionStorage) AddChildPartitions(ctx context.Context, parent
 			columnCreatedAt:       spanner.CommitTimestamp,
 		})
 
-		if _, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority)); err != nil {
+		if _, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("AddChildPartitions")); err != nil {
 			// Ignore the AlreadyExists error because a child partition can be found multiple times if partitions are merged.
 			if spanner.ErrCode(err) == codes.AlreadyExists {
 				continue
@@ -303,7 +299,7 @@ func (s *SpannerPartitionStorage) UpdateToRunning(ctx context.Context, partition
 		columnRunningAt:      spanner.CommitTimestamp,
 	})
 
-	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority))
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateToRunning"))
 	return err
 }
 
@@ -315,7 +311,7 @@ func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partitio
 		columnFinishedAt:     spanner.CommitTimestamp,
 	})
 
-	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority))
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateToFinished"))
 	return err
 }
 
@@ -326,7 +322,7 @@ func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition
 		columnWatermark:      watermark,
 	})
 
-	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority))
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateWatermark"))
 	return err
 }
 
