@@ -49,6 +49,8 @@ type Subscriber struct {
 	consumer               Consumer
 	eg                     *errgroup.Group
 	mu                     sync.Mutex
+	serializedConsumer     bool
+	consumerMu             sync.Mutex
 }
 
 // Option configures a Subscriber via functional options.
@@ -61,6 +63,7 @@ type config struct {
 	endTimestamp           time.Time
 	heartbeatInterval      time.Duration
 	spannerRequestPriority spannerpb.RequestOptions_Priority
+	serializedConsumer     bool
 }
 
 type withStartTimestamp time.Time
@@ -113,9 +116,23 @@ func WithSpannerRequestPriotiry(priority spannerpb.RequestOptions_Priority) Opti
 	return withSpannerRequestPriotiry(priority)
 }
 
+type withSerializedConsumer bool
+
+func (o withSerializedConsumer) Apply(c *config) {
+	c.serializedConsumer = bool(o)
+}
+
+// WithSerializedConsumer enables or disables serialized processing of records by the Consumer.
+// When true, a mutex ensures that s.consumer.Consume() is called serially, simplifying
+// Consumer implementations that are not re-entrant safe. This may impact performance.
+// Default is false (concurrent consumption is allowed if the Consumer is re-entrant safe).
+func WithSerializedConsumer(serialized bool) Option {
+	return withSerializedConsumer(serialized)
+}
+
 var (
 	defaultEndTimestamp      = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC) // Maximum value of Spanner TIMESTAMP type.
-	defaultHeartbeatInterval = 3 * time.Second
+	defaultHeartbeatInterval = 10 * time.Second
 
 	nowFunc = time.Now
 )
@@ -146,6 +163,7 @@ func NewSubscriber(
 		spannerRequestPriority: c.spannerRequestPriority,
 		partitionStorage:       partitionStorage,
 		runnerID:               runnerID,
+		serializedConsumer:     c.serializedConsumer,
 	}
 }
 
@@ -245,7 +263,7 @@ var errDone = errors.New("all partitions have been processed")
 func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 	minWatermarkPartition, err := s.partitionStorage.GetUnfinishedMinWatermarkPartition(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get unfinished min watarmark partition: %w", err)
+		return fmt.Errorf("failed to get unfinished min watermark partition: %w", err)
 	}
 
 	if minWatermarkPartition == nil {
@@ -333,8 +351,17 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			if err != nil {
 				return err
 			}
-			if err := s.consumer.Consume(out); err != nil {
-				return err
+			if s.serializedConsumer {
+				s.consumerMu.Lock()
+				err = s.consumer.Consume(out)
+				s.consumerMu.Unlock()
+				if err != nil {
+					return err
+				}
+			} else {
+				if err := s.consumer.Consume(out); err != nil {
+					return err
+				}
 			}
 			watermarker.set(record.CommitTimestamp)
 		}
