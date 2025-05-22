@@ -111,7 +111,7 @@ OPTIONS:
    --metadata-table value       [$METADATA_TABLE]
    --start value               (default: Start timestamp with RFC3339 format, default: current timestamp) [$START]
    --end value                 (default: End timestamp with RFC3339 format default: indefinite) [$END]
-   --heartbeat-interval value  (default: 10s) [$HEARTBEAT_INTERVAL]
+   --heartbeat-interval value  (default: 3s) [$HEARTBEAT_INTERVAL]
    --partition-dsn value       (default: Database dsn for use by the partition metadata table. If not provided, the main dsn will be used.) [$PARTITION_DSN]
    --help, -h                  show help
 ```
