@@ -19,7 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var defaultHeartbeatInterval time.Duration = 10 * time.Second
+var defaultHeartbeatInterval time.Duration = 3 * time.Second
 
 func ScreamerCommand() *cli.Command {
 	flags := []cli.Flag{

@@ -6,18 +6,12 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
-	"log"
-	"os"
 
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/anicoll/screamer"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 )
-
-// logger is used for package-level logging.
-// It's a simple logger to stderr; a more sophisticated structured logger could be injected if available project-wide.
-var logger = log.New(os.Stderr, "[ScreamerStorage] ", log.LstdFlags|log.Lmicroseconds)
 
 // SpannerPartitionStorage implements PartitionStorage that stores PartitionMetadata in Cloud Spanner.
 type SpannerPartitionStorage struct {
@@ -136,7 +130,6 @@ func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID st
 // GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
 // Assigns the current runnerID to these partitions for recovery.
 func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
-	logger.Printf("GetInterruptedPartitions: Called by runner %s", runnerID)
 	var partitions []*screamer.PartitionMetadata
 
 	_, errOuter := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
@@ -146,24 +139,24 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 			SQL: fmt.Sprintf(`
 				WITH StaleRunners AS (
 					SELECT RunnerID
-					FROM %[1]s
-					WHERE UpdatedAt <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
-				),
-				RecentRunners AS (
-					SELECT ptr.PartitionToken
+						FROM %[1]s
+						WHERE UpdatedAt <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
+					),
+				StalePartitions AS (
+					SELECT 
+						ptr.PartitionToken,
+						MAX(r.UpdatedAt) as UpdatedAt
 					FROM %[1]s r
 					INNER JOIN %[2]s ptr ON ptr.RunnerID = r.RunnerID
-					WHERE r.UpdatedAt >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
+					GROUP BY ptr.PartitionToken
+					HAVING MAX(r.UpdatedAt) <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
 				)
 				SELECT DISTINCT m.* EXCEPT (ParentTokens)
 				FROM %[3]s m
 				LEFT JOIN %[2]s ptr ON m.PartitionToken = ptr.PartitionToken
 				WHERE m.State IN UNNEST(@states)
-				AND (
-					ptr.PartitionToken IS NULL
-					OR ptr.RunnerID IN (SELECT RunnerID FROM StaleRunners)
-				)
-				AND ptr.PartitionToken NOT IN (SELECT PartitionToken FROM RecentRunners) FOR UPDATE`, tableRunner, tablePartitionToRunner, s.tableName),
+					AND (ptr.PartitionToken IS NULL OR ptr.PartitionToken IN (SELECT PartitionToken FROM StalePartitions)) 
+				FOR UPDATE`, tableRunner, tablePartitionToRunner, s.tableName),
 			Params: map[string]interface{}{
 				"states": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
 			},
@@ -193,34 +186,19 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 			// Individual partition reassignment attempt will be logged if transaction succeeds.
 			return nil
 		}); err != nil {
-			logger.Printf("GetInterruptedPartitions: Error iterating query results for runner %s: %v", runnerID, err)
 			return fmt.Errorf("error processing partitions to reassign for runner %s: %w", runnerID, err)
 		}
 
 		if len(mutations) > 0 {
-			logger.Printf("GetInterruptedPartitions: Runner %s attempting to commit reassignment of %d partition(s). First token: %s", runnerID, len(partitions), partitions[0].PartitionToken)
 			return tx.BufferWrite(mutations)
 		}
-		logger.Printf("GetInterruptedPartitions: Runner %s found no interrupted partitions to reassign.", runnerID)
 		return nil
 	}, spanner.TransactionOptions{TransactionTag: "GetInterruptedPartitions"})
 
 	if errOuter != nil {
-		logger.Printf("GetInterruptedPartitions: Transaction failed for runner %s: %v", runnerID, errOuter)
 		return nil, fmt.Errorf("transaction failed for GetInterruptedPartitions with runner %s: %w", runnerID, errOuter)
 	}
 
-	if len(partitions) > 0 {
-		tokens := make([]string, len(partitions))
-		for i, p := range partitions {
-			tokens[i] = p.PartitionToken
-		}
-		logger.Printf("GetInterruptedPartitions: Runner %s successfully reassigned %d partition(s): %v", runnerID, len(partitions), tokens)
-	} else {
-		// This log might be redundant if the one inside the transaction ("found no interrupted partitions") is always hit in this case.
-		// However, keeping it for clarity on overall outcome of the function call.
-		logger.Printf("GetInterruptedPartitions: Runner %s completed call, no partitions were reassigned.", runnerID)
-	}
 	return partitions, nil
 }
 
@@ -275,6 +253,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 				columnState:          screamer.StateScheduled,
 				columnScheduledAt:    spanner.CommitTimestamp,
 			})
+			p.State = screamer.StateScheduled // mark partition as scheduled
 			mutations = append(mutations, m)
 			m = spanner.InsertMap(tablePartitionToRunner, map[string]interface{}{
 				columnPartitionToken: p.PartitionToken,

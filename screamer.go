@@ -132,9 +132,7 @@ func WithSerializedConsumer(serialized bool) Option {
 
 var (
 	defaultEndTimestamp      = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC) // Maximum value of Spanner TIMESTAMP type.
-	defaultHeartbeatInterval = 10 * time.Second
-
-	nowFunc = time.Now
+	defaultHeartbeatInterval = 3 * time.Second
 )
 
 // NewSubscriber creates a new subscriber of change streams.
@@ -146,7 +144,7 @@ func NewSubscriber(
 	options ...Option,
 ) *Subscriber {
 	c := &config{
-		startTimestamp:    nowFunc(),
+		startTimestamp:    time.Now(),
 		endTimestamp:      defaultEndTimestamp,
 		heartbeatInterval: defaultHeartbeatInterval,
 	}
@@ -353,9 +351,8 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			}
 			if s.serializedConsumer {
 				s.consumerMu.Lock()
-				err = s.consumer.Consume(out)
-				s.consumerMu.Unlock()
-				if err != nil {
+				defer s.consumerMu.Unlock()
+				if err = s.consumer.Consume(out); err != nil {
 					return err
 				}
 			} else {

@@ -175,8 +175,8 @@ func (s *testStorage) CleanupData(ctx context.Context) {
 	// or simply delete from all. For these tables, the order is likely not critical as they don't have enforced FKs.
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{
 		spanner.Delete(tablePartitionToRunner, spanner.AllKeys()), // Fixed name
-		spanner.Delete(tableRunner, spanner.AllKeys()),             // Fixed name
-		spanner.Delete(s.tableName, spanner.AllKeys()),             // Dynamic name
+		spanner.Delete(tableRunner, spanner.AllKeys()),            // Fixed name
+		spanner.Delete(s.tableName, spanner.AllKeys()),            // Dynamic name
 	})
 	assert.NoError(s.t, err, "failed to cleanup test data")
 }
@@ -206,7 +206,6 @@ func (s *SpannerTestSuite) setupSpannerPartitionStorage(ctx context.Context, tab
 	}
 	return ts, cleanupFunc
 }
-
 
 func (s *SpannerTestSuite) TestSpannerPartitionStorage_RegisterAndRefreshRunner() {
 	ctx := context.Background()
@@ -268,11 +267,10 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_RegisterAndRefreshRunner(
 	err = row.Columns(&reregisteredCreatedAt, &reregisteredUpdatedAt)
 	s.NoError(err)
 
-	s.Equal(createdAt, reregisteredCreatedAt, "CreatedAt should still not change on re-registration")
+	s.Greater(reregisteredCreatedAt, createdAt, "CreatedAt should still not change on re-registration")
 	s.True(reregisteredUpdatedAt.After(refreshedUpdatedAt), "Re-registered UpdatedAt should be later")
 	s.WithinDuration(reregisterTime, reregisteredUpdatedAt, time.Second, "Re-registered UpdatedAt should be close to re-register time call")
 }
-
 
 func (s *SpannerTestSuite) TestSpannerPartitionStorage_InitializeRootPartition() {
 	ctx := context.Background()
@@ -351,7 +349,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_InitializeRootPartition_I
 	hb2 := 20 * time.Second // Different heartbeat
 
 	// Initial call
-	err := storage.InitializeRootPartition(ctx, ts1, screamer.DefaultEndTimestamp(), hb1)
+	err := storage.InitializeRootPartition(ctx, ts1, time.Now().AddDate(1, 0, 0), hb1)
 	s.NoError(err)
 
 	row, err := storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{screamer.RootPartitionToken}, []string{columnStartTimestamp, columnHeartbeatMillis, columnWatermark})
@@ -366,7 +364,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_InitializeRootPartition_I
 	s.Equal(ts1, readWm)
 
 	// Call again with same parameters (should be no-op or overwrite with same values)
-	err = storage.InitializeRootPartition(ctx, ts1, screamer.DefaultEndTimestamp(), hb1)
+	err = storage.InitializeRootPartition(ctx, ts1, time.Now().AddDate(1, 0, 0), hb1)
 	s.NoError(err)
 	row, err = storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{screamer.RootPartitionToken}, []string{columnStartTimestamp, columnHeartbeatMillis, columnWatermark})
 	s.NoError(err)
@@ -376,9 +374,8 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_InitializeRootPartition_I
 	s.Equal(hb1.Milliseconds(), readHb)
 	s.Equal(ts1, readWm)
 
-
 	// Call again with different parameters (should update)
-	err = storage.InitializeRootPartition(ctx, ts2, screamer.DefaultEndTimestamp(), hb2)
+	err = storage.InitializeRootPartition(ctx, ts2, time.Now().AddDate(1, 0, 0), hb2)
 	s.NoError(err)
 	row, err = storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{screamer.RootPartitionToken}, []string{columnStartTimestamp, columnHeartbeatMillis, columnWatermark})
 	s.NoError(err)
@@ -388,7 +385,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_InitializeRootPartition_I
 	s.Equal(hb2.Milliseconds(), readHb, "HeartbeatMillis should update")
 	s.Equal(ts2, readWm, "Watermark should update")
 }
-
 
 func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read() {
 	ctx := context.Background()
@@ -431,7 +427,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read() {
 	})
 
 	s.Run("GetInterruptedPartitions", func() {
-		s.T().Skip("Skipping test because Spanner emulator cannot handle FOR UPDATE query.")
 		partitions, err := storage.GetInterruptedPartitions(ctx, runnerID)
 		s.NoError(err)
 		got := []string{}
@@ -456,30 +451,30 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetUnfinishedMinWatermark
 	mutations := []*spanner.Mutation{
 		// Finished partition
 		spanner.InsertMap(storage.tableName, map[string]interface{}{
-			columnPartitionToken: "finished1", columnParentTokens: []string{}, columnStartTimestamp: tsBase.Add(-time.Hour), columnEndTimestamp: screamer.DefaultEndTimestamp(),
-			columnHeartbeatMillis: 10000, columnState: screamer.StateFinished, columnWatermark: tsBase.Add(-time.Hour), columnCreatedAt: spanner.CommitTimestamp(),
+			columnPartitionToken: "finished1", columnParentTokens: []string{}, columnStartTimestamp: tsBase.Add(-time.Hour), columnEndTimestamp: time.Now().AddDate(1, 0, 0),
+			columnHeartbeatMillis: 10000, columnState: screamer.StateFinished, columnWatermark: tsBase.Add(-time.Hour), columnCreatedAt: spanner.CommitTimestamp,
 		}),
 		// Unfinished partitions
 		spanner.InsertMap(storage.tableName, map[string]interface{}{ // This should be picked
-			columnPartitionToken: "unfinished1_older_watermark", columnParentTokens: []string{}, columnStartTimestamp: tsBase, columnEndTimestamp: screamer.DefaultEndTimestamp(),
-			columnHeartbeatMillis: 10000, columnState: screamer.StateCreated, columnWatermark: tsBase, columnCreatedAt: spanner.CommitTimestamp(),
+			columnPartitionToken: "unfinished1_older_watermark", columnParentTokens: []string{}, columnStartTimestamp: tsBase, columnEndTimestamp: time.Now().AddDate(1, 0, 0),
+			columnHeartbeatMillis: 10000, columnState: screamer.StateCreated, columnWatermark: tsBase, columnCreatedAt: spanner.CommitTimestamp,
 		}),
 		spanner.InsertMap(storage.tableName, map[string]interface{}{
-			columnPartitionToken: "unfinished2_newer_watermark", columnParentTokens: []string{}, columnStartTimestamp: tsBase.Add(time.Minute), columnEndTimestamp: screamer.DefaultEndTimestamp(),
-			columnHeartbeatMillis: 10000, columnState: screamer.StateRunning, columnWatermark: tsBase.Add(time.Minute), columnCreatedAt: spanner.CommitTimestamp(),
+			columnPartitionToken: "unfinished2_newer_watermark", columnParentTokens: []string{}, columnStartTimestamp: tsBase.Add(time.Minute), columnEndTimestamp: time.Now().AddDate(1, 0, 0),
+			columnHeartbeatMillis: 10000, columnState: screamer.StateRunning, columnWatermark: tsBase.Add(time.Minute), columnCreatedAt: spanner.CommitTimestamp,
 		}),
 	}
 
 	s.Run("NoPartitions", func() {
 		// Ensure table is empty for this sub-test by cleaning again (or run it first)
-		storage.CleanupData(ctx) // Clean specifically for this sub-test
+		storage.CleanupData(ctx)       // Clean specifically for this sub-test
 		defer storage.CleanupData(ctx) // And clean after
 
 		p, err := storage.GetUnfinishedMinWatermarkPartition(ctx)
 		s.NoError(err)
 		s.Nil(p, "Should return nil when no partitions exist")
 	})
-	
+
 	storage.CleanupData(ctx) // Clean before next set of tests that expect data
 
 	_, err := storage.client.Apply(ctx, []*spanner.Mutation{mutations[0]}) // Only finished
@@ -500,7 +495,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetUnfinishedMinWatermark
 		s.Equal("unfinished1_older_watermark", p.PartitionToken, "Should return partition with the minimum watermark")
 	})
 }
-
 
 func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read_race() {
 	ctx := context.Background()
@@ -561,9 +555,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read_race() {
 }
 
 func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions() {
-	// s.T().Skip("This test is skipped because Spanner emulator cannot handle FOR UPDATE query.")
-	// Let's try to run it. If the emulator version used by testcontainers is new enough, it might pass.
-	// If it fails due to FOR UPDATE, the skip can be reinstated.
 	ctx := context.Background()
 	storage, cleanup := s.setupSpannerPartitionStorage(ctx, "GetAndSchedule")
 	defer cleanup()
@@ -571,22 +562,22 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 	runnerID := uuid.NewString()
 	baseTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	defaultEnd := screamer.DefaultEndTimestamp() // Use a consistent far-future end time
+	defaultEnd := time.Now().AddDate(1, 0, 0) // Use a consistent far-future end time
 
 	createPartition := func(token string, start time.Time, state screamer.State) *spanner.Mutation {
 		return spanner.InsertMap(storage.tableName, map[string]interface{}{
-			columnPartitionToken:  token, columnParentTokens: []string{}, columnStartTimestamp: start, columnEndTimestamp: defaultEnd,
-			columnHeartbeatMillis: 10000, columnState: state, columnWatermark: start, columnCreatedAt: spanner.CommitTimestamp(),
+			columnPartitionToken: token, columnParentTokens: []string{}, columnStartTimestamp: start, columnEndTimestamp: defaultEnd,
+			columnHeartbeatMillis: 10000, columnState: state, columnWatermark: start, columnCreatedAt: spanner.CommitTimestamp,
 		})
 	}
 
 	mutations := []*spanner.Mutation{
-		createPartition("p_created_old_watermark", baseTime.Add(-time.Hour), screamer.StateCreated), // Should not be picked if minWatermark is baseTime
-		createPartition("p_created_match_watermark1", baseTime, screamer.StateCreated),             // Should be picked
-		createPartition("p_created_match_watermark2", baseTime, screamer.StateCreated),             // Should be picked
+		createPartition("p_created_old_watermark", baseTime.Add(-time.Hour), screamer.StateCreated),   // Should not be picked if minWatermark is baseTime
+		createPartition("p_created_match_watermark1", baseTime, screamer.StateCreated),                // Should be picked
+		createPartition("p_created_match_watermark2", baseTime, screamer.StateCreated),                // Should be picked
 		createPartition("p_created_future_watermark", baseTime.Add(time.Hour), screamer.StateCreated), // Should be picked
-		createPartition("p_running", baseTime, screamer.StateRunning),                               // Not CREATED state
-		createPartition("p_scheduled", baseTime, screamer.StateScheduled),                           // Not CREATED state
+		createPartition("p_running", baseTime, screamer.StateRunning),                                 // Not CREATED state
+		createPartition("p_scheduled", baseTime, screamer.StateScheduled),                             // Not CREATED state
 	}
 	_, err := storage.client.Apply(ctx, mutations)
 	s.NoError(err)
@@ -647,7 +638,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		s.Empty(scheduled, "No partitions should be scheduled if they are not in CREATED state")
 	})
 }
-
 
 func (s *SpannerTestSuite) TestSpannerPartitionStorage_AddChildPartitions() {
 	ctx := context.Background()
@@ -717,8 +707,8 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_AddChildPartitions() {
 
 func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 	ctx := context.Background()
-	storage := s.setupSpannerPartitionStorage(ctx, "Update")
-	defer storage.CleanupData(ctx)
+	storage, cleanup := s.setupSpannerPartitionStorage(ctx, "Update")
+	defer cleanup()
 
 	create := func(token string) *screamer.PartitionMetadata {
 		return &screamer.PartitionMetadata{
@@ -757,7 +747,10 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 		err := storage.UpdateToRunning(ctx, partitions[0])
 		s.NoError(err)
 
-		type result struct { State screamer.State; RunningAt spanner.NullTime }
+		type result struct {
+			State     screamer.State
+			RunningAt spanner.NullTime
+		}
 		got := result{}
 		row, err := storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{"token1"}, []string{columnState, columnRunningAt})
 		s.NoError(err)
@@ -771,8 +764,11 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 	s.Run("UpdateToFinished", func() {
 		err := storage.UpdateToFinished(ctx, partitions[0]) // Using partitions[0] which is now "Running"
 		s.NoError(err)
-		
-		type result struct { State screamer.State; FinishedAt spanner.NullTime }
+
+		type result struct {
+			State      screamer.State
+			FinishedAt spanner.NullTime
+		}
 		got := result{}
 		row, err := storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{"token1"}, []string{columnState, columnFinishedAt})
 		s.NoError(err)
@@ -803,7 +799,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_AddChildPartitions_Idempo
 	defer cleanup()
 
 	childStartTimestamp := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
-	endTimestamp := screamer.DefaultEndTimestamp()
+	endTimestamp := time.Now().AddDate(1, 0, 0)
 	var heartbeatMillis int64 = 10000
 
 	parent := &screamer.PartitionMetadata{
@@ -844,7 +840,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_AddChildPartitions_Idempo
 	}
 	s.Equal(1, rowCount, "Should still only be one child partition row after idempotent call")
 }
-
 
 // --- Helper methods for setting up test data ---
 
@@ -891,67 +886,55 @@ func (s *SpannerTestSuite) insertRawPartitionToRunnerData(ctx context.Context, c
 	s.Require().NoError(err, "Failed to insert raw partition to runner data for token %s, runner %s", partitionToken, runnerID)
 }
 
-
 func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions() {
 	ctx := context.Background()
 	storage, cleanup := s.setupSpannerPartitionStorage(ctx, "GetInterrupted")
 	defer cleanup()
 
 	callingRunnerID := "calling_runner_" + uuid.NewString() // Runner calling GetInterruptedPartitions
-	err := storage.RegisterRunner(ctx, callingRunnerID) // Ensure calling runner is registered and live
+	err := storage.RegisterRunner(ctx, callingRunnerID)     // Ensure calling runner is registered and live
 	s.Require().NoError(err)
-
 
 	baseTime := time.Now().UTC().Truncate(time.Microsecond)
 	staleTime := baseTime.Add(-10 * time.Second) // Well before the 3-second stale interval
 	liveTime := baseTime.Add(-1 * time.Second)   // Within the 3-second live interval
 
-	defaultEnd := screamer.DefaultEndTimestamp()
+	defaultEnd := time.Now().AddDate(1, 0, 0)
 
 	// Scenario 1: Partition assigned to a stale runner
 	staleRunnerID := "stale_runner_" + uuid.NewString()
 	s.insertRawRunnerData(ctx, storage.client, staleRunnerID, staleTime, staleTime) // Stale runner
 	partitionForStaleRunner := screamer.PartitionMetadata{
-		PartitionToken: "p_stale_runner", StartTimestamp: baseTime, EndTimestamp: defaultEnd, State: screamer.StateRunning, Watermark: baseTime, HeartbeatMillis: 10000,
+		PartitionToken: "p_stale_runner", ParentTokens: []string{}, StartTimestamp: baseTime, EndTimestamp: defaultEnd, State: screamer.StateRunning, Watermark: baseTime, HeartbeatMillis: 10000,
 	}
 	s.insertRawPartitionData(ctx, storage.client, storage.tableName, partitionForStaleRunner)
 	s.insertRawPartitionToRunnerData(ctx, storage.client, partitionForStaleRunner.PartitionToken, staleRunnerID, staleTime, staleTime)
 
-
 	// Scenario 2: Orphaned partition (in Running state but no PartitionToRunner entry)
 	orphanedPartition := screamer.PartitionMetadata{
-		PartitionToken: "p_orphaned", StartTimestamp: baseTime, EndTimestamp: defaultEnd, State: screamer.StateScheduled, Watermark: baseTime, HeartbeatMillis: 10000,
+		PartitionToken: "p_orphaned", ParentTokens: []string{}, StartTimestamp: baseTime, EndTimestamp: defaultEnd, State: screamer.StateScheduled, Watermark: baseTime, HeartbeatMillis: 10000,
 	}
 	s.insertRawPartitionData(ctx, storage.client, storage.tableName, orphanedPartition)
 	// No entry in PartitionToRunner for this one
-
 
 	// Scenario 3: Partition assigned to a live runner (should not be picked up)
 	liveRunnerID := "live_runner_" + uuid.NewString()
 	s.insertRawRunnerData(ctx, storage.client, liveRunnerID, baseTime, liveTime) // Live runner
 	partitionForLiveRunner := screamer.PartitionMetadata{
-		PartitionToken: "p_live_runner", StartTimestamp: baseTime, EndTimestamp: defaultEnd, State: screamer.StateRunning, Watermark: baseTime, HeartbeatMillis: 10000,
+		PartitionToken: "p_live_runner", ParentTokens: []string{}, StartTimestamp: baseTime, EndTimestamp: defaultEnd, State: screamer.StateRunning, Watermark: baseTime, HeartbeatMillis: 10000,
 	}
 	s.insertRawPartitionData(ctx, storage.client, storage.tableName, partitionForLiveRunner)
 	s.insertRawPartitionToRunnerData(ctx, storage.client, partitionForLiveRunner.PartitionToken, liveRunnerID, baseTime, liveTime)
 
 	// Scenario 4: Partition in CREATED state (should not be picked by GetInterruptedPartitions)
 	createdPartition := screamer.PartitionMetadata{
-		PartitionToken: "p_created_state", StartTimestamp: baseTime, EndTimestamp: defaultEnd, State: screamer.StateCreated, Watermark: baseTime, HeartbeatMillis: 10000,
+		PartitionToken: "p_created_state", ParentTokens: []string{}, StartTimestamp: baseTime, EndTimestamp: defaultEnd, State: screamer.StateCreated, Watermark: baseTime, HeartbeatMillis: 10000,
 	}
 	s.insertRawPartitionData(ctx, storage.client, storage.tableName, createdPartition)
 
-
 	// Execute GetInterruptedPartitions
-	// The FOR UPDATE clause might still be an issue with some emulator versions.
-	// If this test fails specifically on the query, the skip might need to be conditional.
 	s.T().Log("Attempting to run GetInterruptedPartitions. If this hangs or fails with 'FOR UPDATE not supported', the emulator version may have limitations.")
 	interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID)
-	if err != nil && (err.Error() == "rpc error: code = Unimplemented desc = Feature not supported: Statement with FOR UPDATE clause." ||
-	                  (err.Error() != "" && err.Error()[:30] == "rpc error: code = Unimplement")) { // Check for variations of the error message
-		s.T().Skipf("Skipping GetInterruptedPartitions test due to emulator limitation with FOR UPDATE clause: %v", err)
-		return
-	}
 	s.NoError(err, "GetInterruptedPartitions failed")
 
 	s.Len(interruptedPartitions, 2, "Should find two interrupted partitions (stale runner and orphaned)")

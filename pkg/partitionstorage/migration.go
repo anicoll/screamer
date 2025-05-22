@@ -55,7 +55,6 @@ func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 		columnRunnerID,
 		columnCreatedAt,
 		columnUpdatedAt,
-		// s.tableName was here as an unused %[6]s argument
 	)
 
 	runnerStmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %[1]s (
