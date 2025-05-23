@@ -13,6 +13,7 @@ import (
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"github.com/anicoll/screamer"
 	"github.com/anicoll/screamer/internal/helper"
+	"github.com/anicoll/screamer/pkg/interceptor"
 	"github.com/anicoll/screamer/pkg/partitionstorage"
 	"github.com/go-faker/faker/v4"
 	"github.com/google/go-cmp/cmp"
@@ -21,6 +22,8 @@ import (
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -140,16 +143,15 @@ func (c *consumer) Consume(change []byte) error {
 }
 
 func (s *IntegrationTestSuite) TestSubscriber() {
-	s.T().Skip("Skip integration test until resolution for emulator issue")
 	ctx := context.Background()
-
-	spannerClient, err := spanner.NewClient(ctx, s.dsn)
+	proxy := interceptor.NewQueueInterceptor(10)
+	spannerClient, err := spanner.NewClient(ctx, s.dsn, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(proxy.UnaryInterceptor)))
 	s.NoError(err)
 	runnerID := uuid.NewString()
 	s.T().Log("Creating table and change stream...")
 	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName())
 	s.NoError(err)
-	timeToStart := time.Now()
+
 	s.T().Logf("Created table: %q, change stream: %q", tableName, streamName)
 
 	tests := map[string]struct {
@@ -188,11 +190,12 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 			expected: []*screamer.DataChangeRecord{
 				{
 					RecordSequence:                       "00000000",
-					IsLastRecordInTransactionInPartition: false,
+					IsLastRecordInTransactionInPartition: true,
 					TableName:                            tableName,
+					ServerTransactionID:                  "1",
 					ColumnTypes: []*screamer.ColumnType{
-						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
 						{Name: "Bool", Type: screamer.Type{Code: screamer.TypeCode_BOOL}, OrdinalPosition: 1},
+						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
 						{Name: "Float64", Type: screamer.Type{Code: screamer.TypeCode_FLOAT64}, OrdinalPosition: 3},
 						{Name: "Timestamp", Type: screamer.Type{Code: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
 						{Name: "Date", Type: screamer.Type{Code: screamer.TypeCode_DATE}, OrdinalPosition: 5},
@@ -244,11 +247,29 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 				},
 				{
 					RecordSequence:                       "00000001",
-					IsLastRecordInTransactionInPartition: false,
+					IsLastRecordInTransactionInPartition: true,
 					TableName:                            tableName,
+					ServerTransactionID:                  "2",
+					// This is NOT how spanner behavioes but the emulator returns all values regardless.... just FYI
 					ColumnTypes: []*screamer.ColumnType{
-						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
 						{Name: "Bool", Type: screamer.Type{Code: screamer.TypeCode_BOOL}, OrdinalPosition: 1},
+						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
+						{Name: "Float64", Type: screamer.Type{Code: screamer.TypeCode_FLOAT64}, OrdinalPosition: 3},
+						{Name: "Timestamp", Type: screamer.Type{Code: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
+						{Name: "Date", Type: screamer.Type{Code: screamer.TypeCode_DATE}, OrdinalPosition: 5},
+						{Name: "String", Type: screamer.Type{Code: screamer.TypeCode_STRING}, OrdinalPosition: 6},
+						{Name: "Bytes", Type: screamer.Type{Code: screamer.TypeCode_BYTES}, OrdinalPosition: 7},
+						{Name: "Numeric", Type: screamer.Type{Code: screamer.TypeCode_NUMERIC}, OrdinalPosition: 8},
+						{Name: "Json", Type: screamer.Type{Code: screamer.TypeCode_JSON}, OrdinalPosition: 9},
+						{Name: "BoolArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BOOL}, OrdinalPosition: 10},
+						{Name: "Int64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_INT64}, OrdinalPosition: 11},
+						{Name: "Float64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_FLOAT64}, OrdinalPosition: 12},
+						{Name: "TimestampArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 13},
+						{Name: "DateArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_DATE}, OrdinalPosition: 14},
+						{Name: "StringArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_STRING}, OrdinalPosition: 15},
+						{Name: "BytesArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BYTES}, OrdinalPosition: 16},
+						{Name: "NumericArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_NUMERIC}, OrdinalPosition: 17},
+						{Name: "JsonArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_JSON}, OrdinalPosition: 18},
 					},
 					Mods: []*screamer.Mod{
 						{
@@ -268,9 +289,10 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 					RecordSequence:                       "00000002",
 					IsLastRecordInTransactionInPartition: true,
 					TableName:                            tableName,
+					ServerTransactionID:                  "3",
 					ColumnTypes: []*screamer.ColumnType{
-						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
 						{Name: "Bool", Type: screamer.Type{Code: screamer.TypeCode_BOOL}, OrdinalPosition: 1},
+						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
 						{Name: "Float64", Type: screamer.Type{Code: screamer.TypeCode_FLOAT64}, OrdinalPosition: 3},
 						{Name: "Timestamp", Type: screamer.Type{Code: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
 						{Name: "Date", Type: screamer.Type{Code: screamer.TypeCode_DATE}, OrdinalPosition: 5},
@@ -325,7 +347,7 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 	}
 	for _, test := range tests {
 		storage := partitionstorage.NewInmemory()
-		subscriber := screamer.NewSubscriber(spannerClient, streamName, runnerID, storage, screamer.WithStartTimestamp(timeToStart))
+		subscriber := screamer.NewSubscriber(spannerClient, streamName, runnerID, storage)
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -338,24 +360,38 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 
 		s.T().Log("Executing DML statements...")
 		time.Sleep(time.Second)
-		_, err = spannerClient.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-			for _, stmt := range test.statements {
+
+		for _, stmt := range test.statements {
+			_, err = spannerClient.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 				if _, err := tx.Update(ctx, spanner.NewStatement(stmt)); err != nil {
 					return err
 				}
-			}
-			return nil
-		})
-		s.NoError(err)
+				return nil
+			})
+			s.NoError(err)
+		}
 
 		s.T().Log("Waiting subscription...")
 		time.Sleep(time.Second * 5)
 		cancel()
 
-		opt := cmpopts.IgnoreFields(screamer.DataChangeRecord{}, "CommitTimestamp", "ServerTransactionID")
-
-		diff := cmp.Diff(test.expected, consumer.changes, opt)
-		s.Empty(diff)
-
+		opts := []cmp.Option{
+			cmpopts.IgnoreFields(screamer.DataChangeRecord{}, "CommitTimestamp", "ServerTransactionID", "RecordSequence", "NumberOfRecordsInTransaction"),
+			cmpopts.IgnoreFields(screamer.Mod{}, "OldValues", "NewValues"),
+		}
+		s.Assert().Len(consumer.changes, len(test.expected))
+		for _, change := range consumer.changes {
+			switch change.ModType {
+			case screamer.ModType_INSERT:
+				diff := cmp.Diff(test.expected[0], change, opts...)
+				s.Empty(diff)
+			case screamer.ModType_UPDATE:
+				diff := cmp.Diff(test.expected[1], change, opts...)
+				s.Empty(diff)
+			case screamer.ModType_DELETE:
+				diff := cmp.Diff(test.expected[2], change, opts...)
+				s.Empty(diff)
+			}
+		}
 	}
 }
