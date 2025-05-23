@@ -142,7 +142,7 @@ func (c *consumer) Consume(change []byte) error {
 	return nil
 }
 
-func (s *IntegrationTestSuite) TestSubscriber() {
+func (s *IntegrationTestSuite) TestSubscriber_inmemstorage() {
 	ctx := context.Background()
 	proxy := interceptor.NewQueueInterceptor(10)
 	spannerClient, err := spanner.NewClient(ctx, s.dsn, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(proxy.UnaryInterceptor)))
@@ -347,6 +347,263 @@ func (s *IntegrationTestSuite) TestSubscriber() {
 	}
 	for _, test := range tests {
 		storage := partitionstorage.NewInmemory()
+		subscriber := screamer.NewSubscriber(spannerClient, streamName, runnerID, storage)
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		consumer := &consumer{}
+		go func() {
+			_ = subscriber.Subscribe(ctx, consumer)
+		}()
+		s.T().Log("Subscribe started.")
+
+		s.T().Log("Executing DML statements...")
+		time.Sleep(time.Second)
+
+		for _, stmt := range test.statements {
+			_, err = spannerClient.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+				if _, err := tx.Update(ctx, spanner.NewStatement(stmt)); err != nil {
+					return err
+				}
+				return nil
+			})
+			s.NoError(err)
+		}
+
+		s.T().Log("Waiting subscription...")
+		time.Sleep(time.Second * 5)
+		cancel()
+
+		opts := []cmp.Option{
+			cmpopts.IgnoreFields(screamer.DataChangeRecord{}, "CommitTimestamp", "ServerTransactionID", "RecordSequence", "NumberOfRecordsInTransaction"),
+			cmpopts.IgnoreFields(screamer.Mod{}, "OldValues", "NewValues"),
+		}
+		s.Assert().Len(consumer.changes, len(test.expected))
+		for _, change := range consumer.changes {
+			switch change.ModType {
+			case screamer.ModType_INSERT:
+				diff := cmp.Diff(test.expected[0], change, opts...)
+				s.Empty(diff)
+			case screamer.ModType_UPDATE:
+				diff := cmp.Diff(test.expected[1], change, opts...)
+				s.Empty(diff)
+			case screamer.ModType_DELETE:
+				diff := cmp.Diff(test.expected[2], change, opts...)
+				s.Empty(diff)
+			}
+		}
+	}
+}
+
+func (s *IntegrationTestSuite) TestSubscriber_spannerstorage() {
+	ctx := context.Background()
+	proxy := interceptor.NewQueueInterceptor(10)
+	spannerClient, err := spanner.NewClient(ctx, s.dsn, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(proxy.UnaryInterceptor)))
+	s.NoError(err)
+	runnerID := uuid.NewString()
+	s.T().Log("Creating table and change stream...")
+	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName())
+	s.NoError(err)
+	metaTableName := faker.Word()
+
+	s.T().Logf("Created table: %q, change stream: %q", tableName, streamName)
+
+	tests := map[string]struct {
+		statements []string
+		expected   []*screamer.DataChangeRecord
+	}{
+		"change": {
+			statements: []string{
+				fmt.Sprintf(`
+					INSERT INTO %s
+						(Bool, Int64, Float64, Timestamp, Date, String, Bytes, Numeric, Json, BoolArray, Int64Array, Float64Array, TimestampArray, DateArray, StringArray, BytesArray, NumericArray, JsonArray)
+					VALUES (
+						TRUE,
+						1,
+						0.5,
+						'2023-12-31T23:59:59.999999999Z',
+						'2023-01-01',
+						'string',
+						B'bytes',
+						NUMERIC '123.456',
+						JSON '{"name":"foobar"}',
+						[TRUE, FALSE],
+						[1, 2],
+						[0.5, 0.25],
+						[TIMESTAMP '2023-12-31T23:59:59.999999999Z', TIMESTAMP '2023-01-01T00:00:00Z'],
+						[DATE '2023-01-01', DATE '2023-02-01'],
+						['string1', 'string2'],
+						[B'bytes1', B'bytes2'],
+						[NUMERIC '12.345', NUMERIC '67.89'],
+						[JSON '{"name":"foobar"}', JSON '{"name":"barbaz"}']
+					)
+				`, tableName),
+				fmt.Sprintf(`UPDATE %s SET Bool = FALSE WHERE Int64 = 1`, tableName),
+				fmt.Sprintf(`DELETE FROM %s WHERE Int64 = 1`, tableName),
+			},
+			expected: []*screamer.DataChangeRecord{
+				{
+					RecordSequence:                       "00000000",
+					IsLastRecordInTransactionInPartition: true,
+					TableName:                            tableName,
+					ServerTransactionID:                  "1",
+					ColumnTypes: []*screamer.ColumnType{
+						{Name: "Bool", Type: screamer.Type{Code: screamer.TypeCode_BOOL}, OrdinalPosition: 1},
+						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
+						{Name: "Float64", Type: screamer.Type{Code: screamer.TypeCode_FLOAT64}, OrdinalPosition: 3},
+						{Name: "Timestamp", Type: screamer.Type{Code: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
+						{Name: "Date", Type: screamer.Type{Code: screamer.TypeCode_DATE}, OrdinalPosition: 5},
+						{Name: "String", Type: screamer.Type{Code: screamer.TypeCode_STRING}, OrdinalPosition: 6},
+						{Name: "Bytes", Type: screamer.Type{Code: screamer.TypeCode_BYTES}, OrdinalPosition: 7},
+						{Name: "Numeric", Type: screamer.Type{Code: screamer.TypeCode_NUMERIC}, OrdinalPosition: 8},
+						{Name: "Json", Type: screamer.Type{Code: screamer.TypeCode_JSON}, OrdinalPosition: 9},
+						{Name: "BoolArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BOOL}, OrdinalPosition: 10},
+						{Name: "Int64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_INT64}, OrdinalPosition: 11},
+						{Name: "Float64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_FLOAT64}, OrdinalPosition: 12},
+						{Name: "TimestampArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 13},
+						{Name: "DateArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_DATE}, OrdinalPosition: 14},
+						{Name: "StringArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_STRING}, OrdinalPosition: 15},
+						{Name: "BytesArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BYTES}, OrdinalPosition: 16},
+						{Name: "NumericArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_NUMERIC}, OrdinalPosition: 17},
+						{Name: "JsonArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_JSON}, OrdinalPosition: 18},
+					},
+					Mods: []*screamer.Mod{
+						{
+							Keys: map[string]interface{}{"Int64": "1"},
+							NewValues: map[string]interface{}{
+								"Bool":           true,
+								"BoolArray":      []interface{}{true, false},
+								"Bytes":          "Ynl0ZXM=",
+								"BytesArray":     []interface{}{"Ynl0ZXMx", "Ynl0ZXMy"},
+								"Date":           "2023-01-01",
+								"DateArray":      []interface{}{"2023-01-01", "2023-02-01"},
+								"Float64":        0.5,
+								"Float64Array":   []interface{}{0.5, 0.25},
+								"Int64Array":     []interface{}{"1", "2"},
+								"Json":           "{\"name\":\"foobar\"}",
+								"JsonArray":      []interface{}{"{\"name\":\"foobar\"}", "{\"name\":\"barbaz\"}"},
+								"Numeric":        "123.456",
+								"NumericArray":   []interface{}{"12.345", "67.89"},
+								"String":         "string",
+								"StringArray":    []interface{}{"string1", "string2"},
+								"Timestamp":      "2023-12-31T23:59:59.999999999Z",
+								"TimestampArray": []interface{}{"2023-12-31T23:59:59.999999999Z", "2023-01-01T00:00:00Z"},
+							},
+							OldValues: map[string]interface{}{},
+						},
+					},
+					ModType:                         screamer.ModType_INSERT,
+					ValueCaptureType:                "OLD_AND_NEW_VALUES",
+					NumberOfRecordsInTransaction:    3,
+					NumberOfPartitionsInTransaction: 1,
+					TransactionTag:                  "",
+					IsSystemTransaction:             false,
+				},
+				{
+					RecordSequence:                       "00000001",
+					IsLastRecordInTransactionInPartition: true,
+					TableName:                            tableName,
+					ServerTransactionID:                  "2",
+					// This is NOT how spanner behavioes but the emulator returns all values regardless.... just FYI
+					ColumnTypes: []*screamer.ColumnType{
+						{Name: "Bool", Type: screamer.Type{Code: screamer.TypeCode_BOOL}, OrdinalPosition: 1},
+						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
+						{Name: "Float64", Type: screamer.Type{Code: screamer.TypeCode_FLOAT64}, OrdinalPosition: 3},
+						{Name: "Timestamp", Type: screamer.Type{Code: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
+						{Name: "Date", Type: screamer.Type{Code: screamer.TypeCode_DATE}, OrdinalPosition: 5},
+						{Name: "String", Type: screamer.Type{Code: screamer.TypeCode_STRING}, OrdinalPosition: 6},
+						{Name: "Bytes", Type: screamer.Type{Code: screamer.TypeCode_BYTES}, OrdinalPosition: 7},
+						{Name: "Numeric", Type: screamer.Type{Code: screamer.TypeCode_NUMERIC}, OrdinalPosition: 8},
+						{Name: "Json", Type: screamer.Type{Code: screamer.TypeCode_JSON}, OrdinalPosition: 9},
+						{Name: "BoolArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BOOL}, OrdinalPosition: 10},
+						{Name: "Int64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_INT64}, OrdinalPosition: 11},
+						{Name: "Float64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_FLOAT64}, OrdinalPosition: 12},
+						{Name: "TimestampArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 13},
+						{Name: "DateArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_DATE}, OrdinalPosition: 14},
+						{Name: "StringArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_STRING}, OrdinalPosition: 15},
+						{Name: "BytesArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BYTES}, OrdinalPosition: 16},
+						{Name: "NumericArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_NUMERIC}, OrdinalPosition: 17},
+						{Name: "JsonArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_JSON}, OrdinalPosition: 18},
+					},
+					Mods: []*screamer.Mod{
+						{
+							Keys:      map[string]interface{}{"Int64": "1"},
+							NewValues: map[string]interface{}{"Bool": false},
+							OldValues: map[string]interface{}{"Bool": true},
+						},
+					},
+					ModType:                         screamer.ModType_UPDATE,
+					ValueCaptureType:                "OLD_AND_NEW_VALUES",
+					NumberOfRecordsInTransaction:    3,
+					NumberOfPartitionsInTransaction: 1,
+					TransactionTag:                  "",
+					IsSystemTransaction:             false,
+				},
+				{
+					RecordSequence:                       "00000002",
+					IsLastRecordInTransactionInPartition: true,
+					TableName:                            tableName,
+					ServerTransactionID:                  "3",
+					ColumnTypes: []*screamer.ColumnType{
+						{Name: "Bool", Type: screamer.Type{Code: screamer.TypeCode_BOOL}, OrdinalPosition: 1},
+						{Name: "Int64", Type: screamer.Type{Code: screamer.TypeCode_INT64}, OrdinalPosition: 2, IsPrimaryKey: true},
+						{Name: "Float64", Type: screamer.Type{Code: screamer.TypeCode_FLOAT64}, OrdinalPosition: 3},
+						{Name: "Timestamp", Type: screamer.Type{Code: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 4},
+						{Name: "Date", Type: screamer.Type{Code: screamer.TypeCode_DATE}, OrdinalPosition: 5},
+						{Name: "String", Type: screamer.Type{Code: screamer.TypeCode_STRING}, OrdinalPosition: 6},
+						{Name: "Bytes", Type: screamer.Type{Code: screamer.TypeCode_BYTES}, OrdinalPosition: 7},
+						{Name: "Numeric", Type: screamer.Type{Code: screamer.TypeCode_NUMERIC}, OrdinalPosition: 8},
+						{Name: "Json", Type: screamer.Type{Code: screamer.TypeCode_JSON}, OrdinalPosition: 9},
+						{Name: "BoolArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BOOL}, OrdinalPosition: 10},
+						{Name: "Int64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_INT64}, OrdinalPosition: 11},
+						{Name: "Float64Array", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_FLOAT64}, OrdinalPosition: 12},
+						{Name: "TimestampArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_TIMESTAMP}, OrdinalPosition: 13},
+						{Name: "DateArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_DATE}, OrdinalPosition: 14},
+						{Name: "StringArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_STRING}, OrdinalPosition: 15},
+						{Name: "BytesArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_BYTES}, OrdinalPosition: 16},
+						{Name: "NumericArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_NUMERIC}, OrdinalPosition: 17},
+						{Name: "JsonArray", Type: screamer.Type{Code: screamer.TypeCode_ARRAY, ArrayElementType: screamer.TypeCode_JSON}, OrdinalPosition: 18},
+					},
+					Mods: []*screamer.Mod{
+						{
+							Keys:      map[string]interface{}{"Int64": "1"},
+							NewValues: map[string]interface{}{},
+							OldValues: map[string]interface{}{
+								"Bool":           false,
+								"BoolArray":      []interface{}{true, false},
+								"Bytes":          "Ynl0ZXM=",
+								"BytesArray":     []interface{}{"Ynl0ZXMx", "Ynl0ZXMy"},
+								"Date":           "2023-01-01",
+								"DateArray":      []interface{}{"2023-01-01", "2023-02-01"},
+								"Float64":        0.5,
+								"Float64Array":   []interface{}{0.5, 0.25},
+								"Int64Array":     []interface{}{"1", "2"},
+								"Json":           "{\"name\":\"foobar\"}",
+								"JsonArray":      []interface{}{"{\"name\":\"foobar\"}", "{\"name\":\"barbaz\"}"},
+								"Numeric":        "123.456",
+								"NumericArray":   []interface{}{"12.345", "67.89"},
+								"String":         "string",
+								"StringArray":    []interface{}{"string1", "string2"},
+								"Timestamp":      "2023-12-31T23:59:59.999999999Z",
+								"TimestampArray": []interface{}{"2023-12-31T23:59:59.999999999Z", "2023-01-01T00:00:00Z"},
+							},
+						},
+					},
+					ModType:                         screamer.ModType_DELETE,
+					ValueCaptureType:                "OLD_AND_NEW_VALUES",
+					NumberOfRecordsInTransaction:    3,
+					NumberOfPartitionsInTransaction: 1,
+					TransactionTag:                  "",
+					IsSystemTransaction:             false,
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		storage := partitionstorage.NewSpanner(spannerClient, metaTableName)
+		s.NoError(storage.RunMigrations(ctx))
+		s.NoError(storage.RegisterRunner(ctx, runnerID))
 		subscriber := screamer.NewSubscriber(spannerClient, streamName, runnerID, storage)
 
 		ctx, cancel := context.WithCancel(ctx)
