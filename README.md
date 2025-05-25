@@ -1,4 +1,4 @@
-# Screamer... (S)panner (C)hangest(REAM) read(ER)
+# Screamer... (S)panner (C)hange st(REAM) read(ER)
 
 [![Test](https://github.com/anicoll/screamer/actions/workflows/go.yml/badge.svg)](https://github.com/anicoll/screamer/actions/workflows/go.yaml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/anicoll/screamer.svg)](https://pkg.go.dev/github.com/anicoll/screamer)
