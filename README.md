@@ -113,10 +113,33 @@ OPTIONS:
    --end value                 (default: End timestamp with RFC3339 format default: indefinite) [$END]
    --heartbeat-interval value  (default: 3s) [$HEARTBEAT_INTERVAL]
    --partition-dsn value       (default: Database dsn for use by the partition metadata table. If not provided, the main dsn will be used.) [$PARTITION_DSN]
+   --metrics-port value        (default: "8080") [$METRICS_PORT]
    --help, -h                  show help
 ```
 
 ### Example
+
+## Monitoring
+
+Screamer exposes Prometheus metrics on an HTTP endpoint.
+
+- **Path**: `/metrics`
+- **Default Port**: `8080`
+- **Configuration**:
+    - Use the `--metrics-port` command-line flag.
+    - Or set the `METRICS_PORT` environment variable.
+
+The following metrics are exposed:
+- `screamer_records_processed_total`: Total number of records processed successfully by the consumer.
+- `screamer_records_processing_errors_total`: Total number of errors encountered during record processing.
+- `screamer_consumer_duration_seconds`: Duration of each consumer.Consume() call.
+- `screamer_active_partitions`: Number of partitions a runner is currently processing.
+- `screamer_partition_watermark_seconds`: Latest watermark for a partition, in Unix timestamp seconds. (Labels: `partition_token`)
+- `screamer_runner_heartbeats_total`: Total number of successful runner heartbeats.
+- `screamer_spanner_query_duration_seconds`: Duration of spannerClient.Single().QueryWithOptions() calls.
+- `screamer_child_partitions_created_total`: Total number of child partitions created successfully. (Labels: `parent_partition_token`)
+
+All metrics are labeled with `stream_name` and `runner_id`.
 
 ## Credits
 
