@@ -14,12 +14,16 @@ import (
 	"github.com/anicoll/screamer"
 	"github.com/anicoll/screamer/pkg/partitionstorage"
 	"github.com/anicoll/screamer/pkg/signal"
+	"net/http"
+
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
 )
 
 var defaultHeartbeatInterval time.Duration = 3 * time.Second
+var defaultMetricsPort string = "8080"
 
 func ScreamerCommand() *cli.Command {
 	flags := []cli.Flag{
@@ -68,6 +72,12 @@ func ScreamerCommand() *cli.Command {
 			Value:       "",
 			DefaultText: "Database dsn for use by the partition metadata table. If not provided, the main dsn will be used.",
 		},
+		&cli.StringFlag{
+			Name:     "metrics-port",
+			Sources:  cli.EnvVars("METRICS_PORT"),
+			Required: false,
+			Value:    defaultMetricsPort,
+		},
 	}
 	return &cli.Command{
 		Name:  "screamer",
@@ -88,8 +98,28 @@ func ScreamerCommand() *cli.Command {
 				return run(ctx, cfg)
 			})
 
+			// Start HTTP server for metrics
+			metricsPort := c.String("metrics-port")
+			http.Handle("/metrics", promhttp.Handler())
+			fmt.Fprintf(os.Stdout, "Starting metrics server on port %s\n", metricsPort)
+			srv := &http.Server{Addr: ":" + metricsPort}
+
+			eg.Go(func() error {
+				if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					fmt.Fprintf(os.Stderr, "Metrics server error: %v\n", err)
+					return err
+				}
+				return nil
+			})
+
+			eg.Go(func() error {
+				<-ctx.Done()
+				fmt.Fprintln(os.Stdout, "Shutting down metrics server...")
+				return srv.Shutdown(context.Background())
+			})
+
 			if err := eg.Wait(); err != nil {
-				if errors.Is(err, signal.ErrSignal) {
+				if errors.Is(err, signal.ErrSignal) || errors.Is(err, http.ErrServerClosed) {
 					return nil
 				}
 				return err

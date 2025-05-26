@@ -10,6 +10,7 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -51,6 +52,7 @@ type Subscriber struct {
 	mu                     sync.Mutex
 	serializedConsumer     bool
 	consumerMu             sync.Mutex
+	metrics                *screamerMetrics
 }
 
 // Option configures a Subscriber via functional options.
@@ -162,7 +164,95 @@ func NewSubscriber(
 		partitionStorage:       partitionStorage,
 		runnerID:               runnerID,
 		serializedConsumer:     c.serializedConsumer,
+		metrics:                newScreamerMetrics(prometheus.DefaultRegisterer, streamName, runnerID),
 	}
+}
+
+type screamerMetrics struct {
+	recordsProcessedTotal          *prometheus.CounterVec
+	recordsProcessingErrorsTotal   *prometheus.CounterVec
+	consumerDurationSeconds        *prometheus.HistogramVec
+	activePartitions               prometheus.Gauge
+	partitionWatermarkSeconds      *prometheus.GaugeVec
+	runnerHeartbeatsTotal          prometheus.Counter
+	spannerQueryDurationSeconds    *prometheus.HistogramVec
+	childPartitionsCreatedTotal    *prometheus.CounterVec
+}
+
+func newScreamerMetrics(reg prometheus.Registerer, streamName, runnerID string) *screamerMetrics {
+	metrics := &screamerMetrics{
+		recordsProcessedTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name:        "screamer_records_processed_total",
+				Help:        "Total number of records processed successfully by the consumer.",
+				ConstLabels: prometheus.Labels{"stream_name": streamName, "runner_id": runnerID},
+			},
+			[]string{},
+		),
+		recordsProcessingErrorsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name:        "screamer_records_processing_errors_total",
+				Help:        "Total number of errors encountered during record processing.",
+				ConstLabels: prometheus.Labels{"stream_name": streamName, "runner_id": runnerID},
+			},
+			[]string{},
+		),
+		consumerDurationSeconds: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:        "screamer_consumer_duration_seconds",
+				Help:        "Duration of each consumer.Consume() call.",
+				ConstLabels: prometheus.Labels{"stream_name": streamName, "runner_id": runnerID},
+			},
+			[]string{},
+		),
+		activePartitions: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name:        "screamer_active_partitions",
+				Help:        "Number of partitions a runner is currently processing.",
+				ConstLabels: prometheus.Labels{"stream_name": streamName, "runner_id": runnerID},
+			},
+		),
+		partitionWatermarkSeconds: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name:        "screamer_partition_watermark_seconds",
+				Help:        "Latest watermark for a partition, in Unix timestamp seconds.",
+				ConstLabels: prometheus.Labels{"stream_name": streamName, "runner_id": runnerID},
+			},
+			[]string{"partition_token"},
+		),
+		runnerHeartbeatsTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name:        "screamer_runner_heartbeats_total",
+				Help:        "Total number of successful runner heartbeats.",
+				ConstLabels: prometheus.Labels{"stream_name": streamName, "runner_id": runnerID},
+			},
+		),
+		spannerQueryDurationSeconds: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:        "screamer_spanner_query_duration_seconds",
+				Help:        "Duration of spannerClient.Single().QueryWithOptions() calls.",
+				ConstLabels: prometheus.Labels{"stream_name": streamName, "runner_id": runnerID},
+			},
+			[]string{},
+		),
+		childPartitionsCreatedTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name:        "screamer_child_partitions_created_total",
+				Help:        "Total number of child partitions created successfully.",
+				ConstLabels: prometheus.Labels{"stream_name": streamName, "runner_id": runnerID},
+			},
+			[]string{"parent_partition_token"},
+		),
+	}
+	reg.MustRegister(metrics.recordsProcessedTotal)
+	reg.MustRegister(metrics.recordsProcessingErrorsTotal)
+	reg.MustRegister(metrics.consumerDurationSeconds)
+	reg.MustRegister(metrics.activePartitions)
+	reg.MustRegister(metrics.partitionWatermarkSeconds)
+	reg.MustRegister(metrics.runnerHeartbeatsTotal)
+	reg.MustRegister(metrics.spannerQueryDurationSeconds)
+	reg.MustRegister(metrics.childPartitionsCreatedTotal)
+	return metrics
 }
 
 // Subscribe starts subscribing to the change stream and processing records using the provided Consumer.
@@ -180,6 +270,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 				err := s.partitionStorage.RefreshRunner(ctx, s.runnerID)
 				switch err {
 				case nil:
+					s.metrics.runnerHeartbeatsTotal.Inc()
 					// continue
 				default:
 					return err
@@ -278,7 +369,9 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 
 	for _, p := range partitions {
 		p := p
+		s.metrics.activePartitions.Inc()
 		s.eg.Go(func() error {
+			defer s.metrics.activePartitions.Dec()
 			return s.queryChangeStream(ctx, p)
 		})
 	}
@@ -306,7 +399,11 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 		stmt.Params["partitionToken"] = nil
 	}
 
+	start := time.Now()
 	iter := s.spannerClient.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.spannerRequestPriority})
+	defer func() {
+		s.metrics.spannerQueryDurationSeconds.WithLabelValues().Observe(time.Since(start).Seconds())
+	}()
 	if err := iter.Do(func(r *spanner.Row) error {
 		records := []*ChangeRecord{}
 		if err := r.Columns(&records); err != nil {
@@ -347,19 +444,23 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 		for _, record := range cr.DataChangeRecords {
 			out, err := json.Marshal(record.DecodeToNonSpannerType())
 			if err != nil {
+				s.metrics.recordsProcessingErrorsTotal.WithLabelValues().Inc()
 				return err
 			}
+			consumerStart := time.Now()
 			if s.serializedConsumer {
 				s.consumerMu.Lock()
-				defer s.consumerMu.Unlock()
-				if err = s.consumer.Consume(out); err != nil {
-					return err
-				}
+				err = s.consumer.Consume(out)
+				s.consumerMu.Unlock()
 			} else {
-				if err := s.consumer.Consume(out); err != nil {
-					return err
-				}
+				err = s.consumer.Consume(out)
 			}
+			s.metrics.consumerDurationSeconds.WithLabelValues().Observe(time.Since(consumerStart).Seconds())
+			if err != nil {
+				s.metrics.recordsProcessingErrorsTotal.WithLabelValues().Inc()
+				return err
+			}
+			s.metrics.recordsProcessedTotal.WithLabelValues().Inc()
 			watermarker.set(record.CommitTimestamp)
 		}
 		for _, record := range cr.HeartbeatRecords {
@@ -369,13 +470,16 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			if err := s.partitionStorage.AddChildPartitions(ctx, p, record); err != nil {
 				return fmt.Errorf("failed to add child partitions: %w", err)
 			}
+			s.metrics.childPartitionsCreatedTotal.WithLabelValues(p.PartitionToken).Inc()
 			watermarker.set(record.StartTimestamp)
 		}
 	}
 
-	if err := s.partitionStorage.UpdateWatermark(ctx, p, watermarker.get()); err != nil {
+	watermark := watermarker.get()
+	if err := s.partitionStorage.UpdateWatermark(ctx, p, watermark); err != nil {
 		return fmt.Errorf("failed to update watermark: %w", err)
 	}
+	s.metrics.partitionWatermarkSeconds.WithLabelValues(p.PartitionToken).Set(float64(watermark.Unix()))
 
 	return nil
 }
