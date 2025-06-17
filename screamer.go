@@ -374,7 +374,7 @@ func (w *watermarker) get() time.Time {
 func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records []*ChangeRecord) error {
 	var watermarker watermarker
 	for _, cr := range records {
-		log.Debug().
+		log.Trace().
 			Str("partition_token", p.PartitionToken).
 			Int("data_change_records", len(cr.DataChangeRecords)).
 			Msg("processing change record")
