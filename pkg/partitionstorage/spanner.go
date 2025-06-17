@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
-
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/anicoll/screamer"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 )
@@ -78,6 +78,7 @@ const (
 // GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark.
 // Returns nil if there are no unfinished partitions.
 func (s *SpannerPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context.Context) (*screamer.PartitionMetadata, error) {
+	log.Debug().Msg("GetUnfinishedMinWatermarkPartition called")
 	stmt := spanner.Statement{
 		SQL: fmt.Sprintf("SELECT * FROM %s WHERE State != @state ORDER BY Watermark ASC LIMIT 1", s.tableName),
 		Params: map[string]interface{}{
@@ -103,12 +104,17 @@ func (s *SpannerPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context
 		return nil, err
 	}
 
+	log.Debug().Str("partition_token", partition.PartitionToken).
+		Str("watermark", partition.Watermark.Format(time.RFC3339Nano)).
+		Msg("GetUnfinishedMinWatermarkPartition result")
+
 	return partition, nil
 }
 
 // RegisterRunner registers a runner in the Runner table with the given runnerID.
 // Used for distributed lock and partition assignment.
 func (s *SpannerPartitionStorage) RegisterRunner(ctx context.Context, runnerID string) error {
+	log.Debug().Str("runner_id", runnerID).Msg("RegisterRunner called")
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdateMap(tableRunner, map[string]interface{}{
 		columnRunnerID:  runnerID,
 		columnUpdatedAt: spanner.CommitTimestamp,
@@ -120,6 +126,7 @@ func (s *SpannerPartitionStorage) RegisterRunner(ctx context.Context, runnerID s
 // RefreshRunner updates the UpdatedAt timestamp for the given runnerID in the Runner table.
 // Used to indicate liveness of a runner.
 func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID string) error {
+	log.Debug().Str("runner_id", runnerID).Msg("RefreshRunner called")
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.UpdateMap(tableRunner, map[string]interface{}{
 		columnRunnerID:  runnerID,
 		columnUpdatedAt: spanner.CommitTimestamp,
@@ -130,6 +137,7 @@ func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID st
 // GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
 // Assigns the current runnerID to these partitions for recovery.
 func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
+	log.Debug().Str("runner_id", runnerID).Msg("GetInterruptedPartitions called")
 	var partitions []*screamer.PartitionMetadata
 
 	_, errOuter := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
@@ -181,6 +189,10 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 				columnUpdatedAt:      spanner.CommitTimestamp,
 				columnCreatedAt:      spanner.CommitTimestamp,
 			})
+			log.Debug().Str("runner_id", runnerID).
+				Str("partition_token", p.PartitionToken).
+				Msg("assigned partition to runner")
+
 			mutations = append(mutations, ptrMut)
 			partitions = append(partitions, p)
 			// Individual partition reassignment attempt will be logged if transaction succeeds.
@@ -198,13 +210,20 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 	if errOuter != nil {
 		return nil, fmt.Errorf("transaction failed for GetInterruptedPartitions with runner %s: %w", runnerID, errOuter)
 	}
-
+	log.Debug().Str("runner_id", runnerID).
+		Int("interrupted_partitions", len(partitions)).
+		Msg("GetInterruptedPartitions completed")
 	return partitions, nil
 }
 
 // InitializeRootPartition creates or updates the root partition metadata in the table.
 // Used to start a new change stream subscription.
 func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error {
+	log.Debug().
+		Time("start_timestamp", startTimestamp).
+		Time("end_timestamp", endTimestamp).
+		Dur("heartbeat_interval", heartbeatInterval).
+		Msg("InitializeRootPartition called")
 	m := spanner.InsertOrUpdateMap(s.tableName, map[string]interface{}{
 		columnPartitionToken:  screamer.RootPartitionToken,
 		columnParentTokens:    []string{},
@@ -226,6 +245,10 @@ func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, s
 // GetAndSchedulePartitions finds partitions ready to be scheduled and assigns them to the given runnerID.
 // Returns the scheduled partitions.
 func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
+	log.Debug().
+		Time("min_watermark", minWatermark).
+		Str("runner_id", runnerID).
+		Msg("GetAndSchedulePartitions called")
 	var partitions []*screamer.PartitionMetadata
 
 	_, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
@@ -275,6 +298,10 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
+	log.Debug().
+		Int("partitions", len(partitions)).
+		Str("runner_id", runnerID).
+		Msg("GetAndSchedulePartitions completed")
 	return partitions, nil
 }
 
@@ -307,6 +334,9 @@ func (s *SpannerPartitionStorage) AddChildPartitions(ctx context.Context, parent
 
 // UpdateToRunning marks the given partition as running and sets the RunningAt timestamp.
 func (s *SpannerPartitionStorage) UpdateToRunning(ctx context.Context, partition *screamer.PartitionMetadata) error {
+	log.Debug().
+		Str("partitionToken", partition.PartitionToken).
+		Msg("UpdateToRunning called")
 	m := spanner.UpdateMap(s.tableName, map[string]interface{}{
 		columnPartitionToken: partition.PartitionToken,
 		columnState:          screamer.StateRunning,
@@ -319,6 +349,9 @@ func (s *SpannerPartitionStorage) UpdateToRunning(ctx context.Context, partition
 
 // UpdateToFinished marks the given partition as finished and sets the FinishedAt timestamp.
 func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partition *screamer.PartitionMetadata) error {
+	log.Debug().
+		Str("partitionToken", partition.PartitionToken).
+		Msg("UpdateToFinished called")
 	m := spanner.UpdateMap(s.tableName, map[string]interface{}{
 		columnPartitionToken: partition.PartitionToken,
 		columnState:          screamer.StateFinished,
@@ -331,6 +364,10 @@ func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partitio
 
 // UpdateWatermark updates the watermark for the given partition.
 func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition *screamer.PartitionMetadata, watermark time.Time) error {
+	log.Debug().
+		Str("partitionToken", partition.PartitionToken).
+		Time("watermark", watermark).
+		Msg("UpdateWatermark called")
 	m := spanner.UpdateMap(s.tableName, map[string]interface{}{
 		columnPartitionToken: partition.PartitionToken,
 		columnWatermark:      watermark,
