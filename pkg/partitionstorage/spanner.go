@@ -189,9 +189,9 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 				columnUpdatedAt:      spanner.CommitTimestamp,
 				columnCreatedAt:      spanner.CommitTimestamp,
 			})
-			log.Debug().Str("runner_id", runnerID).
+			log.Info().Str("runner_id", runnerID).
 				Str("partition_token", p.PartitionToken).
-				Msg("assigned partition to runner")
+				Msg("assigned stale partition to runner")
 
 			mutations = append(mutations, ptrMut)
 			partitions = append(partitions, p)
@@ -284,7 +284,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 				columnUpdatedAt:      spanner.CommitTimestamp,
 				columnCreatedAt:      spanner.CommitTimestamp,
 			})
-			log.Debug().
+			log.Info().
 				Str("runner_id", runnerID).
 				Str("partition_token", p.PartitionToken).
 				Msg("scheduled partition for runner")
