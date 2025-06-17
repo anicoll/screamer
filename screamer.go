@@ -283,6 +283,7 @@ func (s *Subscriber) initErrGroup(ctx context.Context) context.Context {
 var errDone = errors.New("all partitions have been processed")
 
 func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
+	log.Info().Str("stream_name", s.streamName).Str("runner_id", s.runnerID).Msg("detecting new partitions")
 	minWatermarkPartition, err := s.partitionStorage.GetUnfinishedMinWatermarkPartition(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get unfinished min watermark partition: %w", err)
@@ -336,22 +337,24 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 		if err := r.Columns(&records); err != nil {
 			return err
 		}
-		log.Debug().
-			Str("partitionToken", p.PartitionToken).
-			Int("numRecords", len(records)).
+		log.Trace().
+			Str("partition_token", p.PartitionToken).
+			Int("num_records", len(records)).
 			Msg("processing partition")
 		if err := s.handle(ctx, p, records); err != nil {
 			return err
 		}
-		log.Debug().
-			Str("partitionToken", p.PartitionToken).
-			Int("numRecords", len(records)).
+		log.Trace().
+			Str("partition_token", p.PartitionToken).
+			Int("num_records", len(records)).
 			Msg("processing partition complete")
 		return nil
 	}); err != nil {
 		return err
 	}
 
+	log.Info().Str("partition_token", p.PartitionToken).
+		Msg("partition processing complete")
 	if err := s.partitionStorage.UpdateToFinished(ctx, p); err != nil {
 		return fmt.Errorf("failed to update to finished: %w", err)
 	}
