@@ -28,6 +28,7 @@ This library aims to make reading change streams native for non beam/dataflow us
 ```go
 package screamer
 
+
 import (
 	"context"
 	"encoding/json"
@@ -40,13 +41,13 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"github.com/anicoll/screamer"
-	"github.com/anicoll/screamer/partitionstorage"
+	"github.com/anicoll/screamer/pkg/partitionstorage"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	defer stop()
-	runnerID:= "runner-1"
+	runnerID := "runner-1"
 
 	database := fmt.Sprintf("projects/%s/instances/%s/databases/%s", "foo-project", "bar-instance", "baz-database")
 	spannerClient, err := spanner.NewClient(ctx, database)
@@ -61,12 +62,12 @@ func main() {
 	if err := partitionStorage.RunMigrations(ctx); err != nil {
 		panic(err)
 	}
-	if err := ps.RegisterRunner(ctx, runnerID); err != nil {
+	if err := partitionStorage.RegisterRunner(ctx, runnerID); err != nil {
 		panic(err)
 	}
 
 	changeStreamName := "FooStream"
-	subscriber := screamer.NewSubscriber(spannerClient, changeStreamName, partitionStorage)
+	subscriber := screamer.NewSubscriber(spannerClient, changeStreamName, runnerID, partitionStorage, screamer.WithLogLevel("debug"))
 
 	fmt.Fprintf(os.Stderr, "Reading the stream...\n")
 	logger := &Logger{out: os.Stdout}
