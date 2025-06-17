@@ -78,7 +78,7 @@ const (
 // GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark.
 // Returns nil if there are no unfinished partitions.
 func (s *SpannerPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context.Context) (*screamer.PartitionMetadata, error) {
-	log.Debug().Msg("GetUnfinishedMinWatermarkPartition called")
+	log.Trace().Msg("GetUnfinishedMinWatermarkPartition called")
 	stmt := spanner.Statement{
 		SQL: fmt.Sprintf("SELECT * FROM %s WHERE State != @state ORDER BY Watermark ASC LIMIT 1", s.tableName),
 		Params: map[string]interface{}{
@@ -126,7 +126,7 @@ func (s *SpannerPartitionStorage) RegisterRunner(ctx context.Context, runnerID s
 // RefreshRunner updates the UpdatedAt timestamp for the given runnerID in the Runner table.
 // Used to indicate liveness of a runner.
 func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID string) error {
-	log.Debug().Str("runner_id", runnerID).Msg("RefreshRunner called")
+	log.Trace().Str("runner_id", runnerID).Msg("RefreshRunner called")
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.UpdateMap(tableRunner, map[string]interface{}{
 		columnRunnerID:  runnerID,
 		columnUpdatedAt: spanner.CommitTimestamp,
@@ -137,7 +137,7 @@ func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID st
 // GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
 // Assigns the current runnerID to these partitions for recovery.
 func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
-	log.Debug().Str("runner_id", runnerID).Msg("GetInterruptedPartitions called")
+	log.Trace().Str("runner_id", runnerID).Msg("GetInterruptedPartitions called")
 	var partitions []*screamer.PartitionMetadata
 
 	_, errOuter := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
@@ -210,7 +210,7 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 	if errOuter != nil {
 		return nil, fmt.Errorf("transaction failed for GetInterruptedPartitions with runner %s: %w", runnerID, errOuter)
 	}
-	log.Debug().Str("runner_id", runnerID).
+	log.Trace().Str("runner_id", runnerID).
 		Int("interrupted_partitions", len(partitions)).
 		Msg("GetInterruptedPartitions completed")
 	return partitions, nil
@@ -245,7 +245,7 @@ func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, s
 // GetAndSchedulePartitions finds partitions ready to be scheduled and assigns them to the given runnerID.
 // Returns the scheduled partitions.
 func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
-	log.Debug().
+	log.Trace().
 		Time("min_watermark", minWatermark).
 		Str("runner_id", runnerID).
 		Msg("GetAndSchedulePartitions called")
@@ -298,7 +298,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	log.Debug().
+	log.Trace().
 		Int("partitions", len(partitions)).
 		Str("runner_id", runnerID).
 		Msg("GetAndSchedulePartitions completed")
@@ -364,7 +364,7 @@ func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partitio
 
 // UpdateWatermark updates the watermark for the given partition.
 func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition *screamer.PartitionMetadata, watermark time.Time) error {
-	log.Debug().
+	log.Trace().
 		Str("partitionToken", partition.PartitionToken).
 		Time("watermark", watermark).
 		Msg("UpdateWatermark called")
