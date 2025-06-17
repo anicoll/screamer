@@ -168,10 +168,12 @@ func NewSubscriber(
 		startTimestamp:    time.Now(),
 		endTimestamp:      defaultEndTimestamp,
 		heartbeatInterval: defaultHeartbeatInterval,
+		logLevel:          zerolog.InfoLevel, // Default log level
 	}
 	for _, o := range options {
 		o.Apply(c)
 	}
+	zerolog.SetGlobalLevel(c.logLevel)
 
 	return &Subscriber{
 		spannerClient:          client,
