@@ -18,6 +18,7 @@ import (
 	"github.com/anicoll/screamer/internal/helper"
 	"github.com/anicoll/screamer/pkg/interceptor"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
@@ -48,6 +49,8 @@ func TestSpannerTestSuite(t *testing.T) {
 }
 
 func (s *SpannerTestSuite) SetupSuite() {
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
+
 	image := "gcr.io/cloud-spanner-emulator/emulator"
 	ports := []string{"9010/tcp"}
 	s.ctx = context.Background()

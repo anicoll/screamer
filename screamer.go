@@ -10,6 +10,8 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -64,6 +66,7 @@ type config struct {
 	heartbeatInterval      time.Duration
 	spannerRequestPriority spannerpb.RequestOptions_Priority
 	serializedConsumer     bool
+	logLevel               zerolog.Level
 }
 
 type withStartTimestamp time.Time
@@ -83,6 +86,22 @@ type withEndTimestamp time.Time
 
 func (o withEndTimestamp) Apply(c *config) {
 	c.endTimestamp = time.Time(o)
+}
+
+// WithLogLevel sets the log level for the subscriber.
+func WithLogLevel(logLevel string) Option {
+	ll, err := zerolog.ParseLevel(logLevel)
+	if err != nil {
+		log.Warn().Err(err).Msgf("Invalid log level %s, using default level info", logLevel)
+		ll = zerolog.InfoLevel // Default log level
+	}
+	return withLogLevel(ll)
+}
+
+type withLogLevel zerolog.Level
+
+func (o withLogLevel) Apply(c *config) {
+	c.logLevel = zerolog.Level(o)
 }
 
 // WithEndTimestamp sets the end timestamp option for reading change streams.
@@ -143,6 +162,8 @@ func NewSubscriber(
 	partitionStorage PartitionStorage,
 	options ...Option,
 ) *Subscriber {
+	zerolog.TimeFieldFormat = time.RFC3339Nano
+
 	c := &config{
 		startTimestamp:    time.Now(),
 		endTimestamp:      defaultEndTimestamp,
@@ -168,6 +189,7 @@ func NewSubscriber(
 // Subscribe starts subscribing to the change stream and processing records using the provided Consumer.
 // This method blocks until all partitions are processed or the context is canceled.
 func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
+	log.Debug().Msg("Starting subscription to change stream")
 	ctx = s.initErrGroup(ctx)
 	s.consumer = consumer
 
@@ -312,9 +334,17 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 		if err := r.Columns(&records); err != nil {
 			return err
 		}
+		log.Debug().
+			Str("partitionToken", p.PartitionToken).
+			Int("numRecords", len(records)).
+			Msg("processing partition")
 		if err := s.handle(ctx, p, records); err != nil {
 			return err
 		}
+		log.Debug().
+			Str("partitionToken", p.PartitionToken).
+			Int("numRecords", len(records)).
+			Msg("processing partition complete")
 		return nil
 	}); err != nil {
 		return err
@@ -344,6 +374,10 @@ func (w *watermarker) get() time.Time {
 func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records []*ChangeRecord) error {
 	var watermarker watermarker
 	for _, cr := range records {
+		log.Debug().
+			Str("partition_token", p.PartitionToken).
+			Int("data_change_records", len(cr.DataChangeRecords)).
+			Msg("processing change record")
 		for _, record := range cr.DataChangeRecords {
 			out, err := json.Marshal(record.DecodeToNonSpannerType())
 			if err != nil {
