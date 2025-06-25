@@ -652,3 +652,178 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage() {
 		}
 	}
 }
+
+func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
+	ctx := context.Background()
+	proxy := interceptor.NewQueueInterceptor(10)
+	spannerClient, err := spanner.NewClient(ctx, s.dsn, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(proxy.UnaryInterceptor)))
+	s.NoError(err)
+	runnerID := uuid.NewString()
+	s.T().Log("Creating table and change stream...")
+	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName())
+	s.NoError(err)
+	metaTableName := testTableName
+
+	s.T().Logf("Created table: %q, change stream: %q", tableName, streamName)
+
+	// Create the metadata table for SpannerStorage
+	adminClient, err := database.NewDatabaseAdminClient(ctx)
+	s.NoError(err)
+	defer adminClient.Close()
+
+	// Create metadata table
+	storage := partitionstorage.NewSpanner(spannerClient, metaTableName)
+	s.NoError(storage.RunMigrations(ctx))
+	s.NoError(storage.RegisterRunner(ctx, runnerID))
+
+	// Test with SpannerStorage
+	subscriber := screamer.NewSubscriber(
+		spannerClient,
+		streamName,
+		runnerID,
+		storage,
+		screamer.WithStartTimestamp(time.Now()),
+		screamer.WithHeartbeatInterval(1*time.Second),
+	)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	consumerr := &consumer{}
+	contextForCancellation, cancelFunc := context.WithCancel(context.Background())
+	go func() {
+		err := subscriber.Subscribe(contextForCancellation, consumerr)
+		// The error should be context.Canceled because we canceled the context
+		s.ErrorIs(err, context.Canceled, "Subscribe should return context.Canceled when the context is canceled")
+	}()
+	s.T().Log("Subscribe started.")
+
+	s.T().Log("Executing DML statements...")
+	time.Sleep(time.Second)
+
+	s.createTestData(ctx, spannerClient, tableName)
+
+	s.T().Log("Waiting for subscription processing...")
+	time.Sleep(time.Second * 5)
+
+	// Verify metadata in partition storage table
+	iter := spannerClient.Single().Read(ctx, metaTableName, spanner.AllKeys(), []string{"PartitionToken", "State"})
+	var partitions []struct {
+		PartitionToken string
+		State          string
+	}
+	err = iter.Do(func(row *spanner.Row) error {
+		var p struct {
+			PartitionToken string
+			State          string
+		}
+		if err := row.Columns(&p.PartitionToken, &p.State); err != nil {
+			return err
+		}
+		partitions = append(partitions, p)
+		return nil
+	})
+	s.NoError(err)
+
+	// Should have at least one partition still running
+	s.NotEmpty(partitions)
+	hasRunningPartition := false
+	for _, p := range partitions {
+		if p.State == "RUNNING" {
+			hasRunningPartition = true
+			break
+		}
+	}
+	s.True(hasRunningPartition, "Should have at least one running partition")
+	cancelFunc() // cancel running subscription
+
+	newRunnerID := uuid.NewString()
+	err = storage.RegisterRunner(ctx, newRunnerID)
+	s.NoError(err)
+
+	newConsumer := &consumer{}
+	newSubscriber := screamer.NewSubscriber(
+		spannerClient,
+		streamName,
+		newRunnerID,
+		storage,
+		screamer.WithStartTimestamp(time.Now()),
+		screamer.WithHeartbeatInterval(1*time.Second),
+	)
+
+	go func() {
+		err := newSubscriber.Subscribe(ctx, newConsumer)
+		s.ErrorIs(err, context.Canceled, "Subscribe should return context.Canceled when the context is canceled")
+	}()
+	// Verify we received change records
+	s.T().Logf("Received %d changes", len(consumerr.changes))
+	s.NotEmpty(consumerr.changes, "Should have received at least one change record")
+
+	// At least one record should be for our table
+	var tableRecords int
+	for _, r := range consumerr.changes {
+		if r.TableName == tableName {
+			tableRecords++
+		}
+	}
+	s.Greater(tableRecords, 0, "Should have received records for our table")
+
+	time.Sleep(time.Second * 10) // wait for old records to become stale.
+	s.createTestData(ctx, spannerClient, tableName)
+	time.Sleep(time.Second * 1)
+
+	// Verify we received change records
+	s.T().Logf("Received %d changes", len(newConsumer.changes))
+	s.NotEmpty(newConsumer.changes, "Should have received at least one change record")
+
+	// At least one record should be for our table
+	var newTableRecords int
+	for _, r := range newConsumer.changes {
+		if r.TableName == tableName {
+			newTableRecords++
+		}
+	}
+	s.Greater(newTableRecords, 0, "Should have received records for our table")
+
+	cancel()
+}
+
+func (s *IntegrationTestSuite) createTestData(ctx context.Context, spannerClient *spanner.Client, tableName string) {
+	// Insert data
+	stmt := fmt.Sprintf(`
+		INSERT INTO %s
+			(Bool, Int64, Float64, Timestamp, Date, String, Bytes, Numeric, Json)
+		VALUES (
+			TRUE,
+			42,
+			3.14,
+			'2023-12-31T23:59:59Z',
+			'2023-01-01',
+			'test string',
+			B'test bytes',
+			NUMERIC '123.45',
+			JSON '{"test":"value"}'
+		)
+	`, tableName)
+	_, err := spannerClient.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		_, err := txn.Update(ctx, spanner.Statement{SQL: stmt})
+		return err
+	})
+	s.NoError(err)
+
+	// Update data
+	stmt = fmt.Sprintf(`UPDATE %s SET Bool = FALSE WHERE Int64 = 42`, tableName)
+	_, err = spannerClient.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		_, err := txn.Update(ctx, spanner.Statement{SQL: stmt})
+		return err
+	})
+	s.NoError(err)
+
+	// Delete data
+	stmt = fmt.Sprintf(`DELETE FROM %s WHERE Int64 = 42`, tableName)
+	_, err = spannerClient.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		_, err := txn.Update(ctx, spanner.Statement{SQL: stmt})
+		return err
+	})
+	s.NoError(err)
+}

@@ -225,15 +225,8 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 		}
 	}
 
-	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx, s.runnerID)
-	if err != nil {
-		return fmt.Errorf("failed to get interrupted partitions: %w", err)
-	}
-	for _, p := range interruptedPartitions {
-		p := p
-		s.eg.Go(func() error {
-			return s.queryChangeStream(ctx, p)
-		})
+	if err := s.processInterruptedPartitions(ctx); err != nil {
+		return err
 	}
 
 	s.eg.Go(func() error {
@@ -258,7 +251,44 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 		}
 	})
 
+	// periodically check for new stale partitions.
+	s.eg.Go(func() error {
+		ticker := time.NewTicker(time.Second * 10)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				err := s.processInterruptedPartitions(ctx)
+				switch err {
+				case errDone:
+					return nil
+				case nil:
+					// continue
+				default:
+					return err
+				}
+			case <-ctx.Done():
+				err := ctx.Err()
+				return err
+			}
+		}
+	})
+
 	return s.eg.Wait()
+}
+
+func (s *Subscriber) processInterruptedPartitions(ctx context.Context) error {
+	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx, s.runnerID)
+	if err != nil {
+		return fmt.Errorf("failed to get interrupted partitions: %w", err)
+	}
+	for _, p := range interruptedPartitions {
+		p := p
+		s.eg.Go(func() error {
+			return s.queryChangeStream(ctx, p)
+		})
+	}
+	return nil
 }
 
 // SubscribeFunc is an adapter to allow the use of ordinary functions as Consumer.
