@@ -58,6 +58,16 @@ type DataChangeRecord struct {
 	IsSystemTransaction                  bool          `json:"is_system_transaction"`
 }
 
+type DataChangeRecordWithPartitionMeta struct {
+	*DataChangeRecord
+	PartitionToken string     `spanner:"PartitionToken" json:"partition_token"`
+	StartTimestamp time.Time  `spanner:"StartTimestamp" json:"start_timestamp"`
+	Watermark      time.Time  `spanner:"Watermark" json:"watermark"`
+	CreatedAt      time.Time  `spanner:"CreatedAt" json:"created_at"`
+	ScheduledAt    *time.Time `spanner:"ScheduledAt" json:"scheduled_at,omitempty"`
+	RunningAt      *time.Time `spanner:"RunningAt" json:"running_at,omitempty"`
+}
+
 // ColumnType is the metadata of the column.
 type ColumnType struct {
 	Name            string `json:"name"`
@@ -118,7 +128,7 @@ type ChildPartition struct {
 	ParentPartitionTokens []string `spanner:"parent_partition_tokens" json:"parent_partition_tokens"`
 }
 
-func (r *dataChangeRecord) DecodeToNonSpannerType() *DataChangeRecord {
+func (r *dataChangeRecord) DecodeToNonSpannerType(p *PartitionMetadata) *DataChangeRecordWithPartitionMeta {
 	columnTypes := []*ColumnType{}
 	for _, t := range r.ColumnTypes {
 		columnTypes = append(columnTypes, &ColumnType{
@@ -138,20 +148,28 @@ func (r *dataChangeRecord) DecodeToNonSpannerType() *DataChangeRecord {
 		})
 	}
 
-	return &DataChangeRecord{
-		CommitTimestamp:                      r.CommitTimestamp,
-		RecordSequence:                       r.RecordSequence,
-		ServerTransactionID:                  r.ServerTransactionID,
-		IsLastRecordInTransactionInPartition: r.IsLastRecordInTransactionInPartition,
-		TableName:                            r.TableName,
-		ColumnTypes:                          columnTypes,
-		Mods:                                 mods,
-		ModType:                              ModType(r.ModType),
-		ValueCaptureType:                     r.ValueCaptureType,
-		NumberOfRecordsInTransaction:         r.NumberOfRecordsInTransaction,
-		NumberOfPartitionsInTransaction:      r.NumberOfPartitionsInTransaction,
-		TransactionTag:                       r.TransactionTag,
-		IsSystemTransaction:                  r.IsSystemTransaction,
+	return &DataChangeRecordWithPartitionMeta{
+		DataChangeRecord: &DataChangeRecord{
+			CommitTimestamp:                      r.CommitTimestamp,
+			RecordSequence:                       r.RecordSequence,
+			ServerTransactionID:                  r.ServerTransactionID,
+			IsLastRecordInTransactionInPartition: r.IsLastRecordInTransactionInPartition,
+			TableName:                            r.TableName,
+			ColumnTypes:                          columnTypes,
+			Mods:                                 mods,
+			ModType:                              ModType(r.ModType),
+			ValueCaptureType:                     r.ValueCaptureType,
+			NumberOfRecordsInTransaction:         r.NumberOfRecordsInTransaction,
+			NumberOfPartitionsInTransaction:      r.NumberOfPartitionsInTransaction,
+			TransactionTag:                       r.TransactionTag,
+			IsSystemTransaction:                  r.IsSystemTransaction,
+		},
+		PartitionToken: p.PartitionToken,
+		StartTimestamp: p.StartTimestamp,
+		Watermark:      p.Watermark,
+		CreatedAt:      p.CreatedAt,
+		ScheduledAt:    p.ScheduledAt,
+		RunningAt:      p.RunningAt,
 	}
 }
 

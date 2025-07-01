@@ -251,7 +251,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 		Msg("GetAndSchedulePartitions called")
 	var partitions []*screamer.PartitionMetadata
 
-	_, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		partitions = make([]*screamer.PartitionMetadata, 0)
 		mutations := make([]*spanner.Mutation, 0, len(partitions))
 
@@ -302,6 +302,9 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
+	for _, p := range partitions {
+		p.ScheduledAt = &ts.CommitTs
+	}
 	log.Trace().
 		Int("partitions", len(partitions)).
 		Str("runner_id", runnerID).
@@ -347,7 +350,8 @@ func (s *SpannerPartitionStorage) UpdateToRunning(ctx context.Context, partition
 		columnRunningAt:      spanner.CommitTimestamp,
 	})
 
-	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateToRunning"))
+	ts, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateToRunning"))
+	partition.RunningAt = &ts
 	return err
 }
 
@@ -362,7 +366,8 @@ func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partitio
 		columnFinishedAt:     spanner.CommitTimestamp,
 	})
 
-	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateToFinished"))
+	ts, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateToFinished"))
+	partition.RunningAt = &ts
 	return err
 }
 

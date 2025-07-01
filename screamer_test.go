@@ -129,11 +129,24 @@ func createTableAndChangeStream(ctx context.Context, databaseName string) (strin
 	return tableName, streamName, err
 }
 
-type consumer struct {
+type consumerV2 struct {
+	changes []*screamer.DataChangeRecordWithPartitionMeta
+}
+
+func (c *consumerV2) Consume(change []byte) error {
+	dcr := &screamer.DataChangeRecordWithPartitionMeta{}
+	if err := json.Unmarshal(change, dcr); err != nil {
+		return err
+	}
+	c.changes = append(c.changes, dcr)
+	return nil
+}
+
+type consumerV1 struct {
 	changes []*screamer.DataChangeRecord
 }
 
-func (c *consumer) Consume(change []byte) error {
+func (c *consumerV1) Consume(change []byte) error {
 	dcr := &screamer.DataChangeRecord{}
 	if err := json.Unmarshal(change, dcr); err != nil {
 		return err
@@ -352,7 +365,7 @@ func (s *IntegrationTestSuite) TestSubscriber_inmemstorage() {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		consumer := &consumer{}
+		consumer := &consumerV1{}
 		go func() {
 			_ = subscriber.Subscribe(ctx, consumer)
 		}()
@@ -609,7 +622,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage() {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		consumer := &consumer{}
+		consumer := &consumerV1{}
 		go func() {
 			_ = subscriber.Subscribe(ctx, consumer)
 		}()
@@ -689,7 +702,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	consumerr := &consumer{}
+	consumerr := &consumerV1{}
 	contextForCancellation, cancelFunc := context.WithCancel(context.Background())
 	go func() {
 		_ = subscriber.Subscribe(contextForCancellation, consumerr)
@@ -739,7 +752,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	err = storage.RegisterRunner(ctx, newRunnerID)
 	s.NoError(err)
 
-	newConsumer := &consumer{}
+	newConsumer := &consumerV1{}
 	newSubscriber := screamer.NewSubscriber(
 		spannerClient,
 		streamName,
