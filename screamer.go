@@ -47,12 +47,13 @@ type Subscriber struct {
 	endTimestamp           time.Time
 	heartbeatInterval      time.Duration
 	spannerRequestPriority spannerpb.RequestOptions_Priority
-	partitionStorage       PartitionStorage
-	consumer               Consumer
-	eg                     *errgroup.Group
-	mu                     sync.Mutex
-	serializedConsumer     bool
-	consumerMu             sync.Mutex
+
+	partitionStorage   PartitionStorage
+	consumer           Consumer
+	eg                 *errgroup.Group
+	mu                 sync.Mutex
+	serializedConsumer bool
+	consumerMu         sync.Mutex
 }
 
 // Option configures a Subscriber via functional options.
@@ -414,7 +415,7 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			Int("data_change_records", len(cr.DataChangeRecords)).
 			Msg("processing change record")
 		for _, record := range cr.DataChangeRecords {
-			out, err := json.Marshal(record.DecodeToNonSpannerType())
+			out, err := json.Marshal(record.DecodeToNonSpannerType(p))
 			if err != nil {
 				return err
 			}
