@@ -1,4 +1,3 @@
-version: "3.3"
 services:
   spanner:
     image: gcr.io/cloud-spanner-emulator/emulator

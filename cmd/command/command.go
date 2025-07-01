@@ -153,7 +153,12 @@ func (l *jsonOutputConsumer) Consume(change []byte) error {
 
 func run(ctx context.Context, cfg *screamer.Config) error {
 	eg, ctx := errgroup.WithContext(ctx)
-	spannerClient, err := spanner.NewClient(ctx, cfg.DSN)
+	spannercfg := spanner.ClientConfig{
+		SessionPoolConfig:    spanner.DefaultSessionPoolConfig,
+		DisableRouteToLeader: false,
+	}
+	spannercfg.SessionPoolConfig.MaxOpened = 4 * 400
+	spannerClient, err := spanner.NewClientWithConfig(ctx, cfg.DSN, spannercfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return err
