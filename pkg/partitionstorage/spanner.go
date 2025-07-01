@@ -163,7 +163,9 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 				FROM %[3]s m
 				LEFT JOIN %[2]s ptr ON m.PartitionToken = ptr.PartitionToken
 				WHERE m.State IN UNNEST(@states)
-					AND (ptr.PartitionToken IS NULL OR ptr.PartitionToken IN (SELECT PartitionToken FROM StalePartitions)) 
+					AND (ptr.PartitionToken IS NULL OR ptr.PartitionToken IN (SELECT PartitionToken FROM StalePartitions))
+				ORDER BY m.Watermark ASC
+				LIMIT 100
 				FOR UPDATE`, tableRunner, tablePartitionToRunner, s.tableName),
 			Params: map[string]interface{}{
 				"states": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
@@ -284,7 +286,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 				columnUpdatedAt:      spanner.CommitTimestamp,
 				columnCreatedAt:      spanner.CommitTimestamp,
 			})
-			log.Info().
+			log.Debug().
 				Str("runner_id", runnerID).
 				Str("partition_token", p.PartitionToken).
 				Msg("scheduled partition for runner")
@@ -357,7 +359,7 @@ func (s *SpannerPartitionStorage) UpdateToRunning(ctx context.Context, partition
 
 // UpdateToFinished marks the given partition as finished and sets the FinishedAt timestamp.
 func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partition *screamer.PartitionMetadata) error {
-	log.Info().
+	log.Debug().
 		Str("partition_token", partition.PartitionToken).
 		Msg("UpdateToFinished called")
 	m := spanner.UpdateMap(s.tableName, map[string]interface{}{

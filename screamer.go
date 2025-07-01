@@ -314,7 +314,7 @@ func (s *Subscriber) initErrGroup(ctx context.Context) context.Context {
 var errDone = errors.New("all partitions have been processed")
 
 func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
-	log.Info().Str("stream_name", s.streamName).Str("runner_id", s.runnerID).Msg("detecting new partitions")
+	log.Debug().Str("stream_name", s.streamName).Str("runner_id", s.runnerID).Msg("detecting new partitions")
 	minWatermarkPartition, err := s.partitionStorage.GetUnfinishedMinWatermarkPartition(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get unfinished min watermark partition: %w", err)
