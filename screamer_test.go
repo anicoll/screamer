@@ -752,7 +752,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	err = storage.RegisterRunner(ctx, newRunnerID)
 	s.NoError(err)
 
-	newConsumer := &consumerV1{}
+	newConsumer := &consumerV2{}
 	newSubscriber := screamer.NewSubscriber(
 		spannerClient,
 		streamName,
