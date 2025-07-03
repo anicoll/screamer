@@ -62,7 +62,7 @@ func (s *InmemoryPartitionStorage) InitializeRootPartition(ctx context.Context, 
 		HeartbeatMillis: heartbeatInterval.Milliseconds(),
 		State:           screamer.StateCreated,
 		Watermark:       startTimestamp,
-		CreatedAt:       time.Now(),
+		CreatedAt:       time.Now().UTC(),
 	}
 	s.m[p.PartitionToken] = p
 
@@ -90,7 +90,7 @@ func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context,
 	defer s.mu.Unlock()
 
 	partitions := []*screamer.PartitionMetadata{}
-	now := time.Now()
+	now := time.Now().UTC()
 
 	for _, p := range s.m {
 		if p.State == screamer.StateCreated && !minWatermark.After(p.StartTimestamp) {
@@ -135,7 +135,7 @@ func (s *InmemoryPartitionStorage) UpdateToScheduled(ctx context.Context, partit
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now()
+	now := time.Now().UTC()
 	for _, p := range partitions {
 		p = s.m[p.PartitionToken]
 		p.ScheduledAt = &now
@@ -150,8 +150,7 @@ func (s *InmemoryPartitionStorage) UpdateToRunning(ctx context.Context, partitio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now()
-
+	now := time.Now().UTC()
 	p := s.m[partition.PartitionToken]
 	p.RunningAt = &now
 	p.State = screamer.StateRunning
@@ -164,7 +163,7 @@ func (s *InmemoryPartitionStorage) UpdateToFinished(ctx context.Context, partiti
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now()
+	now := time.Now().UTC()
 
 	p := s.m[partition.PartitionToken]
 	p.FinishedAt = &now

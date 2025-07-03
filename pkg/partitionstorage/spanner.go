@@ -8,6 +8,7 @@ import (
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/anicoll/screamer"
+	"github.com/anicoll/screamer/pkg/utils"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
@@ -305,7 +306,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 		return nil, err
 	}
 	for _, p := range partitions {
-		p.ScheduledAt = &ts.CommitTs
+		p.ScheduledAt = utils.ToPtr(ts.CommitTs.UTC())
 	}
 	log.Trace().
 		Int("partitions", len(partitions)).
@@ -353,7 +354,7 @@ func (s *SpannerPartitionStorage) UpdateToRunning(ctx context.Context, partition
 	})
 
 	ts, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateToRunning"))
-	partition.RunningAt = &ts
+	partition.RunningAt = utils.ToPtr(ts.UTC())
 	return err
 }
 
@@ -369,7 +370,7 @@ func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partitio
 	})
 
 	ts, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateToFinished"))
-	partition.RunningAt = &ts
+	partition.RunningAt = utils.ToPtr(ts.UTC())
 	return err
 }
 
@@ -385,6 +386,8 @@ func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition
 	})
 
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateWatermark"))
+	partition.Watermark = watermark.UTC()
+
 	return err
 }
 
