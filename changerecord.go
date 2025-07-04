@@ -128,7 +128,7 @@ type ChildPartition struct {
 	ParentPartitionTokens []string `spanner:"parent_partition_tokens" json:"parent_partition_tokens"`
 }
 
-func (r *dataChangeRecord) DecodeToNonSpannerType(p *PartitionMetadata) *DataChangeRecordWithPartitionMeta {
+func (r *dataChangeRecord) DecodeToNonSpannerType(p *PartitionMetadata, watermark time.Time) *DataChangeRecordWithPartitionMeta {
 	columnTypes := []*ColumnType{}
 	for _, t := range r.ColumnTypes {
 		columnTypes = append(columnTypes, &ColumnType{
@@ -166,7 +166,7 @@ func (r *dataChangeRecord) DecodeToNonSpannerType(p *PartitionMetadata) *DataCha
 		},
 		PartitionToken: p.PartitionToken,
 		StartTimestamp: p.StartTimestamp,
-		Watermark:      p.Watermark,
+		Watermark:      watermark,
 		CreatedAt:      p.CreatedAt,
 		ScheduledAt:    p.ScheduledAt,
 		RunningAt:      p.RunningAt,

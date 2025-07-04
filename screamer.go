@@ -363,6 +363,7 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 	}
 
 	iter := s.spannerClient.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.spannerRequestPriority})
+	defer iter.Stop()
 	if err := iter.Do(func(r *spanner.Row) error {
 		records := []*ChangeRecord{}
 		if err := r.Columns(&records); err != nil {
@@ -415,7 +416,8 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			Int("data_change_records", len(cr.DataChangeRecords)).
 			Msg("processing change record")
 		for _, record := range cr.DataChangeRecords {
-			out, err := json.Marshal(record.DecodeToNonSpannerType(p))
+			watermarker.set(record.CommitTimestamp)
+			out, err := json.Marshal(record.DecodeToNonSpannerType(p, watermarker.get()))
 			if err != nil {
 				return err
 			}
@@ -430,7 +432,6 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 					return err
 				}
 			}
-			watermarker.set(record.CommitTimestamp)
 		}
 		for _, record := range cr.HeartbeatRecords {
 			watermarker.set(record.Timestamp)
