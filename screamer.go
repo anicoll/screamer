@@ -269,7 +269,7 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 	}
 
 	iter := s.spannerClient.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.spannerRequestPriority})
-	defer iter.Stop()
+
 	if err := iter.Do(func(r *spanner.Row) error {
 		records := []*ChangeRecord{}
 		if err := r.Columns(&records); err != nil {
