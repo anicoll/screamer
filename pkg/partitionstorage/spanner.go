@@ -15,21 +15,27 @@ import (
 )
 
 // SpannerPartitionStorage implements PartitionStorage that stores PartitionMetadata in Cloud Spanner.
-type SpannerPartitionStorage struct {
-	client          *spanner.Client
-	tableName       string
-	requestPriority spannerpb.RequestOptions_Priority
-}
+type (
+	SpannerPartitionStorage struct {
+		client          *spanner.Client
+		tableName       string
+		requestPriority spannerpb.RequestOptions_Priority
+	}
+	spannerConfig struct {
+		requestPriority spannerpb.RequestOptions_Priority
+	}
 
-type spannerConfig struct {
-	requestPriority spannerpb.RequestOptions_Priority
-}
+	spannerOption interface {
+		Apply(*spannerConfig)
+	}
 
-type spannerOption interface {
-	Apply(*spannerConfig)
-}
+	withRequestPriotiry spannerpb.RequestOptions_Priority
 
-type withRequestPriotiry spannerpb.RequestOptions_Priority
+	reader interface {
+		QueryWithOptions(ctx context.Context, statement spanner.Statement, opts spanner.QueryOptions) *spanner.RowIterator
+		ReadRow(ctx context.Context, table string, key spanner.Key, columns []string) (*spanner.Row, error)
+	}
+)
 
 func (o withRequestPriotiry) Apply(c *spannerConfig) {
 	c.requestPriority = spannerpb.RequestOptions_Priority(o)
@@ -350,7 +356,7 @@ func (s *SpannerPartitionStorage) updateRunnerPartitionCount(ctx context.Context
 	return updateRunnerMutation, nil
 }
 
-func (s *SpannerPartitionStorage) getRunnerPartitionCount(ctx context.Context, tx *spanner.ReadWriteTransaction, runnerID string) (int64, error) {
+func (s *SpannerPartitionStorage) getRunnerPartitionCount(ctx context.Context, tx reader, runnerID string) (int64, error) {
 	row, err := tx.ReadRow(ctx, tableRunner, spanner.Key{runnerID}, []string{columnPartitionCount})
 	if err != nil {
 		return 0, err
@@ -364,7 +370,7 @@ func (s *SpannerPartitionStorage) getRunnerPartitionCount(ctx context.Context, t
 	return currentCount, nil
 }
 
-func (s *SpannerPartitionStorage) shouldAssignPartitionsToRunner(ctx context.Context, tx *spanner.ReadWriteTransaction, runnerID string) (bool, error) {
+func (s *SpannerPartitionStorage) shouldAssignPartitionsToRunner(ctx context.Context, tx reader, runnerID string) (bool, error) {
 	stmt := spanner.Statement{
 		SQL: fmt.Sprintf(`
 			WITH ActiveRunners AS (
@@ -391,18 +397,18 @@ func (s *SpannerPartitionStorage) shouldAssignPartitionsToRunner(ctx context.Con
 		return false, err
 	}
 
-	// If this is the only active runner, assign partitions
-	if activeRunnerCount == 1 {
-		return true, nil
-	}
-
 	// Check if this runner has the minimum partition count
 	currentCount, err := s.getRunnerPartitionCount(ctx, tx, runnerID)
 	if err != nil {
 		return false, err
 	}
 
-	return currentCount == minPartitionCount, nil
+	// If this is the only active runner, assign partitions
+	if activeRunnerCount == 1 {
+		return true, nil
+	}
+
+	return currentCount <= minPartitionCount, nil
 }
 
 // AddChildPartitions adds new child partitions for a parent partition based on a ChildPartitionsRecord.
