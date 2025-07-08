@@ -670,6 +670,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	ctx := context.Background()
 	proxy := interceptor.NewQueueInterceptor(10)
 	spannerClient, err := spanner.NewClient(ctx, s.dsn, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(proxy.UnaryInterceptor)))
+	s.client = spannerClient
 	s.NoError(err)
 	runnerID := uuid.NewString()
 	s.T().Log("Creating table and change stream...")
@@ -747,7 +748,8 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	}
 	s.True(hasRunningPartition, "Should have at least one running partition")
 	cancelFunc() // cancel running subscription
-
+	counter := s.getRunnerPartitionCount(context.Background(), runnerID)
+	s.Greater(counter, int64(0))
 	newRunnerID := uuid.NewString()
 	err = storage.RegisterRunner(ctx, newRunnerID)
 	s.NoError(err)
@@ -794,8 +796,29 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 		}
 	}
 	s.Greater(newTableRecords, 0, "Should have received records for our table")
-
+	counter = s.getRunnerPartitionCount(context.Background(), newRunnerID)
+	s.Greater(counter, int64(0))
 	cancel()
+}
+
+func (s *IntegrationTestSuite) getRunnerPartitionCount(ctx context.Context, runnerID string) int64 {
+	stmt := spanner.Statement{
+		SQL: fmt.Sprintf("SELECT %s FROM %s WHERE %s = @runnerID",
+			"PartitionCount", "Runner", "RunnerID"),
+		Params: map[string]interface{}{
+			"runnerID": runnerID,
+		},
+	}
+
+	iter := s.client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+
+	var currentCount int64
+	if row, err := iter.Next(); err == nil {
+		err := row.Columns(&currentCount)
+		s.NoError(err)
+	}
+	return currentCount
 }
 
 func (s *IntegrationTestSuite) createTestData(ctx context.Context, spannerClient *spanner.Client, tableName string) {

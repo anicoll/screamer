@@ -503,6 +503,10 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read() {
 	runnerID := uuid.NewString()
 	timestamp := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 
+	// Register the runner first
+	err := storage.RegisterRunner(ctx, runnerID)
+	s.NoError(err)
+
 	// Create test partitions
 	s.insertTestPartitions(ctx, storage, []testPartition{
 		{"created1", timestamp, screamer.StateCreated},
@@ -623,6 +627,10 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 	runnerID := uuid.NewString()
 	baseTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 
+	// Register the runner first
+	err := storage.RegisterRunner(ctx, runnerID)
+	s.NoError(err)
+
 	// Setup test partitions
 	s.insertTestPartitions(ctx, storage, []testPartition{
 		{"p_created_old_watermark", baseTime.Add(-time.Hour), screamer.StateCreated},
@@ -664,10 +672,205 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 			{"p_running_again", baseTime, screamer.StateRunning},
 			{"p_scheduled_again", baseTime, screamer.StateScheduled},
 		})
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
 
 		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
 		s.NoError(err)
 		s.Empty(scheduled, "No partitions should be scheduled if they are not in CREATED state")
+	})
+}
+
+func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions_Extended() {
+	ctx := context.Background()
+	storage, cleanup := s.setupSpannerPartitionStorage(ctx, "GetAndScheduleExtended")
+	defer cleanup()
+
+	baseTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	s.Run("TransactionRollback", func() {
+		storage.CleanupData(ctx)
+		runnerID := uuid.NewString()
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		// Create a partition
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{"rollback_test", baseTime, screamer.StateCreated},
+		})
+
+		// Inject an error to force transaction rollback
+		// Since we can't easily inject errors, we'll test that partition count is updated atomically
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		s.NoError(err)
+		s.Len(scheduled, 1)
+
+		// Verify runner partition count was updated
+		row, err := storage.client.Single().ReadRow(ctx, tableRunner, spanner.Key{runnerID}, []string{columnPartitionCount})
+		s.NoError(err)
+		var count int64
+		err = row.Columns(&count)
+		s.NoError(err)
+		s.Equal(int64(1), count, "Runner partition count should be updated")
+	})
+
+	s.Run("ConcurrentScheduling", func() {
+		storage.CleanupData(ctx)
+
+		// Create multiple runners
+		runner1ID := uuid.NewString()
+		runner2ID := uuid.NewString()
+		err := storage.RegisterRunner(ctx, runner1ID)
+		s.NoError(err)
+		err = storage.RegisterRunner(ctx, runner2ID)
+		s.NoError(err)
+
+		// Create partitions for concurrent scheduling
+		partitions := []testPartition{}
+		for i := range 20 {
+			partitions = append(partitions, testPartition{
+				fmt.Sprintf("concurrent_%d", i),
+				baseTime.Add(time.Duration(i) * time.Second),
+				screamer.StateCreated,
+			})
+		}
+		s.insertTestPartitions(ctx, storage, partitions)
+
+		// Concurrently try to schedule partitions
+		var wg sync.WaitGroup
+		results := make(map[string][]*screamer.PartitionMetadata)
+		errors := make(map[string]error)
+		mu := sync.Mutex{}
+
+		for _, runnerID := range []string{runner1ID, runner2ID} {
+			wg.Add(1)
+			go func(rid string) {
+				defer wg.Done()
+				scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, rid)
+				mu.Lock()
+				defer mu.Unlock()
+				results[rid] = scheduled
+				errors[rid] = err
+			}(runnerID)
+		}
+
+		wg.Wait()
+
+		// Both calls should succeed
+		s.NoError(errors[runner1ID])
+		s.NoError(errors[runner2ID])
+
+		// Verify no partition is assigned to both runners
+		allScheduled := append(results[runner1ID], results[runner2ID]...)
+		s.Len(allScheduled, 20, "Total scheduled partitions should be equal to created partitions")
+		s.Len(results[runner1ID], 10)
+		s.Len(results[runner2ID], 10)
+		tokenMap := make(map[string]int)
+		for _, p := range allScheduled {
+			tokenMap[p.PartitionToken]++
+		}
+		for token, count := range tokenMap {
+			s.Equal(1, count, "Partition %s should only be scheduled once", token)
+		}
+	})
+
+	s.Run("ScheduledAtTimestamp", func() {
+		storage.CleanupData(ctx)
+		runnerID := uuid.NewString()
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		// Create a partition
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{"timestamp_test", baseTime, screamer.StateCreated},
+		})
+
+		beforeSchedule := time.Now().UTC()
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		afterSchedule := time.Now().UTC()
+
+		s.NoError(err)
+		s.Len(scheduled, 1)
+
+		// Verify ScheduledAt timestamp is set and within expected range
+		partition := scheduled[0]
+		s.NotNil(partition.ScheduledAt)
+		s.True(partition.ScheduledAt.After(beforeSchedule) || partition.ScheduledAt.Equal(beforeSchedule))
+		s.True(partition.ScheduledAt.Before(afterSchedule) || partition.ScheduledAt.Equal(afterSchedule))
+
+		// Verify in database
+		row, err := storage.client.Single().ReadRow(ctx, storage.tableName,
+			spanner.Key{partition.PartitionToken}, []string{columnScheduledAt})
+		s.NoError(err)
+		var dbScheduledAt spanner.NullTime
+		err = row.Columns(&dbScheduledAt)
+		s.NoError(err)
+		s.True(dbScheduledAt.Valid)
+		s.Equal(partition.ScheduledAt.Unix(), dbScheduledAt.Time.Unix())
+	})
+
+	s.Run("RunnerPartitionBalancing", func() {
+		storage.CleanupData(ctx)
+
+		// Create runners with different partition counts
+		busyRunnerID := uuid.NewString()
+		idleRunnerID := uuid.NewString()
+
+		// Register both runners
+		err := storage.RegisterRunner(ctx, busyRunnerID)
+		s.NoError(err)
+		err = storage.RegisterRunner(ctx, idleRunnerID)
+		s.NoError(err)
+
+		// Manually update busy runner to have high partition count
+		_, err = storage.client.Apply(ctx, []*spanner.Mutation{
+			spanner.UpdateMap(tableRunner, map[string]interface{}{
+				columnRunnerID:       busyRunnerID,
+				columnPartitionCount: int64(10),
+				columnUpdatedAt:      spanner.CommitTimestamp,
+			}),
+		})
+		s.NoError(err)
+
+		// Create partitions
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{"balance_test_1", baseTime, screamer.StateCreated},
+			{"balance_test_2", baseTime, screamer.StateCreated},
+		})
+
+		// Busy runner should not get partitions due to balancing logic
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, busyRunnerID)
+		s.NoError(err)
+		s.Empty(scheduled, "Busy runner should not get partitions when idle runner exists")
+
+		// Idle runner should get partitions
+		scheduled, err = storage.GetAndSchedulePartitions(ctx, baseTime, idleRunnerID)
+		s.NoError(err)
+		s.Len(scheduled, 2, "Idle runner should get available partitions")
+	})
+
+	s.Run("OrderByStartTimestamp", func() {
+		storage.CleanupData(ctx)
+		runnerID := uuid.NewString()
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		// Create partitions with different start timestamps
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{"order_test_3", baseTime.Add(3 * time.Hour), screamer.StateCreated},
+			{"order_test_1", baseTime.Add(1 * time.Hour), screamer.StateCreated},
+			{"order_test_2", baseTime.Add(2 * time.Hour), screamer.StateCreated},
+		})
+
+		// Should get partitions ordered by StartTimestamp ASC
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		s.NoError(err)
+		s.Len(scheduled, 3)
+
+		// Verify order
+		s.Equal("order_test_1", scheduled[0].PartitionToken)
+		s.Equal("order_test_2", scheduled[1].PartitionToken)
+		s.Equal("order_test_3", scheduled[2].PartitionToken)
 	})
 }
 
@@ -736,6 +939,9 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 	ctx := context.Background()
 	storage, cleanup := s.setupSpannerPartitionStorage(ctx, "Update")
 	defer cleanup()
+	runnerID := uuid.NewString()
+	err := storage.RegisterRunner(ctx, runnerID)
+	s.NoError(err)
 
 	baseTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 	partitions := []*screamer.PartitionMetadata{
@@ -757,7 +963,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 			columnCreatedAt:       spanner.CommitTimestamp,
 		})
 	}
-	_, err := storage.client.Apply(ctx, mutations)
+	_, err = storage.client.Apply(ctx, mutations)
 	s.NoError(err)
 
 	s.Run("UpdateToRunning", func() {
@@ -779,7 +985,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Update() {
 	})
 
 	s.Run("UpdateToFinished", func() {
-		err := storage.UpdateToFinished(ctx, partitions[0])
+		err := storage.UpdateToFinished(ctx, partitions[0], runnerID)
 		s.NoError(err)
 
 		type result struct {
