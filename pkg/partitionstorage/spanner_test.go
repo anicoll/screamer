@@ -980,6 +980,13 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		for token, count := range tokenMap {
 			s.Equal(1, count, "Partition %s should only be scheduled once", token)
 		}
+		// Runners should be able to take new partitions if any.
+		shouldBeAssignable, err := storage.shouldAssignPartitionsToRunner(ctx, storage.client.ReadOnlyTransaction(), runner1ID)
+		s.NoError(err)
+		s.True(shouldBeAssignable, "Runner should be able to assign partitions")
+		shouldBeAssignable, err = storage.shouldAssignPartitionsToRunner(ctx, storage.client.ReadOnlyTransaction(), runner2ID)
+		s.NoError(err)
+		s.True(shouldBeAssignable, "Runner should be able to assign partitions")
 	})
 
 	s.Run("ScheduledAtTimestamp", func() {
