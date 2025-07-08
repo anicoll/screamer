@@ -899,14 +899,6 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		s.NoError(err)
 		s.Empty(scheduled, "No partitions should be scheduled if they are not in CREATED state")
 	})
-}
-
-func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions_Extended() {
-	ctx := context.Background()
-	storage, cleanup := s.setupSpannerPartitionStorage(ctx, "GetAndScheduleExtended")
-	defer cleanup()
-
-	baseTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	s.Run("TransactionRollback", func() {
 		storage.CleanupData(ctx)
@@ -924,14 +916,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions_
 		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
 		s.NoError(err)
 		s.Len(scheduled, 1)
-
-		// Verify runner partition count was updated
-		row, err := storage.client.Single().ReadRow(ctx, tableRunner, spanner.Key{runnerID}, []string{columnPartitionCount})
-		s.NoError(err)
-		var count int64
-		err = row.Columns(&count)
-		s.NoError(err)
-		s.Equal(int64(1), count, "Runner partition count should be updated")
+		s.assertRunnerPartitionCount(ctx, storage, runnerID, 1)
 	})
 
 	s.Run("ConcurrentScheduling", func() {
@@ -980,6 +965,9 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions_
 		s.NoError(errors[runner1ID])
 		s.NoError(errors[runner2ID])
 
+		s.assertRunnerPartitionCount(ctx, storage, runner1ID, 10)
+		s.assertRunnerPartitionCount(ctx, storage, runner2ID, 10)
+
 		// Verify no partition is assigned to both runners
 		allScheduled := append(results[runner1ID], results[runner2ID]...)
 		s.Len(allScheduled, 20, "Total scheduled partitions should be equal to created partitions")
@@ -1016,7 +1004,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions_
 		partition := scheduled[0]
 		s.NotNil(partition.ScheduledAt)
 		s.True(partition.ScheduledAt.After(beforeSchedule) || partition.ScheduledAt.Equal(beforeSchedule))
-		s.GreaterOrEqual(partition.ScheduledAt.UnixMilli(), afterSchedule.UnixMilli())
+		s.GreaterOrEqual(afterSchedule.UnixMilli(), partition.ScheduledAt.UnixMilli())
 
 		// Verify in database
 		row, err := storage.client.Single().ReadRow(ctx, storage.tableName,
@@ -1027,6 +1015,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions_
 		s.NoError(err)
 		s.True(dbScheduledAt.Valid)
 		s.Equal(partition.ScheduledAt.Unix(), dbScheduledAt.Time.Unix())
+		s.assertRunnerPartitionCount(ctx, storage, runnerID, 1)
 	})
 
 	s.Run("RunnerPartitionBalancing", func() {
@@ -1062,11 +1051,13 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions_
 		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, busyRunnerID)
 		s.NoError(err)
 		s.Empty(scheduled, "Busy runner should not get partitions when idle runner exists")
+		s.assertRunnerPartitionCount(ctx, storage, busyRunnerID, 10)
 
 		// Idle runner should get partitions
 		scheduled, err = storage.GetAndSchedulePartitions(ctx, baseTime, idleRunnerID)
 		s.NoError(err)
 		s.Len(scheduled, 2, "Idle runner should get available partitions")
+		s.assertRunnerPartitionCount(ctx, storage, idleRunnerID, 2)
 	})
 
 	s.Run("OrderByStartTimestamp", func() {
@@ -1092,6 +1083,16 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions_
 		s.Equal("order_test_2", scheduled[1].PartitionToken)
 		s.Equal("order_test_3", scheduled[2].PartitionToken)
 	})
+}
+
+func (s *SpannerTestSuite) assertRunnerPartitionCount(ctx context.Context, storage *testStorage, runnerID string, expectedCount int64) {
+	// Verify runner partition count was updated
+	row, err := storage.client.Single().ReadRow(ctx, tableRunner, spanner.Key{runnerID}, []string{columnPartitionCount})
+	s.NoError(err)
+	var count int64
+	err = row.Columns(&count)
+	s.NoError(err)
+	s.Equal(expectedCount, count, "Runner partition count should be updated")
 }
 
 func (s *SpannerTestSuite) TestSpannerPartitionStorage_AddChildPartitions() {
