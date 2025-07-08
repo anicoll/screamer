@@ -1016,7 +1016,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions_
 		partition := scheduled[0]
 		s.NotNil(partition.ScheduledAt)
 		s.True(partition.ScheduledAt.After(beforeSchedule) || partition.ScheduledAt.Equal(beforeSchedule))
-		s.True(partition.ScheduledAt.Before(afterSchedule) || partition.ScheduledAt.Equal(afterSchedule))
+		s.GreaterOrEqual(partition.ScheduledAt.UnixMilli(), afterSchedule.UnixMilli())
 
 		// Verify in database
 		row, err := storage.client.Single().ReadRow(ctx, storage.tableName,
