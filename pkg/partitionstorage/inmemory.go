@@ -159,7 +159,7 @@ func (s *InmemoryPartitionStorage) UpdateToRunning(ctx context.Context, partitio
 }
 
 // UpdateToFinished marks the given partition as finished and sets the FinishedAt timestamp.
-func (s *InmemoryPartitionStorage) UpdateToFinished(ctx context.Context, partition *screamer.PartitionMetadata) error {
+func (s *InmemoryPartitionStorage) UpdateToFinished(ctx context.Context, partition *screamer.PartitionMetadata, runnerID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

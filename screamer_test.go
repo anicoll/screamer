@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,7 +16,6 @@ import (
 	"github.com/anicoll/screamer/internal/helper"
 	"github.com/anicoll/screamer/pkg/interceptor"
 	"github.com/anicoll/screamer/pkg/partitionstorage"
-	"github.com/go-faker/faker/v4"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
@@ -82,14 +82,13 @@ func (s *IntegrationTestSuite) AfterTest(suiteName, testName string) {
 	}
 }
 
-func createTableAndChangeStream(ctx context.Context, databaseName string) (string, string, error) {
+func createTableAndChangeStream(ctx context.Context, databaseName, tableName string) (string, string, error) {
 	databaseAdminClient, err := database.NewDatabaseAdminClient(ctx)
 	if err != nil {
 		return "", "", err
 	}
 	defer databaseAdminClient.Close()
 
-	tableName := faker.Word()
 	streamName := tableName + "Stream"
 
 	op, err := databaseAdminClient.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
@@ -130,6 +129,7 @@ func createTableAndChangeStream(ctx context.Context, databaseName string) (strin
 }
 
 type consumerV2 struct {
+	mu      sync.Mutex
 	changes []*screamer.DataChangeRecordWithPartitionMeta
 }
 
@@ -138,11 +138,22 @@ func (c *consumerV2) Consume(change []byte) error {
 	if err := json.Unmarshal(change, dcr); err != nil {
 		return err
 	}
+	c.mu.Lock()
 	c.changes = append(c.changes, dcr)
+	c.mu.Unlock()
 	return nil
 }
 
+func (c *consumerV2) getChanges() []*screamer.DataChangeRecordWithPartitionMeta {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make([]*screamer.DataChangeRecordWithPartitionMeta, len(c.changes))
+	copy(result, c.changes)
+	return result
+}
+
 type consumerV1 struct {
+	mu      sync.Mutex
 	changes []*screamer.DataChangeRecord
 }
 
@@ -151,8 +162,18 @@ func (c *consumerV1) Consume(change []byte) error {
 	if err := json.Unmarshal(change, dcr); err != nil {
 		return err
 	}
+	c.mu.Lock()
 	c.changes = append(c.changes, dcr)
+	c.mu.Unlock()
 	return nil
+}
+
+func (c *consumerV1) getChanges() []*screamer.DataChangeRecord {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make([]*screamer.DataChangeRecord, len(c.changes))
+	copy(result, c.changes)
+	return result
 }
 
 func (s *IntegrationTestSuite) TestSubscriber_inmemstorage() {
@@ -162,7 +183,7 @@ func (s *IntegrationTestSuite) TestSubscriber_inmemstorage() {
 	s.NoError(err)
 	runnerID := uuid.NewString()
 	s.T().Log("Creating table and change stream...")
-	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName())
+	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName(), "inmemstorage")
 	s.NoError(err)
 
 	s.T().Logf("Created table: %q, change stream: %q", tableName, streamName)
@@ -360,7 +381,7 @@ func (s *IntegrationTestSuite) TestSubscriber_inmemstorage() {
 	}
 	for _, test := range tests {
 		storage := partitionstorage.NewInmemory()
-		subscriber := screamer.NewSubscriber(spannerClient, streamName, runnerID, storage)
+		subscriber := screamer.NewSubscriber(spannerClient, streamName, runnerID, storage, screamer.WithSerializedConsumer(true))
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -392,8 +413,9 @@ func (s *IntegrationTestSuite) TestSubscriber_inmemstorage() {
 			cmpopts.IgnoreFields(screamer.DataChangeRecord{}, "CommitTimestamp", "ServerTransactionID", "RecordSequence", "NumberOfRecordsInTransaction"),
 			cmpopts.IgnoreFields(screamer.Mod{}, "OldValues", "NewValues"),
 		}
-		s.Assert().Len(consumer.changes, len(test.expected))
-		for _, change := range consumer.changes {
+		changes := consumer.getChanges()
+		s.Assert().Len(changes, len(test.expected))
+		for _, change := range changes {
 			switch change.ModType {
 			case screamer.ModType_INSERT:
 				diff := cmp.Diff(test.expected[0], change, opts...)
@@ -416,9 +438,8 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage() {
 	s.NoError(err)
 	runnerID := uuid.NewString()
 	s.T().Log("Creating table and change stream...")
-	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName())
+	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName(), "spannerstorage")
 	s.NoError(err)
-	metaTableName := faker.Word()
 
 	s.T().Logf("Created table: %q, change stream: %q", tableName, streamName)
 
@@ -614,10 +635,10 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage() {
 		},
 	}
 	for _, test := range tests {
-		storage := partitionstorage.NewSpanner(spannerClient, metaTableName)
+		storage := partitionstorage.NewSpanner(spannerClient, "metaTableName")
 		s.NoError(storage.RunMigrations(ctx))
 		s.NoError(storage.RegisterRunner(ctx, runnerID))
-		subscriber := screamer.NewSubscriber(spannerClient, streamName, runnerID, storage)
+		subscriber := screamer.NewSubscriber(spannerClient, streamName, runnerID, storage, screamer.WithSerializedConsumer(true))
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -649,8 +670,9 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage() {
 			cmpopts.IgnoreFields(screamer.DataChangeRecord{}, "CommitTimestamp", "ServerTransactionID", "RecordSequence", "NumberOfRecordsInTransaction"),
 			cmpopts.IgnoreFields(screamer.Mod{}, "OldValues", "NewValues"),
 		}
-		s.Assert().Len(consumer.changes, len(test.expected))
-		for _, change := range consumer.changes {
+		changes := consumer.getChanges()
+		s.Assert().Len(changes, len(test.expected))
+		for _, change := range changes {
 			switch change.ModType {
 			case screamer.ModType_INSERT:
 				diff := cmp.Diff(test.expected[0], change, opts...)
@@ -670,10 +692,11 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	ctx := context.Background()
 	proxy := interceptor.NewQueueInterceptor(10)
 	spannerClient, err := spanner.NewClient(ctx, s.dsn, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(proxy.UnaryInterceptor)))
+	s.client = spannerClient
 	s.NoError(err)
 	runnerID := uuid.NewString()
 	s.T().Log("Creating table and change stream...")
-	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName())
+	tableName, streamName, err := createTableAndChangeStream(ctx, spannerClient.DatabaseName(), "interrupted")
 	s.NoError(err)
 	metaTableName := testTableName
 
@@ -697,6 +720,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 		storage,
 		screamer.WithStartTimestamp(time.Now()),
 		screamer.WithHeartbeatInterval(1*time.Second),
+		screamer.WithSerializedConsumer(true),
 	)
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -747,7 +771,8 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	}
 	s.True(hasRunningPartition, "Should have at least one running partition")
 	cancelFunc() // cancel running subscription
-
+	counter := s.getRunnerPartitionCount(context.Background(), runnerID)
+	s.Greater(counter, int64(0))
 	newRunnerID := uuid.NewString()
 	err = storage.RegisterRunner(ctx, newRunnerID)
 	s.NoError(err)
@@ -760,6 +785,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 		storage,
 		screamer.WithStartTimestamp(time.Now()),
 		screamer.WithHeartbeatInterval(1*time.Second),
+		screamer.WithSerializedConsumer(true),
 	)
 
 	go func() {
@@ -783,19 +809,41 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	time.Sleep(time.Second * 1)
 
 	// Verify we received change records
-	s.T().Logf("Received %d changes", len(newConsumer.changes))
-	s.NotEmpty(newConsumer.changes, "Should have received at least one change record")
+	changes := newConsumer.getChanges()
+	s.T().Logf("Received %d changes", len(changes))
+	s.NotEmpty(changes, "Should have received at least one change record")
 
 	// At least one record should be for our table
 	var newTableRecords int
-	for _, r := range newConsumer.changes {
+	for _, r := range changes {
 		if r.TableName == tableName {
 			newTableRecords++
 		}
 	}
 	s.Greater(newTableRecords, 0, "Should have received records for our table")
-
+	counter = s.getRunnerPartitionCount(context.Background(), newRunnerID)
+	s.Greater(counter, int64(0))
 	cancel()
+}
+
+func (s *IntegrationTestSuite) getRunnerPartitionCount(ctx context.Context, runnerID string) int64 {
+	stmt := spanner.Statement{
+		SQL: fmt.Sprintf("SELECT %s FROM %s WHERE %s = @runnerID",
+			"PartitionCount", "Runner", "RunnerID"),
+		Params: map[string]interface{}{
+			"runnerID": runnerID,
+		},
+	}
+
+	iter := s.client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+
+	var currentCount int64
+	if row, err := iter.Next(); err == nil {
+		err := row.Columns(&currentCount)
+		s.NoError(err)
+	}
+	return currentCount
 }
 
 func (s *IntegrationTestSuite) createTestData(ctx context.Context, spannerClient *spanner.Client, tableName string) {

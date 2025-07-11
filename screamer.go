@@ -33,7 +33,7 @@ type PartitionStorage interface {
 	// RefreshRunner updates the liveness timestamp for the given runnerID.
 	RefreshRunner(ctx context.Context, runnerID string) error
 	// UpdateToFinished marks the given partition as finished.
-	UpdateToFinished(ctx context.Context, partition *PartitionMetadata) error
+	UpdateToFinished(ctx context.Context, partition *PartitionMetadata, runnerID string) error
 	// UpdateWatermark updates the watermark for the given partition.
 	UpdateWatermark(ctx context.Context, partition *PartitionMetadata, watermark time.Time) error
 }
@@ -269,7 +269,7 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 	}
 
 	iter := s.spannerClient.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.spannerRequestPriority})
-	defer iter.Stop()
+
 	if err := iter.Do(func(r *spanner.Row) error {
 		records := []*ChangeRecord{}
 		if err := r.Columns(&records); err != nil {
@@ -293,7 +293,7 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 
 	log.Info().Str("partition_token", p.PartitionToken).
 		Msg("partition processing complete")
-	if err := s.partitionStorage.UpdateToFinished(ctx, p); err != nil {
+	if err := s.partitionStorage.UpdateToFinished(ctx, p, s.runnerID); err != nil {
 		return fmt.Errorf("failed to update to finished: %w", err)
 	}
 
