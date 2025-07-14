@@ -297,7 +297,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		partitions = make([]*screamer.PartitionMetadata, 0)
 		mutations := make([]*spanner.Mutation, 0, len(partitions))
-		canAssignPartitions, err := s.shouldAssignPartitionsToRunner(ctx, tx, runnerID)
+		canAssignPartitions, err := s.shouldAssignPartitionsToRunner(ctx, tx)
 		if err != nil {
 			return fmt.Errorf("failed to check if runner %s should be assigned partitions: %w", runnerID, err)
 		}
@@ -307,7 +307,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 		}
 
 		stmt := spanner.Statement{
-			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC LIMIT 10 FOR UPDATE", s.tableName),
+			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC FOR UPDATE", s.tableName),
 			Params: map[string]interface{}{
 				"state":        screamer.StateCreated,
 				"minWatermark": minWatermark,
@@ -382,7 +382,7 @@ func (s *SpannerPartitionStorage) updateRunnerMutation(runnerID string) *spanner
 	return updateRunnerMutation
 }
 
-func (s *SpannerPartitionStorage) shouldAssignPartitionsToRunner(ctx context.Context, tx reader, runnerID string) (bool, error) {
+func (s *SpannerPartitionStorage) shouldAssignPartitionsToRunner(ctx context.Context, tx reader) (bool, error) {
 	stmt := spanner.Statement{
 		SQL: fmt.Sprintf(`
 			WITH ActiveRunners AS (
