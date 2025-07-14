@@ -39,6 +39,7 @@ type IntegrationTestSuite struct {
 	container testcontainers.Container
 	client    *spanner.Client
 	dsn       string
+	proxy     *interceptor.QueueInterceptor
 }
 
 func TestIntegrationTestSuite(t *testing.T) {
@@ -49,6 +50,7 @@ func (s *IntegrationTestSuite) SetupSuite() {
 	s.ctx = context.Background()
 	image := "gcr.io/cloud-spanner-emulator/emulator"
 	ports := []string{"9010/tcp"}
+	s.proxy = interceptor.NewQueueInterceptor(100)
 
 	envVars := make(map[string]string)
 	var err error
@@ -135,8 +137,8 @@ func (c *testConsumer) getChangesV2() []*screamer.DataChangeRecordWithPartitionM
 	return result
 }
 
-func createTableAndChangeStream(ctx context.Context, databaseName, tableName string) (string, string, error) {
-	databaseAdminClient, err := database.NewDatabaseAdminClient(ctx)
+func (s *IntegrationTestSuite) createTableAndChangeStream(ctx context.Context, databaseName, tableName string) (string, string, error) {
+	databaseAdminClient, err := database.NewDatabaseAdminClient(ctx, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(s.proxy.UnaryInterceptor)))
 	if err != nil {
 		return "", "", err
 	}
@@ -184,8 +186,7 @@ func createTableAndChangeStream(ctx context.Context, databaseName, tableName str
 // Helper methods for common test operations
 
 func (s *IntegrationTestSuite) createSpannerClient(ctx context.Context) {
-	proxy := interceptor.NewQueueInterceptor(10)
-	spannerClient, err := spanner.NewClient(ctx, s.dsn, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(proxy.UnaryInterceptor)))
+	spannerClient, err := spanner.NewClient(ctx, s.dsn, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(s.proxy.UnaryInterceptor)))
 	s.NoError(err)
 	s.client = spannerClient
 }
@@ -434,7 +435,7 @@ func (s *IntegrationTestSuite) TestSubscriber_inmemstorage() {
 	runnerID := uuid.NewString()
 
 	s.T().Log("Creating table and change stream...")
-	tableName, streamName, err := createTableAndChangeStream(ctx, s.client.DatabaseName(), "inmemstorage")
+	tableName, streamName, err := s.createTableAndChangeStream(ctx, s.client.DatabaseName(), "inmemstorage")
 	s.NoError(err)
 	s.T().Logf("Created table: %q, change stream: %q", tableName, streamName)
 
@@ -473,7 +474,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage() {
 	runnerID := uuid.NewString()
 
 	s.T().Log("Creating table and change stream...")
-	tableName, streamName, err := createTableAndChangeStream(ctx, s.client.DatabaseName(), "spannerstorage")
+	tableName, streamName, err := s.createTableAndChangeStream(ctx, s.client.DatabaseName(), "spannerstorage")
 	metaTableName := "spannerstorage_metadata"
 	s.NoError(err)
 	s.T().Logf("Created table: %q, change stream: %q", tableName, streamName)
@@ -513,16 +514,11 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	ctx := context.Background()
 	runnerID := uuid.NewString()
 	s.T().Log("Creating table and change stream...")
-	tableName, streamName, err := createTableAndChangeStream(ctx, s.client.DatabaseName(), "interrupted")
+	tableName, streamName, err := s.createTableAndChangeStream(ctx, s.client.DatabaseName(), "interrupted")
 	s.NoError(err)
 	metaTableName := "interrupted_metadata"
 
 	s.T().Logf("Created table: %q, change stream: %q", tableName, streamName)
-
-	// Create the metadata table for SpannerStorage
-	adminClient, err := database.NewDatabaseAdminClient(ctx)
-	s.NoError(err)
-	defer adminClient.Close()
 
 	contextForCancellation, cancelFunc := context.WithCancel(context.Background())
 	// Create metadata table
@@ -626,16 +622,11 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_multiple_runners() 
 	runnerID2 := uuid.NewString()
 	runnerID3 := uuid.NewString()
 	s.T().Log("Creating table and change stream...")
-	tableName, streamName, err := createTableAndChangeStream(ctx, s.client.DatabaseName(), "multiple_runners")
+	tableName, streamName, err := s.createTableAndChangeStream(ctx, s.client.DatabaseName(), "multiple_runners")
 	s.NoError(err)
 	metaTableName := "multiple_runners_metadata"
 
 	s.T().Logf("Created table: %q, change stream: %q", tableName, streamName)
-
-	// Create the metadata table for SpannerStorage
-	adminClient, err := database.NewDatabaseAdminClient(ctx)
-	s.NoError(err)
-	defer adminClient.Close()
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
 
