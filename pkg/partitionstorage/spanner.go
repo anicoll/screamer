@@ -3,6 +3,7 @@ package partitionstorage
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -16,10 +17,16 @@ import (
 
 // SpannerPartitionStorage implements PartitionStorage that stores PartitionMetadata in Cloud Spanner.
 type (
+	partitionCounter struct {
+		m     sync.Mutex
+		count int64
+	}
+
 	SpannerPartitionStorage struct {
 		client          *spanner.Client
 		tableName       string
 		requestPriority spannerpb.RequestOptions_Priority
+		counter         *partitionCounter
 	}
 	spannerConfig struct {
 		requestPriority spannerpb.RequestOptions_Priority
@@ -36,6 +43,30 @@ type (
 		ReadRow(ctx context.Context, table string, key spanner.Key, columns []string) (*spanner.Row, error)
 	}
 )
+
+func (pc *partitionCounter) Increment() {
+	pc.m.Lock()
+	defer pc.m.Unlock()
+	pc.count++
+}
+
+func (pc *partitionCounter) Add(delta int64) {
+	pc.m.Lock()
+	defer pc.m.Unlock()
+	pc.count += delta
+}
+
+func (pc *partitionCounter) Decrement() {
+	pc.m.Lock()
+	defer pc.m.Unlock()
+	pc.count--
+}
+
+func (pc *partitionCounter) Get() int64 {
+	pc.m.Lock()
+	defer pc.m.Unlock()
+	return pc.count
+}
 
 func (o withRequestPriotiry) Apply(c *spannerConfig) {
 	c.requestPriority = spannerpb.RequestOptions_Priority(o)
@@ -59,6 +90,7 @@ func NewSpanner(client *spanner.Client, tableName string, options ...spannerOpti
 		client:          client,
 		tableName:       tableName,
 		requestPriority: c.requestPriority,
+		counter:         &partitionCounter{},
 	}
 }
 
@@ -207,19 +239,19 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 			return fmt.Errorf("error processing partitions to reassign for runner %s: %w", runnerID, err)
 		}
 
-		if len(partitions) > 0 {
-			updateRunnerMutation, err := s.updateRunnerPartitionCount(ctx, tx, runnerID, int64(len(partitions)))
-			if err != nil {
-				return fmt.Errorf("failed to update runner partition count for runner %s: %w", runnerID, err)
-			}
-			mutations = append(mutations, updateRunnerMutation)
-		}
-
 		return tx.BufferWrite(mutations)
 	}, spanner.TransactionOptions{TransactionTag: "GetInterruptedPartitions"})
 
 	if errOuter != nil {
 		return nil, fmt.Errorf("transaction failed for GetInterruptedPartitions with runner %s: %w", runnerID, errOuter)
+	}
+
+	if len(partitions) > 0 {
+		s.counter.Add(int64(len(partitions)))
+		updateRunnerMutation := s.updateRunnerMutation(runnerID)
+		if _, err := s.client.Apply(ctx, []*spanner.Mutation{updateRunnerMutation}, spanner.Priority(s.requestPriority)); err != nil {
+			return nil, fmt.Errorf("failed to update runner partition count for runner %s: %w", runnerID, err)
+		}
 	}
 	log.Trace().Str("runner_id", runnerID).
 		Int("interrupted_partitions", len(partitions)).
@@ -315,16 +347,6 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 			return err
 		}
 
-		// Update runner's partition count if we scheduled any partitions
-		if len(partitions) > 0 {
-			updateRunnerMutation, err := s.updateRunnerPartitionCount(ctx, tx, runnerID, int64(len(partitions)))
-			if err != nil {
-				return fmt.Errorf("failed to update runner partition count for runner %s: %w", runnerID, err)
-			}
-
-			mutations = append(mutations, updateRunnerMutation)
-		}
-
 		// writes the updates to spanner.
 		return tx.BufferWrite(mutations)
 	}, spanner.TransactionOptions{TransactionTag: "GetAndSchedulePartitions"})
@@ -334,6 +356,15 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 	for _, p := range partitions {
 		p.ScheduledAt = utils.ToPtr(ts.CommitTs.UTC())
 	}
+
+	// Update runner's partition count if we scheduled any partitions
+	if len(partitions) > 0 {
+		s.counter.Add(int64(len(partitions)))
+		updateRunnerMutation := s.updateRunnerMutation(runnerID)
+		if _, err := s.client.Apply(ctx, []*spanner.Mutation{updateRunnerMutation}, spanner.Priority(s.requestPriority)); err != nil {
+			return nil, fmt.Errorf("failed to update runner partition count for runner %s: %w", runnerID, err)
+		}
+	}
 	log.Trace().
 		Int("partitions", len(partitions)).
 		Str("runner_id", runnerID).
@@ -341,33 +372,14 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 	return partitions, nil
 }
 
-func (s *SpannerPartitionStorage) updateRunnerPartitionCount(ctx context.Context, tx *spanner.ReadWriteTransaction, runnerID string, delta int64) (*spanner.Mutation, error) {
-	currentCount, err := s.getRunnerPartitionCount(ctx, tx, runnerID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current partition count for runner %s: %w", runnerID, err)
-	}
-
+func (s *SpannerPartitionStorage) updateRunnerMutation(runnerID string) *spanner.Mutation {
 	updateRunnerMutation := spanner.UpdateMap(tableRunner, map[string]interface{}{
 		columnRunnerID:       runnerID,
-		columnPartitionCount: max(currentCount+delta, 0),
+		columnPartitionCount: max(s.counter.Get(), 0),
 		columnUpdatedAt:      spanner.CommitTimestamp,
 	})
 
-	return updateRunnerMutation, nil
-}
-
-func (s *SpannerPartitionStorage) getRunnerPartitionCount(ctx context.Context, tx reader, runnerID string) (int64, error) {
-	row, err := tx.ReadRow(ctx, tableRunner, spanner.Key{runnerID}, []string{columnPartitionCount})
-	if err != nil {
-		return 0, err
-	}
-
-	var currentCount int64
-	if err := row.Columns(&currentCount); err != nil {
-		return 0, err
-	}
-
-	return currentCount, nil
+	return updateRunnerMutation
 }
 
 func (s *SpannerPartitionStorage) shouldAssignPartitionsToRunner(ctx context.Context, tx reader, runnerID string) (bool, error) {
@@ -397,18 +409,12 @@ func (s *SpannerPartitionStorage) shouldAssignPartitionsToRunner(ctx context.Con
 		return false, err
 	}
 
-	// Check if this runner has the minimum partition count
-	currentCount, err := s.getRunnerPartitionCount(ctx, tx, runnerID)
-	if err != nil {
-		return false, err
-	}
-
 	// If this is the only active runner, assign partitions
 	if activeRunnerCount == 1 {
 		return true, nil
 	}
 
-	return currentCount <= minPartitionCount, nil
+	return s.counter.Get() <= minPartitionCount, nil
 }
 
 // AddChildPartitions adds new child partitions for a parent partition based on a ChildPartitionsRecord.
@@ -461,11 +467,9 @@ func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partitio
 		Str("runner_id", runnerID).
 		Msg("UpdateToFinished called")
 
+	s.counter.Decrement()
 	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		updateRunnerMutation, err := s.updateRunnerPartitionCount(ctx, tx, runnerID, -1)
-		if err != nil {
-			return fmt.Errorf("failed to update runner partition count for runner %s: %w", runnerID, err)
-		}
+		updateRunnerMutation := s.updateRunnerMutation(runnerID)
 
 		// Update partition state to finished
 		partitionMutation := spanner.UpdateMap(s.tableName, map[string]interface{}{
