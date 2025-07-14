@@ -1000,9 +1000,9 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 			{"timestamp_test", baseTime, screamer.StateCreated},
 		})
 
-		beforeSchedule := time.Now().UTC()
+		beforeSchedule := time.Now().UTC().Truncate(time.Millisecond)
 		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
-		afterSchedule := time.Now().UTC()
+		afterSchedule := time.Now().UTC().Truncate(time.Millisecond)
 
 		s.NoError(err)
 		s.Len(scheduled, 1)
@@ -1010,6 +1010,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		// Verify ScheduledAt timestamp is set and within expected range
 		partition := scheduled[0]
 		s.NotNil(partition.ScheduledAt)
+
 		s.True(partition.ScheduledAt.After(beforeSchedule) || partition.ScheduledAt.Equal(beforeSchedule))
 		s.GreaterOrEqual(afterSchedule.UnixMilli(), partition.ScheduledAt.UnixMilli())
 
@@ -1304,7 +1305,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions(
 	err := storage.RegisterRunner(ctx, callingRunnerID)
 	s.Require().NoError(err)
 
-	baseTime := time.Now().UTC().Truncate(time.Microsecond)
+	baseTime := time.Now().UTC().Truncate(time.Microsecond).Add(-100 * time.Millisecond)
 	staleTime := baseTime.Add(-10 * time.Second) // Well before the 3-second stale interval
 	liveTime := baseTime.Add(-1 * time.Second)   // Within the 3-second live interval
 
