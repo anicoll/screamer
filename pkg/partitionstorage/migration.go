@@ -72,15 +72,9 @@ func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 	partitionMetaIndexStmt := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %[1]s_idx ON %[1]s(%[2]s) STORING (%[3]s, %[4]s, %[5]s, %[6]s, %[7]s, %[8]s, %[9]s, %[10]s, %[11]s)`,
 		s.tableName, columnWatermark, columnCreatedAt, columnEndTimestamp, columnFinishedAt, columnHeartbeatMillis, columnParentTokens, columnRunningAt, columnScheduledAt, columnStartTimestamp, columnState)
 
-	// Add PartitionCount column to Runner table if it doesn't exist
-	addPartitionCountStmt := fmt.Sprintf(`ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS %[2]s INT64 NOT NULL DEFAULT (0)`,
-		tableRunner,
-		columnPartitionCount,
-	)
-
 	req := &databasepb.UpdateDatabaseDdlRequest{
 		Database:   s.client.DatabaseName(),
-		Statements: []string{partitionStmt, partitionToRunnerStmt, runnerStmt, runnerIndexStmt, partitionMetaIndexStmt, addPartitionCountStmt},
+		Statements: []string{partitionStmt, partitionToRunnerStmt, runnerStmt, runnerIndexStmt, partitionMetaIndexStmt},
 	}
 	op, err := databaseAdminClient.UpdateDatabaseDdl(ctx, req)
 	if err != nil {

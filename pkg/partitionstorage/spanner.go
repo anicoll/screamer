@@ -3,7 +3,6 @@ package partitionstorage
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -17,16 +16,10 @@ import (
 
 // SpannerPartitionStorage implements PartitionStorage that stores PartitionMetadata in Cloud Spanner.
 type (
-	partitionCounter struct {
-		m     sync.Mutex
-		count int64
-	}
-
 	SpannerPartitionStorage struct {
 		client          *spanner.Client
 		tableName       string
 		requestPriority spannerpb.RequestOptions_Priority
-		counter         *partitionCounter
 	}
 	spannerConfig struct {
 		requestPriority spannerpb.RequestOptions_Priority
@@ -43,30 +36,6 @@ type (
 		ReadRow(ctx context.Context, table string, key spanner.Key, columns []string) (*spanner.Row, error)
 	}
 )
-
-func (pc *partitionCounter) Increment() {
-	pc.m.Lock()
-	defer pc.m.Unlock()
-	pc.count++
-}
-
-func (pc *partitionCounter) Add(delta int64) {
-	pc.m.Lock()
-	defer pc.m.Unlock()
-	pc.count += delta
-}
-
-func (pc *partitionCounter) Decrement() {
-	pc.m.Lock()
-	defer pc.m.Unlock()
-	pc.count--
-}
-
-func (pc *partitionCounter) Get() int64 {
-	pc.m.Lock()
-	defer pc.m.Unlock()
-	return pc.count
-}
 
 func (o withRequestPriotiry) Apply(c *spannerConfig) {
 	c.requestPriority = spannerpb.RequestOptions_Priority(o)
@@ -90,7 +59,6 @@ func NewSpanner(client *spanner.Client, tableName string, options ...spannerOpti
 		client:          client,
 		tableName:       tableName,
 		requestPriority: c.requestPriority,
-		counter:         &partitionCounter{},
 	}
 }
 
@@ -110,9 +78,8 @@ const (
 	columnRunningAt       = "RunningAt"
 	columnFinishedAt      = "FinishedAt"
 
-	columnUpdatedAt      = "UpdatedAt"
-	columnRunnerID       = "RunnerID"
-	columnPartitionCount = "PartitionCount"
+	columnUpdatedAt = "UpdatedAt"
+	columnRunnerID  = "RunnerID"
 )
 
 // GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark.
@@ -156,10 +123,9 @@ func (s *SpannerPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context
 func (s *SpannerPartitionStorage) RegisterRunner(ctx context.Context, runnerID string) error {
 	log.Debug().Str("runner_id", runnerID).Msg("RegisterRunner called")
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdateMap(tableRunner, map[string]interface{}{
-		columnRunnerID:       runnerID,
-		columnUpdatedAt:      spanner.CommitTimestamp,
-		columnCreatedAt:      spanner.CommitTimestamp,
-		columnPartitionCount: int64(0),
+		columnRunnerID:  runnerID,
+		columnUpdatedAt: spanner.CommitTimestamp,
+		columnCreatedAt: spanner.CommitTimestamp,
 	})}, spanner.TransactionTag("RegisterRunner"))
 	return err
 }
@@ -246,13 +212,6 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 		return nil, fmt.Errorf("transaction failed for GetInterruptedPartitions with runner %s: %w", runnerID, errOuter)
 	}
 
-	if len(partitions) > 0 {
-		s.counter.Add(int64(len(partitions)))
-		updateRunnerMutation := s.updateRunnerMutation(runnerID)
-		if _, err := s.client.Apply(ctx, []*spanner.Mutation{updateRunnerMutation}, spanner.Priority(s.requestPriority)); err != nil {
-			return nil, fmt.Errorf("failed to update runner partition count for runner %s: %w", runnerID, err)
-		}
-	}
 	log.Trace().Str("runner_id", runnerID).
 		Int("interrupted_partitions", len(partitions)).
 		Msg("GetInterruptedPartitions completed")
@@ -297,14 +256,6 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		partitions = make([]*screamer.PartitionMetadata, 0)
 		mutations := make([]*spanner.Mutation, 0, len(partitions))
-		canAssignPartitions, err := s.shouldAssignPartitionsToRunner(ctx, tx)
-		if err != nil {
-			return fmt.Errorf("failed to check if runner %s should be assigned partitions: %w", runnerID, err)
-		}
-		// early exit if runner should not be assigned partitions (its already busy, leave some for others!)
-		if !canAssignPartitions {
-			return nil
-		}
 
 		stmt := spanner.Statement{
 			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC FOR UPDATE", s.tableName),
@@ -357,14 +308,6 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 		p.ScheduledAt = utils.ToPtr(ts.CommitTs.UTC())
 	}
 
-	// Update runner's partition count if we scheduled any partitions
-	if len(partitions) > 0 {
-		s.counter.Add(int64(len(partitions)))
-		updateRunnerMutation := s.updateRunnerMutation(runnerID)
-		if _, err := s.client.Apply(ctx, []*spanner.Mutation{updateRunnerMutation}, spanner.Priority(s.requestPriority)); err != nil {
-			return nil, fmt.Errorf("failed to update runner partition count for runner %s: %w", runnerID, err)
-		}
-	}
 	log.Trace().
 		Int("partitions", len(partitions)).
 		Str("runner_id", runnerID).
@@ -374,47 +317,11 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 
 func (s *SpannerPartitionStorage) updateRunnerMutation(runnerID string) *spanner.Mutation {
 	updateRunnerMutation := spanner.UpdateMap(tableRunner, map[string]interface{}{
-		columnRunnerID:       runnerID,
-		columnPartitionCount: max(s.counter.Get(), 0),
-		columnUpdatedAt:      spanner.CommitTimestamp,
+		columnRunnerID:  runnerID,
+		columnUpdatedAt: spanner.CommitTimestamp,
 	})
 
 	return updateRunnerMutation
-}
-
-func (s *SpannerPartitionStorage) shouldAssignPartitionsToRunner(ctx context.Context, tx reader) (bool, error) {
-	stmt := spanner.Statement{
-		SQL: fmt.Sprintf(`
-			WITH ActiveRunners AS (
-				SELECT %[2]s, %[3]s
-				FROM %[1]s
-				WHERE %[4]s >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
-			)
-			SELECT COUNT(*) as ActiveRunnerCount, COALESCE(MIN(%[3]s), 0) as MinPartitionCount
-			FROM ActiveRunners
-		`, tableRunner, columnRunnerID, columnPartitionCount, columnUpdatedAt),
-	}
-
-	iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority})
-	defer iter.Stop()
-
-	row, err := iter.Next()
-	if err != nil {
-		return false, err
-	}
-
-	var activeRunnerCount int64
-	var minPartitionCount int64
-	if err := row.Columns(&activeRunnerCount, &minPartitionCount); err != nil {
-		return false, err
-	}
-
-	// If this is the only active runner, assign partitions
-	if activeRunnerCount == 1 {
-		return true, nil
-	}
-
-	return s.counter.Get() <= minPartitionCount, nil
 }
 
 // AddChildPartitions adds new child partitions for a parent partition based on a ChildPartitionsRecord.
@@ -467,25 +374,15 @@ func (s *SpannerPartitionStorage) UpdateToFinished(ctx context.Context, partitio
 		Str("runner_id", runnerID).
 		Msg("UpdateToFinished called")
 
-	s.counter.Decrement()
-	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		updateRunnerMutation := s.updateRunnerMutation(runnerID)
+	m := spanner.UpdateMap(s.tableName, map[string]interface{}{
+		columnPartitionToken: partition.PartitionToken,
+		columnState:          screamer.StateFinished,
+		columnFinishedAt:     spanner.CommitTimestamp,
+	})
 
-		// Update partition state to finished
-		partitionMutation := spanner.UpdateMap(s.tableName, map[string]interface{}{
-			columnPartitionToken: partition.PartitionToken,
-			columnState:          screamer.StateFinished,
-			columnFinishedAt:     spanner.CommitTimestamp,
-		})
-
-		return tx.BufferWrite([]*spanner.Mutation{partitionMutation, updateRunnerMutation})
-	}, spanner.TransactionOptions{TransactionTag: "UpdateToFinished"})
-	if err != nil {
-		return err
-	}
-
-	partition.FinishedAt = utils.ToPtr(ts.CommitTs.UTC())
-	return nil
+	ts, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateToFinished"))
+	partition.FinishedAt = utils.ToPtr(ts.UTC())
+	return err
 }
 
 // UpdateWatermark updates the watermark for the given partition.
