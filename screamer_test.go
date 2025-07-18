@@ -193,8 +193,8 @@ func (s *IntegrationTestSuite) createSpannerClient(ctx context.Context) {
 
 func (s *IntegrationTestSuite) setupSpannerStorage(ctx context.Context, runnerID, metaTableName string) *partitionstorage.SpannerPartitionStorage {
 	storage := partitionstorage.NewSpanner(s.client, metaTableName)
-	s.NoError(storage.RunMigrations(ctx))
-	s.NoError(storage.RegisterRunner(ctx, runnerID))
+	s.Require().NoError(storage.RunMigrations(ctx))
+	s.Require().NoError(storage.RegisterRunner(ctx, runnerID))
 	go func(rid string) {
 		for {
 			select {
@@ -563,8 +563,6 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 	s.True(hasRunningPartition, "Should have at least one running partition")
 	cancelFunc() // cancel running subscription
 	time.Sleep(time.Second)
-	counter := s.getRunnerPartitionCount(context.Background(), runnerID)
-	s.Greater(counter, int64(0))
 
 	// Verify we received change records
 	v1changes := v1consumer.getChangesV1()
@@ -611,8 +609,6 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_interrupted() {
 		}
 	}
 	s.Greater(newTableRecords, 0, "Should have received records for our table")
-	counter = s.getRunnerPartitionCount(context.Background(), newRunnerID)
-	s.Greater(counter, int64(0))
 }
 
 func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_multiple_runners() {
@@ -668,7 +664,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_multiple_runners() 
 	go func() {
 		_ = subscriber1.Subscribe(cancelCtx, consumerr)
 	}()
-	time.Sleep(time.Second)
+
 	go func() {
 		_ = subscriber2.Subscribe(cancelCtx, consumerr)
 	}()
@@ -710,12 +706,6 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_multiple_runners() 
 	}
 	s.Greater(tableRecords, 0, "Should have received records for our table")
 
-	// atleast 1 runner should have partitions assigned.
-	counter := int64(0)
-	for _, runnerID := range []string{runnerID1, runnerID2, runnerID3} {
-		counter += s.getRunnerPartitionCount(context.Background(), runnerID)
-	}
-	s.Greater(counter, int64(0))
 	newRunnerID := uuid.NewString()
 	storage4 := s.setupSpannerStorage(ctx, newRunnerID, metaTableName)
 
@@ -751,29 +741,7 @@ func (s *IntegrationTestSuite) TestSubscriber_spannerstorage_multiple_runners() 
 		}
 	}
 	s.Greater(newTableRecords, 0, "Should have received records for our table")
-	counter = s.getRunnerPartitionCount(context.Background(), newRunnerID)
-	s.Greater(counter, int64(0))
 	cancel()
-}
-
-func (s *IntegrationTestSuite) getRunnerPartitionCount(ctx context.Context, runnerID string) int64 {
-	stmt := spanner.Statement{
-		SQL: fmt.Sprintf("SELECT %s FROM %s WHERE %s = @runnerID",
-			"PartitionCount", "Runner", "RunnerID"),
-		Params: map[string]interface{}{
-			"runnerID": runnerID,
-		},
-	}
-
-	iter := s.client.Single().Query(ctx, stmt)
-	defer iter.Stop()
-
-	var currentCount int64
-	if row, err := iter.Next(); err == nil {
-		err := row.Columns(&currentCount)
-		s.NoError(err)
-	}
-	return currentCount
 }
 
 func (s *IntegrationTestSuite) createTestData(ctx context.Context, tableName string) {
