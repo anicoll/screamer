@@ -3,7 +3,7 @@ module github.com/anicoll/screamer
 go 1.24.0
 
 require (
-	cloud.google.com/go/spanner v1.83.0
+	cloud.google.com/go/spanner v1.84.0
 	github.com/go-faker/faker/v4 v4.6.1
 	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
@@ -18,7 +18,7 @@ require (
 
 require (
 	cel.dev/expr v0.24.0 // indirect
-	cloud.google.com/go v0.121.2 // indirect
+	cloud.google.com/go v0.121.4 // indirect
 	cloud.google.com/go/auth v0.16.3 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.7.0 // indirect
@@ -104,7 +104,7 @@ require (
 	golang.org/x/text v0.27.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	google.golang.org/genproto v0.0.0-20250603155806-513f23925822 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20250603155806-513f23925822 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20250728155136-f173205681a0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250728155136-f173205681a0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
