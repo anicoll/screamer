@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	cloud.google.com/go/spanner v1.85.1
-	github.com/go-faker/faker/v4 v4.6.2
+	github.com/go-faker/faker/v4 v4.7.0
 	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
 	github.com/rs/zerolog v1.34.0
