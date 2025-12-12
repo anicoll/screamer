@@ -520,7 +520,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read() {
 	})
 
 	s.Run("GetInterruptedPartitions", func() {
-		partitions, err := storage.GetInterruptedPartitions(ctx, runnerID)
+		partitions, err := storage.GetInterruptedPartitions(ctx, runnerID, 3*time.Second)
 		s.NoError(err)
 
 		tokens := s.extractPartitionTokens(partitions)
@@ -1047,7 +1047,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions(
 	s.assignPartitionToRunner(ctx, storage, "p_live_runner", liveRunnerID, liveTime)
 
 	// Execute GetInterruptedPartitions
-	interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID)
+	interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID, 3*time.Second)
 	s.NoError(err)
 
 	s.Len(interruptedPartitions, 2, "Should find two interrupted partitions (stale runner and orphaned)")
@@ -1066,7 +1066,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions(
 	err = storage.RegisterRunner(ctx, anotherCallingRunnerID)
 	s.Require().NoError(err)
 
-	interruptedPartitionsAgain, err := storage.GetInterruptedPartitions(ctx, anotherCallingRunnerID)
+	interruptedPartitionsAgain, err := storage.GetInterruptedPartitions(ctx, anotherCallingRunnerID, 3*time.Second)
 	s.NoError(err)
 	s.Empty(interruptedPartitionsAgain, "Second call by another runner should not find already reassigned partitions")
 }
@@ -1095,12 +1095,12 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions_
 	}
 
 	// First call should return 100 partitions (limit)
-	interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID)
+	interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID, 3*time.Second)
 	s.NoError(err)
 	s.Len(interruptedPartitions, 100, "Should return 100 interrupted partitions (limit)")
 
 	// Second call should return remaining 50 partitions
-	interruptedPartitionsAgain, err := storage.GetInterruptedPartitions(ctx, callingRunnerID)
+	interruptedPartitionsAgain, err := storage.GetInterruptedPartitions(ctx, callingRunnerID, 3*time.Second)
 	s.NoError(err)
 	s.Len(interruptedPartitionsAgain, 50, "Should return remaining 50 interrupted partitions")
 
@@ -1117,7 +1117,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions_
 	err = storage.RefreshRunner(ctx, callingRunnerID)
 	s.Require().NoError(err)
 
-	differentRunnerPartitions, err := storage.GetInterruptedPartitions(ctx, anotherCallingRunnerID)
+	differentRunnerPartitions, err := storage.GetInterruptedPartitions(ctx, anotherCallingRunnerID, 3*time.Second)
 	s.NoError(err)
 	s.Empty(differentRunnerPartitions, "Third call should find no partitions")
 }

@@ -43,8 +43,8 @@ func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx contex
 	return partitions[0], nil
 }
 
-// GetInterruptedPartitions is a no-op for in-memory storage and always returns nil.
-func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
+// GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
+func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string, leaseDuration time.Duration) ([]*screamer.PartitionMetadata, error) {
 	// InmemoryPartitionStorage can't return any partitions
 	return nil, nil
 }

@@ -143,19 +143,27 @@ func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID st
 
 // GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
 // Assigns the current runnerID to these partitions for recovery.
-func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
-	log.Trace().Str("runner_id", runnerID).Msg("GetInterruptedPartitions called")
+func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string, leaseDuration time.Duration) ([]*screamer.PartitionMetadata, error) {
+	log.Trace().Str("runner_id", runnerID).Dur("lease_duration", leaseDuration).Msg("GetInterruptedPartitions called")
 	var partitions []*screamer.PartitionMetadata
 
 	_, errOuter := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		mutations := []*spanner.Mutation{}
 		partitions = make([]*screamer.PartitionMetadata, 0) // Reset for each transaction attempt
+
+		// Convert duration to seconds for SQL TIMESTAMP_SUB
+		// We use a parameter for the interval seconds to be safe
+		leaseSeconds := int64(leaseDuration.Seconds())
+		if leaseSeconds < 1 {
+			leaseSeconds = 1
+		}
+
 		stmt := spanner.Statement{
 			SQL: fmt.Sprintf(`
 				WITH StaleRunners AS (
 					SELECT RunnerID
 						FROM %[1]s
-						WHERE UpdatedAt <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
+						WHERE UpdatedAt <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @leaseSeconds SECOND)
 					),
 				StalePartitions AS (
 					SELECT 
@@ -164,7 +172,7 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 					FROM %[1]s r
 					INNER JOIN %[2]s ptr ON ptr.RunnerID = r.RunnerID
 					GROUP BY ptr.PartitionToken
-					HAVING MAX(r.UpdatedAt) <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
+					HAVING MAX(r.UpdatedAt) <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @leaseSeconds SECOND)
 				)
 				SELECT DISTINCT m.* EXCEPT (ParentTokens)
 				FROM %[3]s m
@@ -175,7 +183,8 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 				LIMIT 100
 				FOR UPDATE`, tableRunner, tablePartitionToRunner, s.tableName),
 			Params: map[string]interface{}{
-				"states": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
+				"states":       []screamer.State{screamer.StateScheduled, screamer.StateRunning},
+				"leaseSeconds": leaseSeconds,
 			},
 		}
 

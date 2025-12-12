@@ -21,7 +21,7 @@ type PartitionStorage interface {
 	// GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark, or nil if none exist.
 	GetUnfinishedMinWatermarkPartition(ctx context.Context) (*PartitionMetadata, error)
 	// GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
-	GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*PartitionMetadata, error)
+	GetInterruptedPartitions(ctx context.Context, runnerID string, leaseDuration time.Duration) ([]*PartitionMetadata, error)
 	// InitializeRootPartition creates or updates the root partition metadata.
 	InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error
 	// GetAndSchedulePartitions finds partitions ready to be scheduled and assigns them to the given runnerID.
@@ -223,7 +223,8 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 }
 
 func (s *Subscriber) processInterruptedPartitions(ctx context.Context) error {
-	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx, s.runnerID)
+	log.Debug().Msg("processing interrupted partitions")
+	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx, s.runnerID, s.leaseDuration)
 	if err != nil {
 		return fmt.Errorf("failed to get interrupted partitions: %w", err)
 	}
