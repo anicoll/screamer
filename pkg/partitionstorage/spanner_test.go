@@ -773,10 +773,9 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 			{"timestamp_test", baseTime, screamer.StateCreated},
 		})
 
-		beforeSchedule := time.Now().UTC().Truncate(time.Millisecond)
+		beforeSchedule := time.Now().UTC()
 		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
-		afterSchedule := time.Now().UTC().Truncate(time.Millisecond)
-
+		afterSchedule := time.Now().UTC()
 		s.NoError(err)
 		s.Len(scheduled, 1)
 
