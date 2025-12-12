@@ -13,6 +13,24 @@ Screamer now includes built-in distributed locking and runner liveness tracking.
 
 ---
 
+## new: Lease-Based Partition Assignment
+
+Screamer uses a lease-based mechanism to assign partitions to runners. This ensures:
+- **Exclusivity**: A partition is processed by only one runner at a time.
+- **Failover**: If a runner dies, its leases expire and are picked up by other runners.
+- **Load Balancing**: Partitions are distributed among runners.
+
+### Configuration Options
+
+You can configure the behavior of the lease mechanism using functional options in `NewSubscriber`:
+
+- `WithMaxConnections(int)`: Limits the number of partitions a single runner instance can claim. Default is 400.
+  > [!NOTE]
+  > The default Spanner client library has a maximum of 400 sessions. Going beyond this limit may degrade performance. See [Configure the number of sessions](https://docs.cloud.google.com/spanner/docs/sessions#configure_the_number_of_sessions_and_grpc_channels_in_the_pools) for more details.
+- `WithLeaseDuration(time.Duration)`: Sets the duration of the lease. Runners must heartbeat within this interval to keep the lease. Default is 30s.
+- `WithRebalancingInterval(time.Duration)`: Sets how often the runner checks if it should release partitions to balance the load.
+
+
 ### Sypnosis
 
 This library is an implementation to subscribe a change stream's records of Google Cloud Spanner in Go.
@@ -67,7 +85,15 @@ func main() {
 	}
 
 	changeStreamName := "FooStream"
-	subscriber := screamer.NewSubscriber(spannerClient, changeStreamName, runnerID, partitionStorage, screamer.WithLogLevel("debug"))
+	subscriber := screamer.NewSubscriber(
+		spannerClient,
+		changeStreamName,
+		runnerID,
+		partitionStorage,
+		screamer.WithLogLevel("debug"),
+		screamer.WithMaxConnections(100),            // Limit to 100 partitions per instance
+		screamer.WithLeaseDuration(30*time.Second),  // 30s lease duration
+	)
 
 	fmt.Fprintf(os.Stderr, "Reading the stream...\n")
 	logger := &Logger{out: os.Stdout}
