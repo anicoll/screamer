@@ -85,7 +85,7 @@ func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context,
 }
 
 // GetAndSchedulePartitions finds partitions ready to be scheduled and marks them as scheduled.
-func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
+func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, maxConnections int) ([]*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -179,6 +179,16 @@ func (s *InmemoryPartitionStorage) UpdateWatermark(ctx context.Context, partitio
 
 	s.m[partition.PartitionToken].Watermark = watermark
 
+	return nil
+}
+
+// ExtendLease is a no-op for in-memory storage.
+func (s *InmemoryPartitionStorage) ExtendLease(ctx context.Context, partitionToken string, runnerID string) error {
+	return nil
+}
+
+// ReleaseLease is a no-op for in-memory storage.
+func (s *InmemoryPartitionStorage) ReleaseLease(ctx context.Context, partitionToken string, runnerID string) error {
 	return nil
 }
 

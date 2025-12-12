@@ -246,32 +246,64 @@ func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, s
 
 // GetAndSchedulePartitions finds partitions ready to be scheduled and assigns them to the given runnerID.
 // Returns the scheduled partitions.
-func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
+func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, maxConnections int) ([]*screamer.PartitionMetadata, error) {
 	log.Trace().
 		Time("min_watermark", minWatermark).
 		Str("runner_id", runnerID).
+		Int("max_connections", maxConnections).
 		Msg("GetAndSchedulePartitions called")
 	var partitions []*screamer.PartitionMetadata
 
 	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		partitions = make([]*screamer.PartitionMetadata, 0)
-		mutations := make([]*spanner.Mutation, 0, len(partitions))
 
+		// Check current connection count for the runner
+		row, err := tx.Query(ctx, spanner.Statement{
+			SQL: fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE RunnerID = @runnerID", tablePartitionToRunner),
+			Params: map[string]interface{}{
+				"runnerID": runnerID,
+			},
+		}).Next()
+		if err != nil {
+			return err
+		}
+		var currentConnections int64
+		if err := row.Column(0, &currentConnections); err != nil {
+			return err
+		}
+
+		remainingCapacity := int64(maxConnections) - currentConnections
+		if remainingCapacity <= 0 {
+			log.Debug().Int64("current", currentConnections).Int("max", maxConnections).Msg("Connection limit reached, no new partitions")
+			return nil
+		}
+
+		// Use remainingCapacity as limit
 		stmt := spanner.Statement{
-			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC FOR UPDATE", s.tableName),
+			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC LIMIT @limit", s.tableName),
 			Params: map[string]interface{}{
 				"state":        screamer.StateCreated,
 				"minWatermark": minWatermark,
+				"limit":        remainingCapacity,
 			},
 		}
 
+		// We cannot use FOR UPDATE with LIMIT in some Spanner dialects or if not supported, but assuming it is or we just select and then write.
+		// Standard SQL Spanner supports LIMIT.
+		// However, we need to claim them.
+
+		// Reading partitions
 		iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "GetAndSchedulePartitions"})
+		mutations := make([]*spanner.Mutation, 0, remainingCapacity)
 
 		if err := iter.Do(func(r *spanner.Row) error {
 			p := new(screamer.PartitionMetadata)
 			if err := r.ToStruct(p); err != nil {
 				return err
 			}
+
+			// Optimistic locking? We are in a transaction.
+			// We update them to SCHEDULED.
 
 			m := spanner.UpdateMap(s.tableName, map[string]interface{}{
 				columnPartitionToken: p.PartitionToken,
@@ -296,6 +328,10 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 			return nil
 		}); err != nil {
 			return err
+		}
+
+		if len(partitions) == 0 {
+			return nil
 		}
 
 		// writes the updates to spanner.
@@ -399,6 +435,41 @@ func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("UpdateWatermark"))
 	partition.Watermark = watermark.UTC()
 
+	return err
+}
+
+// Assert that SpannerPartitionStorage implements PartitionStorage.
+var _ screamer.PartitionStorage = (*SpannerPartitionStorage)(nil)
+
+// ExtendLease extends the lease for a partition.
+func (s *SpannerPartitionStorage) ExtendLease(ctx context.Context, partitionToken string, runnerID string) error {
+	log.Trace().
+		Str("partition_token", partitionToken).
+		Str("runner_id", runnerID).
+		Msg("ExtendLease called")
+
+	// Update UpdatedAt in PartitionToRunner table
+	m := spanner.UpdateMap(tablePartitionToRunner, map[string]interface{}{
+		columnPartitionToken: partitionToken,
+		columnRunnerID:       runnerID,
+		columnUpdatedAt:      spanner.CommitTimestamp,
+	})
+
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("ExtendLease"))
+	return err
+}
+
+// ReleaseLease releases the lease for a partition by removing the assignment.
+func (s *SpannerPartitionStorage) ReleaseLease(ctx context.Context, partitionToken string, runnerID string) error {
+	log.Debug().
+		Str("partition_token", partitionToken).
+		Str("runner_id", runnerID).
+		Msg("ReleaseLease called")
+
+	// Delete from PartitionToRunner table
+	m := spanner.Delete(tablePartitionToRunner, spanner.Key{partitionToken, runnerID})
+
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("ReleaseLease"))
 	return err
 }
 

@@ -641,14 +641,14 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 
 	s.Run("NoPartitionsReady", func() {
 		// Min watermark is far in the future, no CREATED partitions should match
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime.Add(2*time.Hour), runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime.Add(2*time.Hour), runnerID, 100)
 		s.NoError(err)
 		s.Empty(scheduled, "No partitions should be scheduled if minWatermark is too high")
 	})
 
 	s.Run("ScheduleAvailablePartitions", func() {
 		// Min watermark allows three CREATED partitions
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		s.NoError(err)
 		s.Len(scheduled, 3, "Should schedule three partitions")
 
@@ -673,7 +673,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		err := storage.RegisterRunner(ctx, runnerID)
 		s.NoError(err)
 
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		s.NoError(err)
 		s.Empty(scheduled, "No partitions should be scheduled if they are not in CREATED state")
 	})
@@ -691,7 +691,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 
 		// Inject an error to force transaction rollback
 		// Since we can't easily inject errors, we'll test that partition count is updated atomically
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		s.NoError(err)
 		s.Len(scheduled, 1)
 	})
@@ -729,7 +729,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		wg.Add(2)
 		go func(rid string) {
 			defer wg.Done()
-			scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, rid)
+			scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, rid, 100)
 			mu.Lock()
 			defer mu.Unlock()
 			results[rid] = scheduled
@@ -737,7 +737,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		}(runner1ID)
 		go func(rid string) {
 			defer wg.Done()
-			scheduled, err := storage2.GetAndSchedulePartitions(ctx, baseTime, rid)
+			scheduled, err := storage2.GetAndSchedulePartitions(ctx, baseTime, rid, 100)
 			mu.Lock()
 			defer mu.Unlock()
 			results[rid] = scheduled
@@ -774,7 +774,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		})
 
 		beforeSchedule := time.Now().UTC().Truncate(time.Millisecond)
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		afterSchedule := time.Now().UTC().Truncate(time.Millisecond)
 
 		s.NoError(err)
@@ -812,7 +812,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		})
 
 		// Should get partitions ordered by StartTimestamp ASC
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		s.NoError(err)
 		s.Len(scheduled, 3)
 
