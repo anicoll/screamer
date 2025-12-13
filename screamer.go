@@ -40,6 +40,10 @@ type PartitionStorage interface {
 	ExtendLease(ctx context.Context, partitionToken string, runnerID string) error
 	// ReleaseLease releases the lease for a partition.
 	ReleaseLease(ctx context.Context, partitionToken string, runnerID string) error
+	// GetActiveRunnerCount returns the number of active runners.
+	GetActiveRunnerCount(ctx context.Context, leaseDuration time.Duration) (int64, error)
+	// GetActivePartitionCount returns the number of active (scheduled or running) partitions.
+	GetActivePartitionCount(ctx context.Context) (int64, error)
 }
 
 // Subscriber subscribes to a change stream and manages partition processing.
@@ -61,6 +65,9 @@ type Subscriber struct {
 	mu                 sync.Mutex
 	serializedConsumer bool
 	consumerMu         sync.Mutex
+
+	activePartitionsMu sync.Mutex
+	activePartitions   map[string]context.CancelFunc
 }
 
 var (
@@ -106,6 +113,7 @@ func NewSubscriber(
 		maxConnections:         c.maxConnections,
 		rebalancingInterval:    c.rebalancingInterval,
 		leaseDuration:          c.leaseDuration,
+		activePartitions:       make(map[string]context.CancelFunc),
 	}
 }
 
@@ -204,14 +212,59 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 			for {
 				select {
 				case <-ticker.C:
-					// TODO: Implement rebalancing logic
-					// For now, we rely on natural expiration and maxConnections limit.
-					// A proper rebalancing would check if we have > fair share and release some.
-					// Given the user request asked for "Periodically ... instances can check for imbalance ... and voluntarily release partitions",
-					// we can implement a basic random release if we are above a threshold/full.
-					// However, without global knowledge of "fair share" in the storage interface, it's hard to do perfectly.
-					// We can skip this for now or just log.
-					// Let's at least log stats.
+					// Rebalancing Logic
+					activeRunners, err := s.partitionStorage.GetActiveRunnerCount(ctx, s.leaseDuration)
+					if err != nil {
+						log.Warn().Err(err).Msg("failed to get active runner count for rebalancing")
+						continue
+					}
+					if activeRunners == 0 {
+						activeRunners = 1 // Should be at least 1 (us)
+					}
+
+					activePartitions, err := s.partitionStorage.GetActivePartitionCount(ctx)
+					if err != nil {
+						log.Warn().Err(err).Msg("failed to get active partition count for rebalancing")
+						continue
+					}
+
+					fairShare := float64(activePartitions) / float64(activeRunners)
+					s.activePartitionsMu.Lock()
+					myCount := len(s.activePartitions)
+
+					// Release threshold with hysteresis (e.g., 20% above fair share)
+					// Avoid releasing if count is small to prevent flapping
+					if float64(myCount) > fairShare*1.2 && myCount > 1 {
+						releaseCount := int(float64(myCount) - fairShare)
+						log.Info().
+							Int64("active_runners", activeRunners).
+							Int64("active_partitions", activePartitions).
+							Float64("fair_share", fairShare).
+							Int("my_count", myCount).
+							Int("release_count", releaseCount).
+							Msg("rebalancing: releasing partitions")
+
+						// Release partitions
+						released := 0
+						for token, cancel := range s.activePartitions {
+							if released >= releaseCount {
+								break
+							}
+							log.Debug().Str("partition", token).Msg("releasing partition")
+
+							// Cancel local processing
+							cancel()
+
+							// Release lease in storage (best effort)
+							if err := s.partitionStorage.ReleaseLease(ctx, token, s.runnerID); err != nil {
+								log.Warn().Err(err).Str("partition", token).Msg("failed to release lease during rebalancing")
+							}
+
+							released++
+						}
+					}
+					s.activePartitionsMu.Unlock()
+					// End Rebalancing Logic
 				case <-ctx.Done():
 					return ctx.Err()
 				}
@@ -230,9 +283,7 @@ func (s *Subscriber) processInterruptedPartitions(ctx context.Context) error {
 	}
 	for _, p := range interruptedPartitions {
 		p := p
-		s.eg.Go(func() error {
-			return s.queryChangeStream(ctx, p)
-		})
+		s.startPartitionProcessing(ctx, p)
 	}
 	return nil
 }
@@ -241,6 +292,23 @@ func (s *Subscriber) processInterruptedPartitions(ctx context.Context) error {
 // The function might be called from multiple goroutines and must be re-entrant safe.
 func (s *Subscriber) SubscribeFunc(ctx context.Context, f ConsumerFunc) error {
 	return s.Subscribe(ctx, f)
+}
+
+func (s *Subscriber) startPartitionProcessing(ctx context.Context, p *PartitionMetadata) {
+	pCtx, cancel := context.WithCancel(ctx)
+	s.activePartitionsMu.Lock()
+	s.activePartitions[p.PartitionToken] = cancel
+	s.activePartitionsMu.Unlock()
+
+	s.eg.Go(func() error {
+		defer func() {
+			s.activePartitionsMu.Lock()
+			delete(s.activePartitions, p.PartitionToken)
+			s.activePartitionsMu.Unlock()
+			cancel()
+		}()
+		return s.queryChangeStream(pCtx, p)
+	})
 }
 
 func (s *Subscriber) initErrGroup(ctx context.Context) context.Context {
@@ -279,9 +347,7 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 
 	for _, p := range partitions {
 		p := p
-		s.eg.Go(func() error {
-			return s.queryChangeStream(ctx, p)
-		})
+		s.startPartitionProcessing(ctx, p)
 	}
 
 	return nil
@@ -350,17 +416,11 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 		return err
 	}
 
-	log.Info().Str("partition_token", p.PartitionToken).
-		Msg("partition processing complete")
+	log.Info().Str("partition_token", p.PartitionToken).Msg("partition processing complete")
+
 	if err := s.partitionStorage.UpdateToFinished(ctx, p, s.runnerID); err != nil {
 		return fmt.Errorf("failed to update to finished: %w", err)
 	}
-
-	// Explicitly release lease (though UpdateToFinished might handle it, but for safety or rebalancing)
-	// Actually UpdateToFinished changes state to Finished, so lease is irrelevant.
-	// But if we return early on error, we should release lease?
-	// The caller captures error?
-	// s.queryChangeStream returns error.
 
 	return nil
 }

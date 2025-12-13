@@ -468,18 +468,57 @@ func (s *SpannerPartitionStorage) ExtendLease(ctx context.Context, partitionToke
 	return err
 }
 
-// ReleaseLease releases the lease for a partition by removing the assignment.
+// ReleaseLease releases the lease for a partition.
 func (s *SpannerPartitionStorage) ReleaseLease(ctx context.Context, partitionToken string, runnerID string) error {
-	log.Debug().
-		Str("partition_token", partitionToken).
-		Str("runner_id", runnerID).
-		Msg("ReleaseLease called")
-
-	// Delete from PartitionToRunner table
-	m := spanner.Delete(tablePartitionToRunner, spanner.Key{partitionToken, runnerID})
-
-	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("ReleaseLease"))
+	log.Trace().Str("partition_token", partitionToken).Str("runner_id", runnerID).Msg("ReleaseLease called")
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.Delete(tablePartitionToRunner, spanner.Key{partitionToken})}, spanner.Priority(s.requestPriority), spanner.TransactionTag("ReleaseLease"))
 	return err
+}
+
+// GetActiveRunnerCount returns the number of active runners.
+func (s *SpannerPartitionStorage) GetActiveRunnerCount(ctx context.Context, leaseDuration time.Duration) (int64, error) {
+	log.Trace().Dur("lease_duration", leaseDuration).Msg("GetActiveRunnerCount called")
+	stmt := spanner.Statement{
+		SQL: fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE UpdatedAt > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @leaseSeconds SECOND)`, tableRunner),
+		Params: map[string]interface{}{
+			"leaseSeconds": int64(leaseDuration.Seconds()),
+		},
+	}
+	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "GetActiveRunnerCount"})
+	defer iter.Stop()
+
+	var count int64
+	row, err := iter.Next()
+	if err != nil {
+		return 0, err
+	}
+	if err := row.Column(0, &count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// GetActivePartitionCount returns the number of active (scheduled or running) partitions.
+func (s *SpannerPartitionStorage) GetActivePartitionCount(ctx context.Context) (int64, error) {
+	log.Trace().Msg("GetActivePartitionCount called")
+	stmt := spanner.Statement{
+		SQL: fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE State IN UNNEST(@states)`, s.tableName),
+		Params: map[string]interface{}{
+			"states": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
+		},
+	}
+	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "GetActivePartitionCount"})
+	defer iter.Stop()
+
+	var count int64
+	row, err := iter.Next()
+	if err != nil {
+		return 0, err
+	}
+	if err := row.Column(0, &count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // Assert that SpannerPartitionStorage implements PartitionStorage.

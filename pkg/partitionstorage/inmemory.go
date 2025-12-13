@@ -49,6 +49,16 @@ func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context,
 	return nil, nil
 }
 
+// GetActiveRunnerCount returns the number of active runners.
+func (s *InmemoryPartitionStorage) GetActiveRunnerCount(ctx context.Context, leaseDuration time.Duration) (int64, error) {
+	return 1, nil
+}
+
+// GetActivePartitionCount returns the number of active (scheduled or running) partitions.
+func (s *InmemoryPartitionStorage) GetActivePartitionCount(ctx context.Context) (int64, error) {
+	return 0, nil
+}
+
 // InitializeRootPartition creates or updates the root partition metadata in memory.
 func (s *InmemoryPartitionStorage) InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error {
 	s.mu.Lock()

@@ -6,6 +6,10 @@ build:
 test:
 	go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
 
+.PHONY: lint
+lint:
+	golangci-lint run ./...
+
 # Assumes v3.5.0 mockery installed.
 gen-mocks:
 	mockery
