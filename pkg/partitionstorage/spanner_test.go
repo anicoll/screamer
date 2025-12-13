@@ -1130,3 +1130,409 @@ func (s *SpannerTestSuite) insertPartitionForRunner(ctx context.Context, storage
 
 	return token
 }
+
+func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetActiveRunnerCount() {
+	ctx := context.Background()
+	tableName := "active_runner_count_test"
+	storage, cleanup := s.setupSpannerPartitionStorage(ctx, tableName)
+	defer cleanup()
+
+	leaseDuration := 10 * time.Second
+
+	s.Run("NoActiveRunners", func() {
+		storage.CleanupData(ctx)
+		count, err := storage.GetActiveRunnerCount(ctx, leaseDuration)
+		s.NoError(err)
+		s.Equal(int64(0), count, "Should have 0 active runners")
+	})
+
+	s.Run("SingleActiveRunner", func() {
+		storage.CleanupData(ctx)
+		runnerID := uuid.NewString()
+
+		// Register runner
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		count, err := storage.GetActiveRunnerCount(ctx, leaseDuration)
+		s.NoError(err)
+		s.Equal(int64(1), count, "Should have 1 active runner")
+	})
+
+	s.Run("MultipleActiveRunners", func() {
+		storage.CleanupData(ctx)
+
+		// Register 3 runners
+		for i := 0; i < 3; i++ {
+			runnerID := uuid.NewString()
+			err := storage.RegisterRunner(ctx, runnerID)
+			s.NoError(err)
+		}
+
+		count, err := storage.GetActiveRunnerCount(ctx, leaseDuration)
+		s.NoError(err)
+		s.Equal(int64(3), count, "Should have 3 active runners")
+	})
+
+	s.Run("ExpiredRunnersNotCounted", func() {
+		storage.CleanupData(ctx)
+
+		// Register old runner (will be expired)
+		oldRunnerID := uuid.NewString()
+		oldTime := time.Now().UTC().Add(-20 * time.Second) // 20 seconds ago
+		_, err := storage.client.Apply(ctx, []*spanner.Mutation{
+			spanner.InsertOrUpdateMap(tableRunner, map[string]interface{}{
+				columnRunnerID:  oldRunnerID,
+				columnCreatedAt: oldTime,
+				columnUpdatedAt: oldTime,
+			}),
+		})
+		s.NoError(err)
+
+		// Register fresh runner
+		freshRunnerID := uuid.NewString()
+		err = storage.RegisterRunner(ctx, freshRunnerID)
+		s.NoError(err)
+
+		// Count with 10 second lease - only fresh runner should count
+		count, err := storage.GetActiveRunnerCount(ctx, leaseDuration)
+		s.NoError(err)
+		s.Equal(int64(1), count, "Should only count the fresh runner")
+	})
+
+	s.Run("LeaseDurationMatters", func() {
+		storage.CleanupData(ctx)
+
+		// Register runner 6 seconds ago
+		runnerID := uuid.NewString()
+		sixSecondsAgo := time.Now().UTC().Add(-6 * time.Second)
+		_, err := storage.client.Apply(ctx, []*spanner.Mutation{
+			spanner.InsertOrUpdateMap(tableRunner, map[string]interface{}{
+				columnRunnerID:  runnerID,
+				columnCreatedAt: sixSecondsAgo,
+				columnUpdatedAt: sixSecondsAgo,
+			}),
+		})
+		s.NoError(err)
+
+		// With 5 second lease, should not count
+		count, err := storage.GetActiveRunnerCount(ctx, 5*time.Second)
+		s.NoError(err)
+		s.Equal(int64(0), count, "5 second lease should not count 6-second-old runner")
+
+		// With 10 second lease, should count
+		count, err = storage.GetActiveRunnerCount(ctx, 10*time.Second)
+		s.NoError(err)
+		s.Equal(int64(1), count, "10 second lease should count 6-second-old runner")
+	})
+}
+
+func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetActivePartitionCount() {
+	ctx := context.Background()
+	tableName := "active_partition_count_test"
+	storage, cleanup := s.setupSpannerPartitionStorage(ctx, tableName)
+	defer cleanup()
+
+	baseTime := time.Now().UTC().Truncate(time.Microsecond)
+
+	s.Run("NoPartitions", func() {
+		storage.CleanupData(ctx)
+		count, err := storage.GetActivePartitionCount(ctx)
+		s.NoError(err)
+		s.Equal(int64(0), count, "Should have 0 active partitions")
+	})
+
+	s.Run("OnlyCreatedPartitions", func() {
+		storage.CleanupData(ctx)
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{"created1", baseTime, screamer.StateCreated},
+			{"created2", baseTime, screamer.StateCreated},
+		})
+
+		count, err := storage.GetActivePartitionCount(ctx)
+		s.NoError(err)
+		s.Equal(int64(0), count, "Created partitions should not count as active")
+	})
+
+	s.Run("OnlyScheduledPartitions", func() {
+		storage.CleanupData(ctx)
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{"scheduled1", baseTime, screamer.StateScheduled},
+			{"scheduled2", baseTime, screamer.StateScheduled},
+			{"scheduled3", baseTime, screamer.StateScheduled},
+		})
+
+		count, err := storage.GetActivePartitionCount(ctx)
+		s.NoError(err)
+		s.Equal(int64(3), count, "Should count all scheduled partitions")
+	})
+
+	s.Run("OnlyRunningPartitions", func() {
+		storage.CleanupData(ctx)
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{"running1", baseTime, screamer.StateRunning},
+			{"running2", baseTime, screamer.StateRunning},
+		})
+
+		count, err := storage.GetActivePartitionCount(ctx)
+		s.NoError(err)
+		s.Equal(int64(2), count, "Should count all running partitions")
+	})
+
+	s.Run("MixedStates", func() {
+		storage.CleanupData(ctx)
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{"created", baseTime, screamer.StateCreated},
+			{"scheduled1", baseTime, screamer.StateScheduled},
+			{"scheduled2", baseTime, screamer.StateScheduled},
+			{"running1", baseTime, screamer.StateRunning},
+			{"running2", baseTime, screamer.StateRunning},
+			{"running3", baseTime, screamer.StateRunning},
+			{"finished", baseTime, screamer.StateFinished},
+		})
+
+		count, err := storage.GetActivePartitionCount(ctx)
+		s.NoError(err)
+		s.Equal(int64(5), count, "Should count 2 scheduled + 3 running = 5 active partitions")
+	})
+
+	s.Run("FinishedPartitionsNotCounted", func() {
+		storage.CleanupData(ctx)
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{"finished1", baseTime, screamer.StateFinished},
+			{"finished2", baseTime, screamer.StateFinished},
+			{"running", baseTime, screamer.StateRunning},
+		})
+
+		count, err := storage.GetActivePartitionCount(ctx)
+		s.NoError(err)
+		s.Equal(int64(1), count, "Should only count running partition, not finished")
+	})
+}
+
+func (s *SpannerTestSuite) TestSpannerPartitionStorage_ExtendLease() {
+	ctx := context.Background()
+	tableName := "extend_lease_test"
+	storage, cleanup := s.setupSpannerPartitionStorage(ctx, tableName)
+	defer cleanup()
+
+	runnerID := uuid.NewString()
+	err := storage.RegisterRunner(ctx, runnerID)
+	s.Require().NoError(err)
+
+	s.Run("ExtendLeaseForExistingAssignment", func() {
+		storage.CleanupData(ctx)
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		partitionToken := "test-partition"
+		baseTime := time.Now().UTC().Truncate(time.Microsecond)
+
+		// Create partition and assignment
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{partitionToken, baseTime, screamer.StateRunning},
+		})
+		s.assignPartitionToRunner(ctx, storage, partitionToken, runnerID, baseTime.Add(-5*time.Second))
+
+		// Get initial UpdatedAt
+		row, err := storage.client.Single().ReadRow(ctx, tablePartitionToRunner,
+			spanner.Key{partitionToken, runnerID}, []string{columnUpdatedAt})
+		s.NoError(err)
+		var initialUpdatedAt time.Time
+		err = row.Column(0, &initialUpdatedAt)
+		s.NoError(err)
+
+		// Wait a bit to ensure timestamp difference
+		time.Sleep(100 * time.Millisecond)
+
+		// Extend lease
+		err = storage.ExtendLease(ctx, partitionToken, runnerID)
+		s.NoError(err)
+
+		// Verify UpdatedAt was updated
+		row, err = storage.client.Single().ReadRow(ctx, tablePartitionToRunner,
+			spanner.Key{partitionToken, runnerID}, []string{columnUpdatedAt})
+		s.NoError(err)
+		var newUpdatedAt time.Time
+		err = row.Column(0, &newUpdatedAt)
+		s.NoError(err)
+
+		s.True(newUpdatedAt.After(initialUpdatedAt),
+			"UpdatedAt should be later after extending lease")
+	})
+
+	s.Run("ExtendLeaseCreatesAssignmentIfNotExists", func() {
+		storage.CleanupData(ctx)
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		partitionToken := "new-partition"
+		baseTime := time.Now().UTC().Truncate(time.Microsecond)
+
+		// Create partition but no assignment
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{partitionToken, baseTime, screamer.StateRunning},
+		})
+
+		// Extend lease (should create assignment)
+		err = storage.ExtendLease(ctx, partitionToken, runnerID)
+		s.NoError(err)
+
+		// Verify assignment was created
+		row, err := storage.client.Single().ReadRow(ctx, tablePartitionToRunner,
+			spanner.Key{partitionToken, runnerID}, []string{columnRunnerID})
+		s.NoError(err)
+		var assignedRunnerID string
+		err = row.Column(0, &assignedRunnerID)
+		s.NoError(err)
+		s.Equal(runnerID, assignedRunnerID)
+	})
+
+	s.Run("ExtendLeaseMultipleTimes", func() {
+		storage.CleanupData(ctx)
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		partitionToken := "multi-extend-partition"
+		baseTime := time.Now().UTC().Truncate(time.Microsecond)
+
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{partitionToken, baseTime, screamer.StateRunning},
+		})
+
+		var previousUpdatedAt time.Time
+
+		// Extend lease 3 times
+		for i := 0; i < 3; i++ {
+			time.Sleep(100 * time.Millisecond)
+
+			err = storage.ExtendLease(ctx, partitionToken, runnerID)
+			s.NoError(err)
+
+			row, err := storage.client.Single().ReadRow(ctx, tablePartitionToRunner,
+				spanner.Key{partitionToken, runnerID}, []string{columnUpdatedAt})
+			s.NoError(err)
+			var currentUpdatedAt time.Time
+			err = row.Column(0, &currentUpdatedAt)
+			s.NoError(err)
+
+			if i > 0 {
+				s.True(currentUpdatedAt.After(previousUpdatedAt),
+					"Each extend should update the timestamp")
+			}
+			previousUpdatedAt = currentUpdatedAt
+		}
+	})
+}
+
+func (s *SpannerTestSuite) TestSpannerPartitionStorage_ReleaseLease() {
+	ctx := context.Background()
+	tableName := "release_lease_test"
+	storage, cleanup := s.setupSpannerPartitionStorage(ctx, tableName)
+	defer cleanup()
+
+	runnerID := uuid.NewString()
+	err := storage.RegisterRunner(ctx, runnerID)
+	s.Require().NoError(err)
+
+	s.Run("ReleaseExistingLease", func() {
+		storage.CleanupData(ctx)
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		partitionToken := "release-test-partition"
+		baseTime := time.Now().UTC().Truncate(time.Microsecond)
+
+		// Create partition and assignment
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{partitionToken, baseTime, screamer.StateRunning},
+		})
+		s.assignPartitionToRunner(ctx, storage, partitionToken, runnerID, baseTime)
+
+		// Verify assignment exists
+		row, err := storage.client.Single().ReadRow(ctx, tablePartitionToRunner,
+			spanner.Key{partitionToken, runnerID}, []string{columnRunnerID})
+		s.NoError(err)
+		var assignedRunnerID string
+		err = row.Column(0, &assignedRunnerID)
+		s.NoError(err)
+		s.Equal(runnerID, assignedRunnerID)
+
+		// Release lease
+		err = storage.ReleaseLease(ctx, partitionToken, runnerID)
+		s.NoError(err)
+
+		// Verify assignment was deleted
+		_, err = storage.client.Single().ReadRow(ctx, tablePartitionToRunner,
+			spanner.Key{partitionToken, runnerID}, []string{columnRunnerID})
+		s.Error(err, "Assignment should be deleted after releasing lease")
+	})
+
+	s.Run("ReleaseNonExistentLease", func() {
+		storage.CleanupData(ctx)
+
+		partitionToken := "non-existent-partition"
+
+		// Release lease for partition that doesn't exist (should not error)
+		err = storage.ReleaseLease(ctx, partitionToken, runnerID)
+		s.NoError(err, "Releasing non-existent lease should not error")
+	})
+
+	s.Run("ReleaseDoesNotAffectPartitionState", func() {
+		storage.CleanupData(ctx)
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		partitionToken := "state-check-partition"
+		baseTime := time.Now().UTC().Truncate(time.Microsecond)
+
+		// Create partition and assignment
+		s.insertTestPartitions(ctx, storage, []testPartition{
+			{partitionToken, baseTime, screamer.StateRunning},
+		})
+		s.assignPartitionToRunner(ctx, storage, partitionToken, runnerID, baseTime)
+
+		// Release lease
+		err = storage.ReleaseLease(ctx, partitionToken, runnerID)
+		s.NoError(err)
+
+		// Verify partition still exists with same state
+		row, err := storage.client.Single().ReadRow(ctx, storage.tableName,
+			spanner.Key{partitionToken}, []string{columnState})
+		s.NoError(err)
+		var state screamer.State
+		err = row.Column(0, &state)
+		s.NoError(err)
+		s.Equal(screamer.StateRunning, state, "Partition state should remain unchanged")
+	})
+
+	s.Run("ReleaseMultipleLeases", func() {
+		storage.CleanupData(ctx)
+		err := storage.RegisterRunner(ctx, runnerID)
+		s.NoError(err)
+
+		baseTime := time.Now().UTC().Truncate(time.Microsecond)
+
+		// Create and assign 3 partitions
+		partitionTokens := []string{"part1", "part2", "part3"}
+		for _, token := range partitionTokens {
+			s.insertTestPartitions(ctx, storage, []testPartition{
+				{token, baseTime, screamer.StateRunning},
+			})
+			s.assignPartitionToRunner(ctx, storage, token, runnerID, baseTime)
+		}
+
+		// Release all leases
+		for _, token := range partitionTokens {
+			err = storage.ReleaseLease(ctx, token, runnerID)
+			s.NoError(err)
+		}
+
+		// Verify all assignments were deleted
+		for _, token := range partitionTokens {
+			_, err = storage.client.Single().ReadRow(ctx, tablePartitionToRunner,
+				spanner.Key{token, runnerID}, []string{columnRunnerID})
+			s.Error(err, "All assignments should be deleted")
+		}
+	})
+}
