@@ -208,7 +208,7 @@ func run(ctx context.Context, cfg *screamer.Config) error {
 		options = append(options, screamer.WithHeartbeatInterval(*cfg.HeartbeatInterval))
 	}
 	if cfg.Priority != int32(spannerpb.RequestOptions_PRIORITY_UNSPECIFIED) {
-		options = append(options, screamer.WithSpannerRequestPriotiry(spannerpb.RequestOptions_Priority(cfg.Priority)))
+		options = append(options, screamer.WithSpannerRequestPriority(spannerpb.RequestOptions_Priority(cfg.Priority)))
 	}
 
 	subscriber := screamer.NewSubscriber(spannerClient, cfg.Stream, runnerID, partitionStorage, options...)

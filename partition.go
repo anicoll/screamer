@@ -22,13 +22,13 @@ type State string
 
 const (
 	// StateCreated indicates the partition is newly created and not yet scheduled.
-	StateCreated   State = "CREATED"
+	StateCreated State = "CREATED"
 	// StateScheduled indicates the partition is scheduled for processing.
 	StateScheduled State = "SCHEDULED"
 	// StateRunning indicates the partition is currently being processed.
-	StateRunning   State = "RUNNING"
+	StateRunning State = "RUNNING"
 	// StateFinished indicates the partition has been fully processed.
-	StateFinished  State = "FINISHED"
+	StateFinished State = "FINISHED"
 )
 
 const (

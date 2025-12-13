@@ -20,6 +20,9 @@ type config struct {
 	spannerRequestPriority spannerpb.RequestOptions_Priority
 	serializedConsumer     bool
 	logLevel               zerolog.Level
+	maxConnections         int
+	rebalancingInterval    time.Duration
+	leaseDuration          time.Duration
 }
 
 type (
@@ -27,8 +30,13 @@ type (
 	withEndTimestamp           time.Time
 	withLogLevel               zerolog.Level
 	withHeartbeatInterval      time.Duration
+	withSpannerRequestPriority spannerpb.RequestOptions_Priority
+	// Deprecated: use withSpannerRequestPriority instead
 	withSpannerRequestPriotiry spannerpb.RequestOptions_Priority
 	withSerializedConsumer     bool
+	withMaxConnections         int
+	withRebalancingInterval    time.Duration
+	withLeaseDuration          time.Duration
 )
 
 func (o withStartTimestamp) Apply(c *config) {
@@ -77,12 +85,23 @@ func WithHeartbeatInterval(heartbeatInterval time.Duration) Option {
 	return withHeartbeatInterval(heartbeatInterval)
 }
 
+func (o withSpannerRequestPriority) Apply(c *config) {
+	c.spannerRequestPriority = spannerpb.RequestOptions_Priority(o)
+}
+
+// WithSpannerRequestPriority sets the request priority option for reading change streams.
+// Default value is unspecified, equivalent to high.
+func WithSpannerRequestPriority(priority spannerpb.RequestOptions_Priority) Option {
+	return withSpannerRequestPriority(priority)
+}
+
+// Deprecated: Use WithSpannerRequestPriority instead (typo fix).
 func (o withSpannerRequestPriotiry) Apply(c *config) {
 	c.spannerRequestPriority = spannerpb.RequestOptions_Priority(o)
 }
 
 // WithSpannerRequestPriotiry sets the request priority option for reading change streams.
-// Default value is unspecified, equivalent to high.
+// Deprecated: Use WithSpannerRequestPriority instead (typo fix).
 func WithSpannerRequestPriotiry(priority spannerpb.RequestOptions_Priority) Option {
 	return withSpannerRequestPriotiry(priority)
 }
@@ -97,4 +116,31 @@ func (o withSerializedConsumer) Apply(c *config) {
 // Default is false (concurrent consumption is allowed if the Consumer is re-entrant safe).
 func WithSerializedConsumer(serialized bool) Option {
 	return withSerializedConsumer(serialized)
+}
+
+func (o withMaxConnections) Apply(c *config) {
+	c.maxConnections = int(o)
+}
+
+// WithMaxConnections sets the maximum number of partitions to process concurrently.
+func WithMaxConnections(n int) Option {
+	return withMaxConnections(n)
+}
+
+func (o withRebalancingInterval) Apply(c *config) {
+	c.rebalancingInterval = time.Duration(o)
+}
+
+// WithRebalancingInterval sets the interval for checking rebalancing needs.
+func WithRebalancingInterval(d time.Duration) Option {
+	return withRebalancingInterval(d)
+}
+
+func (o withLeaseDuration) Apply(c *config) {
+	c.leaseDuration = time.Duration(o)
+}
+
+// WithLeaseDuration sets the duration for partition leases.
+func WithLeaseDuration(d time.Duration) Option {
+	return withLeaseDuration(d)
 }

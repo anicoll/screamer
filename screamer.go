@@ -21,11 +21,11 @@ type PartitionStorage interface {
 	// GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark, or nil if none exist.
 	GetUnfinishedMinWatermarkPartition(ctx context.Context) (*PartitionMetadata, error)
 	// GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
-	GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*PartitionMetadata, error)
+	GetInterruptedPartitions(ctx context.Context, runnerID string, leaseDuration time.Duration) ([]*PartitionMetadata, error)
 	// InitializeRootPartition creates or updates the root partition metadata.
 	InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error
 	// GetAndSchedulePartitions finds partitions ready to be scheduled and assigns them to the given runnerID.
-	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*PartitionMetadata, error)
+	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, maxConnections int) ([]*PartitionMetadata, error)
 	// AddChildPartitions adds new child partitions for a parent partition based on a ChildPartitionsRecord.
 	AddChildPartitions(ctx context.Context, parentPartition *PartitionMetadata, childPartitionsRecord *ChildPartitionsRecord) error
 	// UpdateToRunning marks the given partition as running.
@@ -36,6 +36,14 @@ type PartitionStorage interface {
 	UpdateToFinished(ctx context.Context, partition *PartitionMetadata, runnerID string) error
 	// UpdateWatermark updates the watermark for the given partition.
 	UpdateWatermark(ctx context.Context, partition *PartitionMetadata, watermark time.Time) error
+	// ExtendLease extends the lease for a partition.
+	ExtendLease(ctx context.Context, partitionToken string, runnerID string) error
+	// ReleaseLease releases the lease for a partition.
+	ReleaseLease(ctx context.Context, partitionToken string, runnerID string) error
+	// GetActiveRunnerCount returns the number of active runners.
+	GetActiveRunnerCount(ctx context.Context, leaseDuration time.Duration) (int64, error)
+	// GetActivePartitionCount returns the number of active (scheduled or running) partitions.
+	GetActivePartitionCount(ctx context.Context) (int64, error)
 }
 
 // Subscriber subscribes to a change stream and manages partition processing.
@@ -47,6 +55,9 @@ type Subscriber struct {
 	endTimestamp           time.Time
 	heartbeatInterval      time.Duration
 	spannerRequestPriority spannerpb.RequestOptions_Priority
+	maxConnections         int
+	rebalancingInterval    time.Duration
+	leaseDuration          time.Duration
 
 	partitionStorage   PartitionStorage
 	consumer           Consumer
@@ -54,11 +65,16 @@ type Subscriber struct {
 	mu                 sync.Mutex
 	serializedConsumer bool
 	consumerMu         sync.Mutex
+
+	activePartitionsMu sync.Mutex
+	activePartitions   map[string]context.CancelFunc
 }
 
 var (
 	defaultEndTimestamp      = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC) // Maximum value of Spanner TIMESTAMP type.
 	defaultHeartbeatInterval = 3 * time.Second
+	defaultMaxConnections    = 400
+	defaultLeaseDuration     = 30 * time.Second
 )
 
 // NewSubscriber creates a new subscriber of change streams.
@@ -76,6 +92,8 @@ func NewSubscriber(
 		endTimestamp:      defaultEndTimestamp,
 		heartbeatInterval: defaultHeartbeatInterval,
 		logLevel:          zerolog.InfoLevel, // Default log level
+		maxConnections:    defaultMaxConnections,
+		leaseDuration:     defaultLeaseDuration,
 	}
 	for _, o := range options {
 		o.Apply(c)
@@ -92,6 +110,10 @@ func NewSubscriber(
 		partitionStorage:       partitionStorage,
 		runnerID:               runnerID,
 		serializedConsumer:     c.serializedConsumer,
+		maxConnections:         c.maxConnections,
+		rebalancingInterval:    c.rebalancingInterval,
+		leaseDuration:          c.leaseDuration,
+		activePartitions:       make(map[string]context.CancelFunc),
 	}
 }
 
@@ -158,9 +180,10 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 		}
 	})
 
-	// periodically check for new stale partitions.
+	// periodically check for new stale partitions due to lease expiry
 	s.eg.Go(func() error {
-		ticker := time.NewTicker(time.Second * 10)
+		// Use lease duration as interval for checking stale partitions
+		ticker := time.NewTicker(s.leaseDuration / 2)
 		defer ticker.Stop()
 		for {
 			select {
@@ -181,19 +204,86 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 		}
 	})
 
+	// Rebalancing loop
+	if s.rebalancingInterval > 0 {
+		s.eg.Go(func() error {
+			ticker := time.NewTicker(s.rebalancingInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					// Rebalancing Logic
+					activeRunners, err := s.partitionStorage.GetActiveRunnerCount(ctx, s.leaseDuration)
+					if err != nil {
+						log.Warn().Err(err).Msg("failed to get active runner count for rebalancing")
+						continue
+					}
+					if activeRunners == 0 {
+						activeRunners = 1 // Should be at least 1 (us)
+					}
+
+					activePartitions, err := s.partitionStorage.GetActivePartitionCount(ctx)
+					if err != nil {
+						log.Warn().Err(err).Msg("failed to get active partition count for rebalancing")
+						continue
+					}
+
+					fairShare := float64(activePartitions) / float64(activeRunners)
+					s.activePartitionsMu.Lock()
+					myCount := len(s.activePartitions)
+
+					// Release threshold with hysteresis (e.g., 20% above fair share)
+					// Avoid releasing if count is small to prevent flapping
+					if float64(myCount) > fairShare*1.2 && myCount > 1 {
+						releaseCount := int(float64(myCount) - fairShare)
+						log.Info().
+							Int64("active_runners", activeRunners).
+							Int64("active_partitions", activePartitions).
+							Float64("fair_share", fairShare).
+							Int("my_count", myCount).
+							Int("release_count", releaseCount).
+							Msg("rebalancing: releasing partitions")
+
+						// Release partitions
+						released := 0
+						for token, cancel := range s.activePartitions {
+							if released >= releaseCount {
+								break
+							}
+							log.Debug().Str("partition", token).Msg("releasing partition")
+
+							// Cancel local processing
+							cancel()
+
+							// Release lease in storage (best effort)
+							if err := s.partitionStorage.ReleaseLease(ctx, token, s.runnerID); err != nil {
+								log.Warn().Err(err).Str("partition", token).Msg("failed to release lease during rebalancing")
+							}
+
+							released++
+						}
+					}
+					s.activePartitionsMu.Unlock()
+					// End Rebalancing Logic
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		})
+	}
+
 	return s.eg.Wait()
 }
 
 func (s *Subscriber) processInterruptedPartitions(ctx context.Context) error {
-	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx, s.runnerID)
+	log.Debug().Msg("processing interrupted partitions")
+	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx, s.runnerID, s.leaseDuration)
 	if err != nil {
 		return fmt.Errorf("failed to get interrupted partitions: %w", err)
 	}
 	for _, p := range interruptedPartitions {
 		p := p
-		s.eg.Go(func() error {
-			return s.queryChangeStream(ctx, p)
-		})
+		s.startPartitionProcessing(ctx, p)
 	}
 	return nil
 }
@@ -202,6 +292,23 @@ func (s *Subscriber) processInterruptedPartitions(ctx context.Context) error {
 // The function might be called from multiple goroutines and must be re-entrant safe.
 func (s *Subscriber) SubscribeFunc(ctx context.Context, f ConsumerFunc) error {
 	return s.Subscribe(ctx, f)
+}
+
+func (s *Subscriber) startPartitionProcessing(ctx context.Context, p *PartitionMetadata) {
+	pCtx, cancel := context.WithCancel(ctx)
+	s.activePartitionsMu.Lock()
+	s.activePartitions[p.PartitionToken] = cancel
+	s.activePartitionsMu.Unlock()
+
+	s.eg.Go(func() error {
+		defer func() {
+			s.activePartitionsMu.Lock()
+			delete(s.activePartitions, p.PartitionToken)
+			s.activePartitionsMu.Unlock()
+			cancel()
+		}()
+		return s.queryChangeStream(pCtx, p)
+	})
 }
 
 func (s *Subscriber) initErrGroup(ctx context.Context) context.Context {
@@ -230,7 +337,7 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 		return errDone
 	}
 
-	partitions, err := s.partitionStorage.GetAndSchedulePartitions(ctx, minWatermarkPartition.Watermark, s.runnerID)
+	partitions, err := s.partitionStorage.GetAndSchedulePartitions(ctx, minWatermarkPartition.Watermark, s.runnerID, s.maxConnections)
 	if err != nil {
 		return fmt.Errorf("failed to get schedulable partitions: %w", err)
 	}
@@ -240,9 +347,7 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 
 	for _, p := range partitions {
 		p := p
-		s.eg.Go(func() error {
-			return s.queryChangeStream(ctx, p)
-		})
+		s.startPartitionProcessing(ctx, p)
 	}
 
 	return nil
@@ -262,6 +367,26 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 			"heartbeatMilliseconds": p.HeartbeatMillis,
 		},
 	}
+
+	// Create a context for the heartbeat loop that can be canceled when query finishes
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	defer cancelHeartbeat()
+
+	// Start heartbeat loop for this partition
+	s.eg.Go(func() error {
+		ticker := time.NewTicker(s.leaseDuration / 3) // Renew lease frequently enough
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := s.partitionStorage.ExtendLease(heartbeatCtx, p.PartitionToken, s.runnerID); err != nil {
+					log.Warn().Err(err).Str("partition", p.PartitionToken).Msg("Failed to extend lease")
+				}
+			case <-heartbeatCtx.Done():
+				return nil
+			}
+		}
+	})
 
 	if p.IsRootPartition() {
 		// Must be converted to NULL (root partition).
@@ -291,8 +416,8 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 		return err
 	}
 
-	log.Info().Str("partition_token", p.PartitionToken).
-		Msg("partition processing complete")
+	log.Info().Str("partition_token", p.PartitionToken).Msg("partition processing complete")
+
 	if err := s.partitionStorage.UpdateToFinished(ctx, p, s.runnerID); err != nil {
 		return fmt.Errorf("failed to update to finished: %w", err)
 	}
@@ -329,10 +454,11 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			}
 			if s.serializedConsumer {
 				s.consumerMu.Lock()
-				defer s.consumerMu.Unlock()
 				if err = s.consumer.Consume(out); err != nil {
+					s.consumerMu.Unlock()
 					return err
 				}
+				s.consumerMu.Unlock()
 			} else {
 				if err := s.consumer.Consume(out); err != nil {
 					return err

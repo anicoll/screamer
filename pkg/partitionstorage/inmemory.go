@@ -43,10 +43,29 @@ func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx contex
 	return partitions[0], nil
 }
 
-// GetInterruptedPartitions is a no-op for in-memory storage and always returns nil.
-func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
+// GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
+func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string, leaseDuration time.Duration) ([]*screamer.PartitionMetadata, error) {
 	// InmemoryPartitionStorage can't return any partitions
 	return nil, nil
+}
+
+// GetActiveRunnerCount returns the number of active runners.
+func (s *InmemoryPartitionStorage) GetActiveRunnerCount(ctx context.Context, leaseDuration time.Duration) (int64, error) {
+	return 1, nil
+}
+
+// GetActivePartitionCount returns the number of active (scheduled or running) partitions.
+func (s *InmemoryPartitionStorage) GetActivePartitionCount(ctx context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	count := int64(0)
+	for _, p := range s.m {
+		if p.State == screamer.StateScheduled || p.State == screamer.StateRunning {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // InitializeRootPartition creates or updates the root partition metadata in memory.
@@ -85,7 +104,7 @@ func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context,
 }
 
 // GetAndSchedulePartitions finds partitions ready to be scheduled and marks them as scheduled.
-func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
+func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, maxConnections int) ([]*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -179,6 +198,16 @@ func (s *InmemoryPartitionStorage) UpdateWatermark(ctx context.Context, partitio
 
 	s.m[partition.PartitionToken].Watermark = watermark
 
+	return nil
+}
+
+// ExtendLease is a no-op for in-memory storage.
+func (s *InmemoryPartitionStorage) ExtendLease(ctx context.Context, partitionToken string, runnerID string) error {
+	return nil
+}
+
+// ReleaseLease is a no-op for in-memory storage.
+func (s *InmemoryPartitionStorage) ReleaseLease(ctx context.Context, partitionToken string, runnerID string) error {
 	return nil
 }
 

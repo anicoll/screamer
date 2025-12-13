@@ -143,19 +143,27 @@ func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID st
 
 // GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
 // Assigns the current runnerID to these partitions for recovery.
-func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
-	log.Trace().Str("runner_id", runnerID).Msg("GetInterruptedPartitions called")
+func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string, leaseDuration time.Duration) ([]*screamer.PartitionMetadata, error) {
+	log.Trace().Str("runner_id", runnerID).Dur("lease_duration", leaseDuration).Msg("GetInterruptedPartitions called")
 	var partitions []*screamer.PartitionMetadata
 
 	_, errOuter := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		mutations := []*spanner.Mutation{}
 		partitions = make([]*screamer.PartitionMetadata, 0) // Reset for each transaction attempt
+
+		// Convert duration to seconds for SQL TIMESTAMP_SUB
+		// We use a parameter for the interval seconds to be safe
+		leaseSeconds := int64(leaseDuration.Seconds())
+		if leaseSeconds < 1 {
+			leaseSeconds = 1
+		}
+
 		stmt := spanner.Statement{
 			SQL: fmt.Sprintf(`
 				WITH StaleRunners AS (
 					SELECT RunnerID
 						FROM %[1]s
-						WHERE UpdatedAt <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
+						WHERE UpdatedAt <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @leaseSeconds SECOND)
 					),
 				StalePartitions AS (
 					SELECT 
@@ -164,7 +172,7 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 					FROM %[1]s r
 					INNER JOIN %[2]s ptr ON ptr.RunnerID = r.RunnerID
 					GROUP BY ptr.PartitionToken
-					HAVING MAX(r.UpdatedAt) <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
+					HAVING MAX(r.UpdatedAt) <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @leaseSeconds SECOND)
 				)
 				SELECT DISTINCT m.* EXCEPT (ParentTokens)
 				FROM %[3]s m
@@ -175,7 +183,8 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 				LIMIT 100
 				FOR UPDATE`, tableRunner, tablePartitionToRunner, s.tableName),
 			Params: map[string]interface{}{
-				"states": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
+				"states":       []screamer.State{screamer.StateScheduled, screamer.StateRunning},
+				"leaseSeconds": leaseSeconds,
 			},
 		}
 
@@ -246,32 +255,64 @@ func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, s
 
 // GetAndSchedulePartitions finds partitions ready to be scheduled and assigns them to the given runnerID.
 // Returns the scheduled partitions.
-func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
+func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, maxConnections int) ([]*screamer.PartitionMetadata, error) {
 	log.Trace().
 		Time("min_watermark", minWatermark).
 		Str("runner_id", runnerID).
+		Int("max_connections", maxConnections).
 		Msg("GetAndSchedulePartitions called")
 	var partitions []*screamer.PartitionMetadata
 
 	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		partitions = make([]*screamer.PartitionMetadata, 0)
-		mutations := make([]*spanner.Mutation, 0, len(partitions))
 
+		// Check current connection count for the runner
+		row, err := tx.Query(ctx, spanner.Statement{
+			SQL: fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE RunnerID = @runnerID", tablePartitionToRunner),
+			Params: map[string]interface{}{
+				"runnerID": runnerID,
+			},
+		}).Next()
+		if err != nil {
+			return err
+		}
+		var currentConnections int64
+		if err := row.Column(0, &currentConnections); err != nil {
+			return err
+		}
+
+		remainingCapacity := int64(maxConnections) - currentConnections
+		if remainingCapacity <= 0 {
+			log.Debug().Int64("current", currentConnections).Int("max", maxConnections).Msg("Connection limit reached, no new partitions")
+			return nil
+		}
+
+		// Use remainingCapacity as limit
 		stmt := spanner.Statement{
-			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC FOR UPDATE", s.tableName),
+			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC LIMIT @limit", s.tableName),
 			Params: map[string]interface{}{
 				"state":        screamer.StateCreated,
 				"minWatermark": minWatermark,
+				"limit":        remainingCapacity,
 			},
 		}
 
+		// We cannot use FOR UPDATE with LIMIT in some Spanner dialects or if not supported, but assuming it is or we just select and then write.
+		// Standard SQL Spanner supports LIMIT.
+		// However, we need to claim them.
+
+		// Reading partitions
 		iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "GetAndSchedulePartitions"})
+		mutations := make([]*spanner.Mutation, 0, remainingCapacity)
 
 		if err := iter.Do(func(r *spanner.Row) error {
 			p := new(screamer.PartitionMetadata)
 			if err := r.ToStruct(p); err != nil {
 				return err
 			}
+
+			// Optimistic locking? We are in a transaction.
+			// We update them to SCHEDULED.
 
 			m := spanner.UpdateMap(s.tableName, map[string]interface{}{
 				columnPartitionToken: p.PartitionToken,
@@ -296,6 +337,10 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 			return nil
 		}); err != nil {
 			return err
+		}
+
+		if len(partitions) == 0 {
+			return nil
 		}
 
 		// writes the updates to spanner.
@@ -400,6 +445,80 @@ func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition
 	partition.Watermark = watermark.UTC()
 
 	return err
+}
+
+// Assert that SpannerPartitionStorage implements PartitionStorage.
+var _ screamer.PartitionStorage = (*SpannerPartitionStorage)(nil)
+
+// ExtendLease extends the lease for a partition.
+func (s *SpannerPartitionStorage) ExtendLease(ctx context.Context, partitionToken string, runnerID string) error {
+	log.Trace().
+		Str("partition_token", partitionToken).
+		Str("runner_id", runnerID).
+		Msg("ExtendLease called")
+
+	// Update UpdatedAt in PartitionToRunner table
+	m := spanner.UpdateMap(tablePartitionToRunner, map[string]interface{}{
+		columnPartitionToken: partitionToken,
+		columnRunnerID:       runnerID,
+		columnUpdatedAt:      spanner.CommitTimestamp,
+	})
+
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{m}, spanner.Priority(s.requestPriority), spanner.TransactionTag("ExtendLease"))
+	return err
+}
+
+// ReleaseLease releases the lease for a partition.
+func (s *SpannerPartitionStorage) ReleaseLease(ctx context.Context, partitionToken string, runnerID string) error {
+	log.Trace().Str("partition_token", partitionToken).Str("runner_id", runnerID).Msg("ReleaseLease called")
+	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.Delete(tablePartitionToRunner, spanner.Key{partitionToken})}, spanner.Priority(s.requestPriority), spanner.TransactionTag("ReleaseLease"))
+	return err
+}
+
+// GetActiveRunnerCount returns the number of active runners.
+func (s *SpannerPartitionStorage) GetActiveRunnerCount(ctx context.Context, leaseDuration time.Duration) (int64, error) {
+	log.Trace().Dur("lease_duration", leaseDuration).Msg("GetActiveRunnerCount called")
+	stmt := spanner.Statement{
+		SQL: fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE UpdatedAt > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @leaseSeconds SECOND)`, tableRunner),
+		Params: map[string]interface{}{
+			"leaseSeconds": int64(leaseDuration.Seconds()),
+		},
+	}
+	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "GetActiveRunnerCount"})
+	defer iter.Stop()
+
+	var count int64
+	row, err := iter.Next()
+	if err != nil {
+		return 0, err
+	}
+	if err := row.Column(0, &count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// GetActivePartitionCount returns the number of active (scheduled or running) partitions.
+func (s *SpannerPartitionStorage) GetActivePartitionCount(ctx context.Context) (int64, error) {
+	log.Trace().Msg("GetActivePartitionCount called")
+	stmt := spanner.Statement{
+		SQL: fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE State IN UNNEST(@states)`, s.tableName),
+		Params: map[string]interface{}{
+			"states": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
+		},
+	}
+	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "GetActivePartitionCount"})
+	defer iter.Stop()
+
+	var count int64
+	row, err := iter.Next()
+	if err != nil {
+		return 0, err
+	}
+	if err := row.Column(0, &count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // Assert that SpannerPartitionStorage implements PartitionStorage.
