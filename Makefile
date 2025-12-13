@@ -32,7 +32,7 @@ stop-emulator:
 	@docker stop $(SPANNER_CONTAINER_NAME) || true
 
 .PHONY: test-integration
-test-integration: start-emulator
+test-integration: stop-emulator start-emulator
 	@echo "Running integration tests..."
 	@export SPANNER_EMULATOR_HOST=localhost:9010 && \
 	go test -v ./... || (make stop-emulator && exit 1)

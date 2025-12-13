@@ -454,10 +454,11 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			}
 			if s.serializedConsumer {
 				s.consumerMu.Lock()
-				defer s.consumerMu.Unlock()
 				if err = s.consumer.Consume(out); err != nil {
+					s.consumerMu.Unlock()
 					return err
 				}
+				s.consumerMu.Unlock()
 			} else {
 				if err := s.consumer.Consume(out); err != nil {
 					return err

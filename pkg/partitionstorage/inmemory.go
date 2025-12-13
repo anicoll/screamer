@@ -56,7 +56,16 @@ func (s *InmemoryPartitionStorage) GetActiveRunnerCount(ctx context.Context, lea
 
 // GetActivePartitionCount returns the number of active (scheduled or running) partitions.
 func (s *InmemoryPartitionStorage) GetActivePartitionCount(ctx context.Context) (int64, error) {
-	return 0, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	count := int64(0)
+	for _, p := range s.m {
+		if p.State == screamer.StateScheduled || p.State == screamer.StateRunning {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // InitializeRootPartition creates or updates the root partition metadata in memory.

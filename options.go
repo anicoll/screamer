@@ -30,6 +30,8 @@ type (
 	withEndTimestamp           time.Time
 	withLogLevel               zerolog.Level
 	withHeartbeatInterval      time.Duration
+	withSpannerRequestPriority spannerpb.RequestOptions_Priority
+	// Deprecated: use withSpannerRequestPriority instead
 	withSpannerRequestPriotiry spannerpb.RequestOptions_Priority
 	withSerializedConsumer     bool
 	withMaxConnections         int
@@ -83,12 +85,23 @@ func WithHeartbeatInterval(heartbeatInterval time.Duration) Option {
 	return withHeartbeatInterval(heartbeatInterval)
 }
 
+func (o withSpannerRequestPriority) Apply(c *config) {
+	c.spannerRequestPriority = spannerpb.RequestOptions_Priority(o)
+}
+
+// WithSpannerRequestPriority sets the request priority option for reading change streams.
+// Default value is unspecified, equivalent to high.
+func WithSpannerRequestPriority(priority spannerpb.RequestOptions_Priority) Option {
+	return withSpannerRequestPriority(priority)
+}
+
+// Deprecated: Use WithSpannerRequestPriority instead (typo fix).
 func (o withSpannerRequestPriotiry) Apply(c *config) {
 	c.spannerRequestPriority = spannerpb.RequestOptions_Priority(o)
 }
 
 // WithSpannerRequestPriotiry sets the request priority option for reading change streams.
-// Default value is unspecified, equivalent to high.
+// Deprecated: Use WithSpannerRequestPriority instead (typo fix).
 func WithSpannerRequestPriotiry(priority spannerpb.RequestOptions_Priority) Option {
 	return withSpannerRequestPriotiry(priority)
 }
