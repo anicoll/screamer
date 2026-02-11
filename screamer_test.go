@@ -32,12 +32,14 @@ const (
 
 type IntegrationTestSuite struct {
 	suite.Suite
-	ctx       context.Context
-	container testcontainers.Container
-	client    *spanner.Client
-	dsn       string
-	proxy     *interceptor.QueueInterceptor
-	ddlMutex  sync.Mutex // Serialize DDL operations to avoid Spanner emulator conflicts
+	ctx             context.Context
+	container       testcontainers.Container
+	client          *spanner.Client
+	dsn             string
+	proxy           *interceptor.QueueInterceptor
+	ddlMutex        sync.Mutex            // Serialize DDL operations to avoid Spanner emulator conflicts
+	migratedTables  map[string]bool       // Track which tables have been migrated
+	migratedTableMu sync.Mutex            // Protect migratedTables map
 }
 
 func TestIntegrationTestSuite(t *testing.T) {
@@ -47,6 +49,7 @@ func TestIntegrationTestSuite(t *testing.T) {
 func (s *IntegrationTestSuite) SetupSuite() {
 	s.ctx = context.Background()
 	s.proxy = interceptor.NewQueueInterceptor(100)
+	s.migratedTables = make(map[string]bool)
 
 	var err error
 	s.container, err = helper.NewTestContainer(
@@ -135,18 +138,35 @@ func (s *IntegrationTestSuite) createTableAndStream(ctx context.Context, name st
 		},
 	})
 	s.NoError(err)
-	s.NoError(op.Wait(ctx))
+	if op != nil {
+		s.NoError(op.Wait(ctx))
+	}
+
+	// Small delay to ensure DDL operations complete before releasing mutex
+	time.Sleep(100 * time.Millisecond)
 	return name, streamName
 }
 
 func (s *IntegrationTestSuite) setupSpannerStorage(ctx context.Context, runnerID, tableName string) *partitionstorage.SpannerPartitionStorage {
 	storage := partitionstorage.NewSpanner(s.client, tableName)
 
-	// Serialize DDL operations to avoid conflicts with Spanner emulator
-	s.ddlMutex.Lock()
-	err := storage.RunMigrations(ctx)
-	s.ddlMutex.Unlock()
-	s.NoError(err)
+	// Only run migrations once per table name to avoid concurrent DDL conflicts
+	s.migratedTableMu.Lock()
+	needsMigration := !s.migratedTables[tableName]
+	if needsMigration {
+		s.migratedTables[tableName] = true
+	}
+	s.migratedTableMu.Unlock()
+
+	if needsMigration {
+		// Serialize DDL operations to avoid conflicts with Spanner emulator
+		s.ddlMutex.Lock()
+		err := storage.RunMigrations(ctx)
+		// Small delay to ensure DDL operations complete before releasing mutex
+		time.Sleep(100 * time.Millisecond)
+		s.ddlMutex.Unlock()
+		s.NoError(err)
+	}
 
 	s.NoError(storage.RegisterRunner(ctx, runnerID))
 
