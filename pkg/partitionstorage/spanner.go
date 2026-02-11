@@ -417,5 +417,37 @@ func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition
 	return err
 }
 
+// GetActiveRunnerCount returns the number of active runners that have refreshed within the last 5 seconds.
+// Used for metrics and observability to understand cluster size.
+func (s *SpannerPartitionStorage) GetActiveRunnerCount(ctx context.Context) (int, error) {
+	log.Trace().Msg("GetActiveRunnerCount called")
+
+	stmt := spanner.Statement{
+		SQL: fmt.Sprintf(`
+			SELECT COUNT(*) as ActiveRunners
+			FROM %s
+			WHERE UpdatedAt > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 SECOND)`, tableRunner),
+	}
+
+	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{
+		Priority:   s.requestPriority,
+		RequestTag: "GetActiveRunnerCount",
+	})
+	defer iter.Stop()
+
+	row, err := iter.Next()
+	if err != nil {
+		return 0, fmt.Errorf("failed to query active runner count: %w", err)
+	}
+
+	var count int64
+	if err := row.Columns(&count); err != nil {
+		return 0, fmt.Errorf("failed to scan active runner count: %w", err)
+	}
+
+	log.Trace().Int("active_runners", int(count)).Msg("GetActiveRunnerCount completed")
+	return int(count), nil
+}
+
 // Assert that SpannerPartitionStorage implements PartitionStorage.
 var _ screamer.PartitionStorage = (*SpannerPartitionStorage)(nil)
