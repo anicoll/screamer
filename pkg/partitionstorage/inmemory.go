@@ -187,5 +187,12 @@ func (s *InmemoryPartitionStorage) UpdateWatermark(ctx context.Context, partitio
 	return nil
 }
 
+// GetActiveRunnerCount returns 1 for in-memory storage since it only supports single runner.
+// This is a no-op implementation as in-memory storage doesn't track multiple runners.
+func (s *InmemoryPartitionStorage) GetActiveRunnerCount(ctx context.Context) (int, error) {
+	// In-memory storage is always single-runner
+	return 1, nil
+}
+
 // Assert that InmemoryPartitionStorage implements PartitionStorage.
 var _ screamer.PartitionStorage = (*InmemoryPartitionStorage)(nil)
