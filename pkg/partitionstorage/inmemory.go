@@ -44,7 +44,8 @@ func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx contex
 }
 
 // GetInterruptedPartitions is a no-op for in-memory storage and always returns nil.
-func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
+// The limit parameter is ignored as this implementation doesn't track runner assignments.
+func (s *InmemoryPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string, limit int) ([]*screamer.PartitionMetadata, error) {
 	// InmemoryPartitionStorage can't return any partitions
 	return nil, nil
 }
@@ -85,7 +86,8 @@ func (s *InmemoryPartitionStorage) GetSchedulablePartitions(ctx context.Context,
 }
 
 // GetAndSchedulePartitions finds partitions ready to be scheduled and marks them as scheduled.
-func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
+// The limit parameter restricts the maximum number of partitions to schedule.
+func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, limit int) ([]*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -93,6 +95,9 @@ func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context,
 	now := time.Now().UTC()
 
 	for _, p := range s.m {
+		if len(partitions) >= limit {
+			break
+		}
 		if p.State == screamer.StateCreated && !minWatermark.After(p.StartTimestamp) {
 			p = s.m[p.PartitionToken]
 			p.ScheduledAt = &now
