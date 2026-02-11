@@ -5,29 +5,35 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 	commitTime := time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC)
 	startTime := time.Date(2023, 1, 1, 10, 0, 0, 0, time.UTC)
-	watermarkTime := time.Date(2023, 1, 1, 11, 0, 0, 0, time.UTC)
+	watermark := time.Date(2023, 1, 1, 11, 0, 0, 0, time.UTC)
 	createdTime := time.Date(2023, 1, 1, 9, 0, 0, 0, time.UTC)
 	scheduledTime := time.Date(2023, 1, 1, 9, 30, 0, 0, time.UTC)
 	runningTime := time.Date(2023, 1, 1, 10, 30, 0, 0, time.UTC)
 
+	partition := &PartitionMetadata{
+		PartitionToken: "token-001",
+		StartTimestamp: startTime,
+		CreatedAt:      createdTime,
+		ScheduledAt:    &scheduledTime,
+		RunningAt:      &runningTime,
+	}
+
 	tests := []struct {
-		name                string
-		record              *dataChangeRecord
-		partitionMetadata   *PartitionMetadata
-		recordWatermark     time.Time
-		expectedTableName   string
-		expectedModType     ModType
-		expectedModsCount   int
-		expectedColumnCount int
+		name          string
+		record        *dataChangeRecord
+		expectedTable string
+		expectedType  ModType
+		expectedMods  int
+		expectedCols  int
 	}{
 		{
-			name: "INSERT record with basic types",
+			name: "insert_basic_types",
 			record: &dataChangeRecord{
 				CommitTimestamp:                      commitTime,
 				RecordSequence:                       "seq-001",
@@ -35,18 +41,8 @@ func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 				IsLastRecordInTransactionInPartition: true,
 				TableName:                            "users",
 				ColumnTypes: []*columnType{
-					{
-						Name:            "id",
-						Type:            spanner.NullJSON{Valid: true, Value: map[string]interface{}{"code": "INT64"}},
-						IsPrimaryKey:    true,
-						OrdinalPosition: 1,
-					},
-					{
-						Name:            "name",
-						Type:            spanner.NullJSON{Valid: true, Value: map[string]interface{}{"code": "STRING"}},
-						IsPrimaryKey:    false,
-						OrdinalPosition: 2,
-					},
+					{Name: "id", Type: spanner.NullJSON{Valid: true, Value: map[string]interface{}{"code": "INT64"}}, IsPrimaryKey: true, OrdinalPosition: 1},
+					{Name: "name", Type: spanner.NullJSON{Valid: true, Value: map[string]interface{}{"code": "STRING"}}, IsPrimaryKey: false, OrdinalPosition: 2},
 				},
 				Mods: []*mod{
 					{
@@ -62,21 +58,13 @@ func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 				TransactionTag:                  "tag-001",
 				IsSystemTransaction:             false,
 			},
-			partitionMetadata: &PartitionMetadata{
-				PartitionToken: "token-001",
-				StartTimestamp: startTime,
-				CreatedAt:      createdTime,
-				ScheduledAt:    &scheduledTime,
-				RunningAt:      &runningTime,
-			},
-			recordWatermark:     watermarkTime,
-			expectedTableName:   "users",
-			expectedModType:     ModType_INSERT,
-			expectedModsCount:   1,
-			expectedColumnCount: 2,
+			expectedTable: "users",
+			expectedType:  ModType_INSERT,
+			expectedMods:  1,
+			expectedCols:  2,
 		},
 		{
-			name: "UPDATE record with array type",
+			name: "update_with_array",
 			record: &dataChangeRecord{
 				CommitTimestamp: commitTime,
 				RecordSequence:  "seq-002",
@@ -101,19 +89,13 @@ func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 				},
 				ModType: "UPDATE",
 			},
-			partitionMetadata: &PartitionMetadata{
-				PartitionToken: "token-002",
-				StartTimestamp: startTime,
-				CreatedAt:      createdTime,
-			},
-			recordWatermark:     watermarkTime,
-			expectedTableName:   "products",
-			expectedModType:     ModType_UPDATE,
-			expectedModsCount:   1,
-			expectedColumnCount: 1,
+			expectedTable: "products",
+			expectedType:  ModType_UPDATE,
+			expectedMods:  1,
+			expectedCols:  1,
 		},
 		{
-			name: "DELETE record with null values",
+			name: "delete_with_nulls",
 			record: &dataChangeRecord{
 				CommitTimestamp: commitTime,
 				RecordSequence:  "seq-003",
@@ -128,48 +110,41 @@ func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 				},
 				ModType: "DELETE",
 			},
-			partitionMetadata: &PartitionMetadata{
-				PartitionToken: "token-003",
-				StartTimestamp: startTime,
-				CreatedAt:      createdTime,
-			},
-			recordWatermark:     watermarkTime,
-			expectedTableName:   "deleted_items",
-			expectedModType:     ModType_DELETE,
-			expectedModsCount:   1,
-			expectedColumnCount: 0,
+			expectedTable: "deleted_items",
+			expectedType:  ModType_DELETE,
+			expectedMods:  1,
+			expectedCols:  0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := tt.record.DecodeToNonSpannerType(tt.partitionMetadata, tt.recordWatermark)
+			result := tt.record.DecodeToNonSpannerType(partition, watermark)
 
-			// Test basic fields
-			assert.Equal(t, result.DataChangeRecord.TableName, tt.expectedTableName)
-			assert.Equal(t, result.DataChangeRecord.ModType, tt.expectedModType)
-			assert.Equal(t, len(result.DataChangeRecord.Mods), tt.expectedModsCount)
-			assert.Equal(t, len(result.DataChangeRecord.ColumnTypes), tt.expectedColumnCount)
+			// Verify basic fields
+			require.Equal(t, tt.expectedTable, result.DataChangeRecord.TableName)
+			require.Equal(t, tt.expectedType, result.DataChangeRecord.ModType)
+			require.Len(t, result.DataChangeRecord.Mods, tt.expectedMods)
+			require.Len(t, result.DataChangeRecord.ColumnTypes, tt.expectedCols)
 
-			// Test partition metadata
-			assert.Equal(t, result.PartitionToken, tt.partitionMetadata.PartitionToken)
-			assert.Equal(t, result.StartTimestamp, tt.partitionMetadata.StartTimestamp)
-			assert.Equal(t, result.Watermark, tt.recordWatermark)
+			// Verify partition metadata
+			require.Equal(t, partition.PartitionToken, result.PartitionToken)
+			require.Equal(t, partition.StartTimestamp, result.StartTimestamp)
+			require.Equal(t, watermark, result.Watermark)
 
-			// Test array element type handling
-			for i, columnType := range result.DataChangeRecord.ColumnTypes {
-				if columnType.Type.Code == TypeCode_ARRAY {
-					assert.NotEmpty(t, columnType.Type.ArrayElementType, "column %d: array type should have array_element_type set", i)
+			// Verify array types have element type
+			for _, col := range result.DataChangeRecord.ColumnTypes {
+				if col.Type.Code == TypeCode_ARRAY {
+					require.NotEmpty(t, col.Type.ArrayElementType)
 				}
 			}
 
-			// Test null JSON handling in mods
+			// Verify mod values match null validity
 			for i, mod := range result.DataChangeRecord.Mods {
-				if tt.record.Mods[i].NewValues.Valid && mod.NewValues == nil {
-					t.Errorf("mod %d: expected non-nil new values", i)
-				}
-				if !tt.record.Mods[i].NewValues.Valid && mod.NewValues != nil {
-					t.Errorf("mod %d: expected nil new values", i)
+				if tt.record.Mods[i].NewValues.Valid {
+					require.NotNil(t, mod.NewValues)
+				} else {
+					require.Nil(t, mod.NewValues)
 				}
 			}
 		})
