@@ -212,13 +212,34 @@ func TestGetMetrics(t *testing.T) {
 	})
 }
 
+// safeBuffer is a thread-safe bytes.Buffer wrapper
+type safeBuffer struct {
+	buf bytes.Buffer
+	mu  sync.Mutex
+}
+
+func (sb *safeBuffer) Write(p []byte) (n int, err error) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.Write(p)
+}
+
+func (sb *safeBuffer) String() string {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.String()
+}
+
 func TestMetricsLoggingInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		var buf bytes.Buffer
-		logger := zerolog.New(&buf).With().Timestamp().Logger()
+		buf := &safeBuffer{}
+		logger := zerolog.New(buf).With().Timestamp().Logger()
 		oldLogger := log.Logger
 		log.Logger = logger
-		defer func() { log.Logger = oldLogger }()
+		defer func() {
+			// Restore logger only after all goroutines are done
+			log.Logger = oldLogger
+		}()
 
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
@@ -249,9 +270,13 @@ func TestMetricsLoggingInterval(t *testing.T) {
 		subscriber.markPartitionActive("p3")
 
 		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
-		defer cancel()
 
-		go subscriber.Subscribe(ctx, subscriber.consumer)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			subscriber.Subscribe(ctx, subscriber.consumer)
+		}()
+
 		time.Sleep(31 * time.Second)
 
 		logOutput := buf.String()
@@ -263,7 +288,9 @@ func TestMetricsLoggingInterval(t *testing.T) {
 		metricsCount := strings.Count(logOutput, "partition processing metrics")
 		require.GreaterOrEqual(t, metricsCount, 1)
 
+		// Cancel and wait for goroutine to finish before defer runs
 		cancel()
+		<-done
 	})
 }
 
