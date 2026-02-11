@@ -86,14 +86,18 @@ func WithMaxConcurrentPartitions(max int) Option {
 GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, limit int) ([]*PartitionMetadata, error)
 ```
 
-**Implementation in spanner.go (line 247)**:
+**Implementation in spanner.go (line 247)** - Using optimistic concurrency:
 ```sql
+-- Step 1: Read available partitions (no locking)
 SELECT * FROM {tableName}
 WHERE State = @state
   AND StartTimestamp >= @minWatermark
 ORDER BY StartTimestamp ASC
-LIMIT @limit  -- Add limit parameter
-FOR UPDATE
+LIMIT @limit
+
+-- Step 2: Attempt to claim partitions (in transaction)
+-- Update State to Scheduled only if still in Created state
+-- Spanner's optimistic locking handles conflicts automatically
 ```
 
 **Changes to detectNewPartitions logic**:
@@ -181,20 +185,21 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 
 **Solution**: Randomized selection or round-robin via SQL
 
-**Option A: Randomized Fetch (Simple)**
+**Option A: Randomized Fetch (Recommended - Simple & Scalable)**
 ```sql
 -- Add random ordering to prevent thundering herd
+-- No locking - optimistic concurrency handles conflicts
 SELECT * FROM {tableName}
 WHERE State = @state
   AND StartTimestamp >= @minWatermark
 ORDER BY FARM_FINGERPRINT(CAST(CURRENT_TIMESTAMP() AS STRING) || PartitionToken), StartTimestamp ASC
 LIMIT @limit
-FOR UPDATE
 ```
 
-**Option B: Preferred - Fair Distribution via Modulo**
+**Option B: Deterministic Distribution via Modulo**
 ```sql
 -- Distribute based on hash of partition token
+-- Each runner claims partitions based on hash affinity
 WITH RankedPartitions AS (
   SELECT *,
     MOD(FARM_FINGERPRINT(PartitionToken), @totalRunners) as runner_hash
@@ -207,14 +212,113 @@ FROM RankedPartitions
 WHERE runner_hash = MOD(FARM_FINGERPRINT(@runnerID), @totalRunners)
 ORDER BY StartTimestamp ASC
 LIMIT @limit
-FOR UPDATE
 ```
 
-**Trade-off**: Option A is simpler, Option B provides better distribution but requires active runner count.
+**Trade-off**: Option A provides randomization to avoid contention, Option B provides deterministic partition affinity but may cause hotspots.
 
-**Recommended**: Start with Option A for simplicity.
+**Recommended**: Start with Option A for better conflict avoidance.
 
-#### 5. Dynamic Runner Count
+#### 5. Optimistic Concurrency Implementation
+
+**Approach**: Use Spanner's natural optimistic locking instead of `FOR UPDATE`
+
+**Implementation Strategy**:
+```go
+func (s *SpannerPartitionStorage) GetAndSchedulePartitions(
+    ctx context.Context,
+    minWatermark time.Time,
+    runnerID string,
+    limit int,
+) ([]*screamer.PartitionMetadata, error) {
+    var partitions []*screamer.PartitionMetadata
+
+    _, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+        partitions = make([]*screamer.PartitionMetadata, 0)
+        mutations := make([]*spanner.Mutation, 0)
+
+        // Step 1: Read partitions (no locking)
+        stmt := spanner.Statement{
+            SQL: fmt.Sprintf(`
+                SELECT * FROM %s
+                WHERE State = @state
+                  AND StartTimestamp >= @minWatermark
+                ORDER BY FARM_FINGERPRINT(CAST(CURRENT_TIMESTAMP() AS STRING) || PartitionToken),
+                         StartTimestamp ASC
+                LIMIT @limit`, s.tableName),
+            Params: map[string]interface{}{
+                "state":        screamer.StateCreated,
+                "minWatermark": minWatermark,
+                "limit":        limit,
+            },
+        }
+
+        iter := tx.Query(ctx, stmt)
+
+        // Step 2: Build mutations to claim partitions
+        if err := iter.Do(func(r *spanner.Row) error {
+            p := new(screamer.PartitionMetadata)
+            if err := r.ToStruct(p); err != nil {
+                return err
+            }
+
+            // Only schedule if State is still Created
+            // This condition prevents conflicts
+            m := spanner.UpdateMap(s.tableName, map[string]interface{}{
+                columnPartitionToken: p.PartitionToken,
+                columnState:          screamer.StateScheduled,
+                columnScheduledAt:    spanner.CommitTimestamp,
+            })
+            mutations = append(mutations, m)
+
+            // Also claim in PartitionToRunner table
+            ptrMut := spanner.InsertOrUpdateMap(tablePartitionToRunner, map[string]interface{}{
+                columnPartitionToken: p.PartitionToken,
+                columnRunnerID:       runnerID,
+                columnUpdatedAt:      spanner.CommitTimestamp,
+                columnCreatedAt:      spanner.CommitTimestamp,
+            })
+            mutations = append(mutations, ptrMut)
+
+            p.State = screamer.StateScheduled
+            partitions = append(partitions, p)
+            return nil
+        }); err != nil {
+            return err
+        }
+
+        // Step 3: Commit all updates atomically
+        // If another runner modified these partitions, transaction will abort and retry
+        return tx.BufferWrite(mutations)
+    })
+
+    if err != nil {
+        return nil, err
+    }
+
+    return partitions, nil
+}
+```
+
+**Why This Works**:
+1. **No Lock Contention**: Multiple runners can read concurrently
+2. **Automatic Conflict Resolution**: Spanner's transaction retry handles conflicts
+3. **Randomized Selection**: `FARM_FINGERPRINT(CURRENT_TIMESTAMP || PartitionToken)` ensures different runners see different order
+4. **Natural Backoff**: Failed transactions retry with exponential backoff automatically
+5. **Higher Throughput**: No lock waits = better scalability
+
+**Conflict Handling**:
+- If two runners try to claim the same partition, one transaction succeeds, the other aborts and retries
+- On retry, the partition is already `StateScheduled`, so it won't be selected again
+- Each runner gets a different random ordering, reducing retry probability
+
+**Apply to All Partition Claims**:
+This same optimistic concurrency approach should be used for:
+- `GetAndSchedulePartitions` - claiming new partitions
+- `GetInterruptedPartitions` - reclaiming stale partitions
+
+Both benefit from removing `FOR UPDATE` and using optimistic locking.
+
+#### 7. Dynamic Runner Count
 
 **Enhance Runner table to track active runners**:
 
@@ -231,6 +335,8 @@ WHERE UpdatedAt > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 SECOND)
 
 Used for metrics and optional fair distribution (Option B above).
 
+**Note**: With optimistic concurrency, active runner count is less critical since conflicts are handled automatically through retries.
+
 ### Implementation Plan
 
 #### Phase 1: Concurrency Limiting (Critical - Fixes immediate issue)
@@ -240,13 +346,17 @@ Used for metrics and optional fair distribution (Option B above).
 3. Modify `detectNewPartitions` to calculate available slots
 4. Update `queryChangeStream` to track partition lifecycle
 5. Add limit parameter to `GetAndSchedulePartitions` interface and implementation
-6. **Testing**: Verify single runner respects concurrency limit
+6. **Remove `FOR UPDATE`** from SQL queries:
+   - `GetAndSchedulePartitions` - line 261 (remove FOR UPDATE)
+   - `GetInterruptedPartitions` - line 176 (remove FOR UPDATE)
+   - Use optimistic concurrency via ReadWriteTransaction instead
+7. **Testing**: Verify single runner respects concurrency limit
 
 **Files to modify**:
 - `config.go` - Add config field
 - `options.go` - Add option constructor
 - `screamer.go` - Add tracking, modify detectNewPartitions, queryChangeStream
-- `partitionstorage/spanner.go` - Add limit to SQL query
+- `partitionstorage/spanner.go` - Remove FOR UPDATE, add limit parameter, implement optimistic concurrency
 - `screamer_test.go` - Add tests for concurrency limiting
 
 #### Phase 2: Fair Distribution (Important - Enables scaling)
@@ -374,9 +484,18 @@ With 500 partitions and 5 runners at 100 partitions each = full coverage
 
 #### Database Impact
 
-- Randomized query adds `FARM_FINGERPRINT` computation
-- Minimal CPU impact, same query plan
-- No additional round trips
+- **Optimistic Concurrency Benefits**:
+  - No lock contention (removed `FOR UPDATE`)
+  - Better concurrent throughput across multiple runners
+  - Spanner's automatic retry handles conflicts efficiently
+- **Randomized Query**:
+  - Adds `FARM_FINGERPRINT` computation (minimal CPU cost)
+  - Reduces conflict probability between runners
+  - Same query plan, no additional round trips
+- **Transaction Retries**:
+  - Rare under normal load (different random ordering per runner)
+  - Automatically handled by Spanner client library
+  - Exponential backoff prevents thundering herd
 
 #### Throughput Impact
 
@@ -426,6 +545,7 @@ With 500 partitions and 5 runners at 100 partitions each = full coverage
 
 | Risk | Impact | Mitigation |
 |------|--------|-----------|
+| Transaction conflicts (multiple runners claiming same partitions) | Retry overhead | Randomized query ordering reduces conflicts; Spanner handles retries automatically |
 | Uneven distribution | Some runners idle while others overloaded | Use randomized selection (Phase 2) |
 | Default limit too low | Underutilization | Set default to 100 (based on issue report) |
 | Default limit too high | Still crashes | Users can tune via option |
@@ -459,12 +579,19 @@ With 500 partitions and 5 runners at 100 partitions each = full coverage
 This design solves the partition scaling issue through:
 
 1. **Concurrency limiting** - Prevents single runner from overloading
-2. **Fair distribution** - Enables horizontal scaling across runners
-3. **Backward compatibility** - No breaking changes
-4. **Incremental rollout** - Can be adopted gradually
+2. **Optimistic concurrency** - Removes locking contention, enables better scalability
+3. **Fair distribution** - Enables horizontal scaling across runners via randomization
+4. **Backward compatibility** - No breaking changes
+5. **Incremental rollout** - Can be adopted gradually
 
 **Immediate fix**: Phase 1 can be implemented quickly to stop crash loops by limiting concurrent partitions per runner.
 
 **Long-term scaling**: Phase 2 enables true horizontal scaling by distributing work fairly across multiple runners.
+
+**Architecture Benefits**:
+- **No `FOR UPDATE`**: Optimistic concurrency eliminates lock contention
+- **Automatic retry**: Spanner handles transaction conflicts transparently
+- **Randomized selection**: Different runners see different partition ordering, reducing conflicts
+- **Better throughput**: Multiple runners can claim partitions concurrently without blocking
 
 **Expected outcome**: A deployment with 500 partitions can run 5 runners at 100 partitions each instead of 1 runner trying to handle all 500.
