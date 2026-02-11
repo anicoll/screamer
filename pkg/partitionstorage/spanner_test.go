@@ -520,7 +520,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_Read() {
 	})
 
 	s.Run("GetInterruptedPartitions", func() {
-		partitions, err := storage.GetInterruptedPartitions(ctx, runnerID)
+		partitions, err := storage.GetInterruptedPartitions(ctx, runnerID, 100)
 		s.NoError(err)
 
 		tokens := s.extractPartitionTokens(partitions)
@@ -641,14 +641,14 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 
 	s.Run("NoPartitionsReady", func() {
 		// Min watermark is far in the future, no CREATED partitions should match
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime.Add(2*time.Hour), runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime.Add(2*time.Hour), runnerID, 100)
 		s.NoError(err)
 		s.Empty(scheduled, "No partitions should be scheduled if minWatermark is too high")
 	})
 
 	s.Run("ScheduleAvailablePartitions", func() {
 		// Min watermark allows three CREATED partitions
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		s.NoError(err)
 		s.Len(scheduled, 3, "Should schedule three partitions")
 
@@ -673,7 +673,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		err := storage.RegisterRunner(ctx, runnerID)
 		s.NoError(err)
 
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		s.NoError(err)
 		s.Empty(scheduled, "No partitions should be scheduled if they are not in CREATED state")
 	})
@@ -691,7 +691,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 
 		// Inject an error to force transaction rollback
 		// Since we can't easily inject errors, we'll test that partition count is updated atomically
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		s.NoError(err)
 		s.Len(scheduled, 1)
 	})
@@ -729,7 +729,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		wg.Add(2)
 		go func(rid string) {
 			defer wg.Done()
-			scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, rid)
+			scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, rid, 100)
 			mu.Lock()
 			defer mu.Unlock()
 			results[rid] = scheduled
@@ -737,7 +737,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		}(runner1ID)
 		go func(rid string) {
 			defer wg.Done()
-			scheduled, err := storage2.GetAndSchedulePartitions(ctx, baseTime, rid)
+			scheduled, err := storage2.GetAndSchedulePartitions(ctx, baseTime, rid, 100)
 			mu.Lock()
 			defer mu.Unlock()
 			results[rid] = scheduled
@@ -774,7 +774,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		})
 
 		beforeSchedule := time.Now().UTC().Truncate(time.Millisecond)
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		afterSchedule := time.Now().UTC().Truncate(time.Millisecond)
 
 		s.NoError(err)
@@ -812,14 +812,14 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetAndSchedulePartitions(
 		})
 
 		// Should get partitions ordered by StartTimestamp ASC
-		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID)
+		// Note: Ordering now includes FARM_FINGERPRINT randomization, so exact order may vary
+		scheduled, err := storage.GetAndSchedulePartitions(ctx, baseTime, runnerID, 100)
 		s.NoError(err)
 		s.Len(scheduled, 3)
 
-		// Verify order
-		s.Equal("order_test_1", scheduled[0].PartitionToken)
-		s.Equal("order_test_2", scheduled[1].PartitionToken)
-		s.Equal("order_test_3", scheduled[2].PartitionToken)
+		// Verify all expected partitions are present (order may vary due to randomization)
+		tokens := s.extractPartitionTokens(scheduled)
+		s.ElementsMatch([]string{"order_test_1", "order_test_2", "order_test_3"}, tokens)
 	})
 }
 
@@ -1048,7 +1048,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions(
 	s.assignPartitionToRunner(ctx, storage, "p_live_runner", liveRunnerID, liveTime)
 
 	// Execute GetInterruptedPartitions
-	interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID)
+	interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID, 100)
 	s.NoError(err)
 
 	s.Len(interruptedPartitions, 2, "Should find two interrupted partitions (stale runner and orphaned)")
@@ -1067,7 +1067,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions(
 	err = storage.RegisterRunner(ctx, anotherCallingRunnerID)
 	s.Require().NoError(err)
 
-	interruptedPartitionsAgain, err := storage.GetInterruptedPartitions(ctx, anotherCallingRunnerID)
+	interruptedPartitionsAgain, err := storage.GetInterruptedPartitions(ctx, anotherCallingRunnerID, 100)
 	s.NoError(err)
 	s.Empty(interruptedPartitionsAgain, "Second call by another runner should not find already reassigned partitions")
 }
@@ -1095,13 +1095,26 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions_
 		time.Sleep(time.Millisecond * 10) // Small delay for uniqueness
 	}
 
+	// Test with smaller limit (50)
+	s.Run("RespectsSmallerLimit", func() {
+		smallLimit := 50
+		interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID, smallLimit)
+		s.NoError(err)
+		s.LessOrEqual(len(interruptedPartitions), smallLimit, "Should not exceed limit of %d", smallLimit)
+	})
+
+	// Reset for next test - refresh calling runner
+	err = storage.RefreshRunner(ctx, callingRunnerID)
+	s.Require().NoError(err)
+	time.Sleep(5 * time.Second) // Wait for assignments to become stale again
+
 	// First call should return 100 partitions (limit)
-	interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID)
+	interruptedPartitions, err := storage.GetInterruptedPartitions(ctx, callingRunnerID, 100)
 	s.NoError(err)
 	s.Len(interruptedPartitions, 100, "Should return 100 interrupted partitions (limit)")
 
 	// Second call should return remaining 50 partitions
-	interruptedPartitionsAgain, err := storage.GetInterruptedPartitions(ctx, callingRunnerID)
+	interruptedPartitionsAgain, err := storage.GetInterruptedPartitions(ctx, callingRunnerID, 100)
 	s.NoError(err)
 	s.Len(interruptedPartitionsAgain, 50, "Should return remaining 50 interrupted partitions")
 
@@ -1118,7 +1131,7 @@ func (s *SpannerTestSuite) TestSpannerPartitionStorage_GetInterruptedPartitions_
 	err = storage.RefreshRunner(ctx, callingRunnerID)
 	s.Require().NoError(err)
 
-	differentRunnerPartitions, err := storage.GetInterruptedPartitions(ctx, anotherCallingRunnerID)
+	differentRunnerPartitions, err := storage.GetInterruptedPartitions(ctx, anotherCallingRunnerID, 100)
 	s.NoError(err)
 	s.Empty(differentRunnerPartitions, "Third call should find no partitions")
 }
