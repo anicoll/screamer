@@ -38,6 +38,9 @@ type PartitionStorage interface {
 	UpdateToFinished(ctx context.Context, partition *PartitionMetadata, runnerID string) error
 	// UpdateWatermark updates the watermark for the given partition.
 	UpdateWatermark(ctx context.Context, partition *PartitionMetadata, watermark time.Time) error
+	// GetActiveRunnerCount returns the number of active runners that have refreshed recently.
+	// Used for metrics and observability.
+	GetActiveRunnerCount(ctx context.Context) (int, error)
 }
 
 // Subscriber subscribes to a change stream and manages partition processing.
@@ -112,6 +115,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 	s.eg.Go(func() error {
 		ticker := time.NewTicker(time.Second * 2)
 		defer ticker.Stop()
+		metricsCounter := 0
 		for {
 			select {
 			case <-ticker.C:
@@ -121,6 +125,20 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 					// continue
 				default:
 					return err
+				}
+
+				// Log metrics every 30 seconds (15 ticks)
+				metricsCounter++
+				if metricsCounter >= 15 {
+					metricsCounter = 0
+					metrics := s.GetMetrics()
+					log.Info().
+						Str("runner_id", s.runnerID).
+						Int("active_partitions", metrics.ActivePartitions).
+						Int("max_concurrent", metrics.MaxConcurrentPartitions).
+						Float64("capacity_used_percent", metrics.CapacityUsedPercent).
+						Int("available_slots", metrics.AvailableSlots).
+						Msg("partition processing metrics")
 				}
 			case <-ctx.Done():
 				return ctx.Err()
@@ -438,4 +456,38 @@ func (s *Subscriber) getAvailablePartitionSlots() int {
 		return 0
 	}
 	return available
+}
+
+// PartitionMetrics holds observability metrics for partition processing.
+type PartitionMetrics struct {
+	// ActivePartitions is the number of partitions currently being processed by this runner.
+	ActivePartitions int
+	// MaxConcurrentPartitions is the configured limit (0 = unlimited).
+	MaxConcurrentPartitions int
+	// CapacityUsedPercent is the percentage of capacity in use (0-100, or -1 if unlimited).
+	CapacityUsedPercent float64
+	// AvailableSlots is the number of additional partitions this runner can accept.
+	AvailableSlots int
+}
+
+// GetMetrics returns current partition processing metrics for observability.
+// This can be used for monitoring dashboards, health checks, and capacity planning.
+func (s *Subscriber) GetMetrics() PartitionMetrics {
+	active := s.getRunningPartitionCount()
+	available := s.getAvailablePartitionSlots()
+
+	metrics := PartitionMetrics{
+		ActivePartitions:        active,
+		MaxConcurrentPartitions: s.maxConcurrentPartitions,
+		AvailableSlots:          available,
+	}
+
+	// Calculate capacity percentage
+	if s.maxConcurrentPartitions == 0 {
+		metrics.CapacityUsedPercent = -1 // Unlimited
+	} else {
+		metrics.CapacityUsedPercent = (float64(active) / float64(s.maxConcurrentPartitions)) * 100
+	}
+
+	return metrics
 }

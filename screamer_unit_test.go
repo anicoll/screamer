@@ -1,16 +1,20 @@
 package screamer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"cloud.google.com/go/spanner"
 	"github.com/anicoll/screamer/mocks"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -341,4 +345,253 @@ func TestWithMaxConcurrentPartitions(t *testing.T) {
 			require.Equal(t, tt.expected, c.maxConcurrentPartitions)
 		})
 	}
+}
+
+// TestGetMetrics verifies partition metrics calculation
+func TestGetMetrics(t *testing.T) {
+	t.Run("UnlimitedCapacity", func(t *testing.T) {
+		subscriber := &Subscriber{
+			maxConcurrentPartitions: 0, // Unlimited
+			activePartitions:        make(map[string]struct{}),
+		}
+
+		// Add some active partitions
+		subscriber.markPartitionActive("p1")
+		subscriber.markPartitionActive("p2")
+		subscriber.markPartitionActive("p3")
+
+		metrics := subscriber.GetMetrics()
+		require.Equal(t, 3, metrics.ActivePartitions)
+		require.Equal(t, 0, metrics.MaxConcurrentPartitions)
+		require.Equal(t, 100, metrics.AvailableSlots) // Default batch size
+		require.Equal(t, float64(-1), metrics.CapacityUsedPercent) // Unlimited
+	})
+
+	t.Run("LimitedCapacity", func(t *testing.T) {
+		subscriber := &Subscriber{
+			maxConcurrentPartitions: 100,
+			activePartitions:        make(map[string]struct{}),
+		}
+
+		// Add 25 active partitions
+		for i := 0; i < 25; i++ {
+			subscriber.markPartitionActive(fmt.Sprintf("partition_%d", i))
+		}
+
+		metrics := subscriber.GetMetrics()
+		require.Equal(t, 25, metrics.ActivePartitions)
+		require.Equal(t, 100, metrics.MaxConcurrentPartitions)
+		require.Equal(t, 75, metrics.AvailableSlots)
+		require.Equal(t, float64(25), metrics.CapacityUsedPercent)
+	})
+
+	t.Run("AtCapacity", func(t *testing.T) {
+		subscriber := &Subscriber{
+			maxConcurrentPartitions: 50,
+			activePartitions:        make(map[string]struct{}),
+		}
+
+		// Fill to capacity
+		for i := 0; i < 50; i++ {
+			subscriber.markPartitionActive(fmt.Sprintf("partition_%d", i))
+		}
+
+		metrics := subscriber.GetMetrics()
+		require.Equal(t, 50, metrics.ActivePartitions)
+		require.Equal(t, 50, metrics.MaxConcurrentPartitions)
+		require.Equal(t, 0, metrics.AvailableSlots)
+		require.Equal(t, float64(100), metrics.CapacityUsedPercent)
+	})
+
+	t.Run("OverCapacity", func(t *testing.T) {
+		subscriber := &Subscriber{
+			maxConcurrentPartitions: 50,
+			activePartitions:        make(map[string]struct{}),
+		}
+
+		// Go over capacity (edge case, shouldn't normally happen)
+		for i := 0; i < 60; i++ {
+			subscriber.markPartitionActive(fmt.Sprintf("partition_%d", i))
+		}
+
+		metrics := subscriber.GetMetrics()
+		require.Equal(t, 60, metrics.ActivePartitions)
+		require.Equal(t, 50, metrics.MaxConcurrentPartitions)
+		require.Equal(t, 0, metrics.AvailableSlots)
+		require.Equal(t, float64(120), metrics.CapacityUsedPercent)
+	})
+}
+
+// TestMetricsLoggingInterval verifies that partition metrics are logged every 30 seconds
+func TestMetricsLoggingInterval(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Create a buffer to capture log output
+		var buf bytes.Buffer
+		logger := zerolog.New(&buf).With().Timestamp().Logger()
+
+		// Replace global logger temporarily
+		oldLogger := log.Logger
+		log.Logger = logger
+		defer func() { log.Logger = oldLogger }()
+
+		// Set log level to Info to capture metrics logs
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+
+		// Create mock partition storage
+		storage := &mockPartitionStorage{
+			partitions: make(map[string]*PartitionMetadata),
+		}
+
+		// Initialize root partition
+		storage.partitions[RootPartitionToken] = &PartitionMetadata{
+			PartitionToken:  RootPartitionToken,
+			State:           StateCreated,
+			Watermark:       time.Now(),
+			StartTimestamp:  time.Now(),
+			EndTimestamp:    time.Now().Add(24 * time.Hour),
+			HeartbeatMillis: 3000,
+		}
+
+		// Create subscriber
+		subscriber := &Subscriber{
+			runnerID:                "test-runner",
+			streamName:              "test-stream",
+			startTimestamp:          time.Now(),
+			endTimestamp:            time.Now().Add(24 * time.Hour),
+			heartbeatInterval:       3 * time.Second,
+			partitionStorage:        storage,
+			consumer:                mocks.NewMockConsumer(t),
+			maxConcurrentPartitions: 100,
+			activePartitions:        make(map[string]struct{}),
+		}
+
+		// Add some active partitions for metrics
+		subscriber.markPartitionActive("partition-1")
+		subscriber.markPartitionActive("partition-2")
+		subscriber.markPartitionActive("partition-3")
+
+		// Run Subscribe in background
+		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- subscriber.Subscribe(ctx, subscriber.consumer)
+		}()
+
+		// Wait for first metrics log (should occur at ~30 seconds)
+		// synctest will make time advance instantly in controlled environment
+		time.Sleep(31 * time.Second)
+
+		// Check log output
+		logOutput := buf.String()
+
+		// Verify metrics were logged
+		require.Contains(t, logOutput, "partition processing metrics")
+		require.Contains(t, logOutput, "test-runner")
+		require.Contains(t, logOutput, "active_partitions")
+		require.Contains(t, logOutput, "max_concurrent")
+		require.Contains(t, logOutput, "capacity_used_percent")
+		require.Contains(t, logOutput, "available_slots")
+
+		// Count occurrences - should have at least 1 metrics log
+		metricsCount := strings.Count(logOutput, "partition processing metrics")
+		require.GreaterOrEqual(t, metricsCount, 1, "Expected at least 1 metrics log after 31 seconds")
+
+		// Cancel context to stop Subscribe
+		cancel()
+
+		// Wait for Subscribe to finish
+		select {
+		case err := <-errCh:
+			// Context cancellation is expected
+			require.True(t, err == context.Canceled || err == nil)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Subscribe did not finish within timeout")
+		}
+	})
+}
+
+// mockPartitionStorage is a simple mock implementation for testing
+type mockPartitionStorage struct {
+	mu         sync.Mutex
+	partitions map[string]*PartitionMetadata
+}
+
+func (m *mockPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context.Context) (*PartitionMetadata, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, p := range m.partitions {
+		if p.State != StateFinished {
+			return p, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *mockPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string, limit int) ([]*PartitionMetadata, error) {
+	return nil, nil
+}
+
+func (m *mockPartitionStorage) InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.partitions[RootPartitionToken] = &PartitionMetadata{
+		PartitionToken:  RootPartitionToken,
+		State:           StateCreated,
+		Watermark:       startTimestamp,
+		StartTimestamp:  startTimestamp,
+		EndTimestamp:    endTimestamp,
+		HeartbeatMillis: heartbeatInterval.Milliseconds(),
+	}
+	return nil
+}
+
+func (m *mockPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, limit int) ([]*PartitionMetadata, error) {
+	// Return empty to avoid actually scheduling partitions
+	return []*PartitionMetadata{}, nil
+}
+
+func (m *mockPartitionStorage) AddChildPartitions(ctx context.Context, parentPartition *PartitionMetadata, childPartitionsRecord *ChildPartitionsRecord) error {
+	return nil
+}
+
+func (m *mockPartitionStorage) UpdateToRunning(ctx context.Context, partition *PartitionMetadata) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if p, ok := m.partitions[partition.PartitionToken]; ok {
+		p.State = StateRunning
+	}
+	return nil
+}
+
+func (m *mockPartitionStorage) RefreshRunner(ctx context.Context, runnerID string) error {
+	return nil
+}
+
+func (m *mockPartitionStorage) UpdateToFinished(ctx context.Context, partition *PartitionMetadata, runnerID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if p, ok := m.partitions[partition.PartitionToken]; ok {
+		p.State = StateFinished
+	}
+	return nil
+}
+
+func (m *mockPartitionStorage) UpdateWatermark(ctx context.Context, partition *PartitionMetadata, watermark time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if p, ok := m.partitions[partition.PartitionToken]; ok {
+		p.Watermark = watermark
+	}
+	return nil
+}
+
+func (m *mockPartitionStorage) GetActiveRunnerCount(ctx context.Context) (int, error) {
+	return 1, nil
 }
