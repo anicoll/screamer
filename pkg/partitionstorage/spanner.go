@@ -143,8 +143,12 @@ func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID st
 
 // GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
 // Assigns the current runnerID to these partitions for recovery.
-func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*screamer.PartitionMetadata, error) {
-	log.Trace().Str("runner_id", runnerID).Msg("GetInterruptedPartitions called")
+// The limit parameter restricts the maximum number of partitions to recover.
+func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, runnerID string, limit int) ([]*screamer.PartitionMetadata, error) {
+	log.Trace().
+		Str("runner_id", runnerID).
+		Int("limit", limit).
+		Msg("GetInterruptedPartitions called")
 	var partitions []*screamer.PartitionMetadata
 
 	_, errOuter := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
@@ -158,7 +162,7 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 						WHERE UpdatedAt <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 SECOND)
 					),
 				StalePartitions AS (
-					SELECT 
+					SELECT
 						ptr.PartitionToken,
 						MAX(r.UpdatedAt) as UpdatedAt
 					FROM %[1]s r
@@ -172,10 +176,10 @@ func (s *SpannerPartitionStorage) GetInterruptedPartitions(ctx context.Context, 
 				WHERE m.State IN UNNEST(@states)
 					AND (ptr.PartitionToken IS NULL OR ptr.PartitionToken IN (SELECT PartitionToken FROM StalePartitions))
 				ORDER BY m.Watermark ASC
-				LIMIT 100
-				FOR UPDATE`, tableRunner, tablePartitionToRunner, s.tableName),
+				LIMIT @limit`, tableRunner, tablePartitionToRunner, s.tableName),
 			Params: map[string]interface{}{
 				"states": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
+				"limit":  limit,
 			},
 		}
 
@@ -245,23 +249,34 @@ func (s *SpannerPartitionStorage) InitializeRootPartition(ctx context.Context, s
 }
 
 // GetAndSchedulePartitions finds partitions ready to be scheduled and assigns them to the given runnerID.
-// Returns the scheduled partitions.
-func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*screamer.PartitionMetadata, error) {
+// Returns the scheduled partitions. The limit parameter restricts the maximum number of partitions to schedule.
+// Uses optimistic concurrency with randomized ordering to reduce conflicts between multiple runners.
+func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, limit int) ([]*screamer.PartitionMetadata, error) {
 	log.Trace().
 		Time("min_watermark", minWatermark).
 		Str("runner_id", runnerID).
+		Int("limit", limit).
 		Msg("GetAndSchedulePartitions called")
 	var partitions []*screamer.PartitionMetadata
 
 	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		partitions = make([]*screamer.PartitionMetadata, 0)
-		mutations := make([]*spanner.Mutation, 0, len(partitions))
+		mutations := make([]*spanner.Mutation, 0)
 
+		// Use randomized ordering to reduce conflicts between runners
+		// No FOR UPDATE - optimistic concurrency handles conflicts via transaction retry
 		stmt := spanner.Statement{
-			SQL: fmt.Sprintf("SELECT * FROM %s WHERE State = @state AND StartTimestamp >= @minWatermark ORDER BY StartTimestamp ASC FOR UPDATE", s.tableName),
+			SQL: fmt.Sprintf(`
+				SELECT * FROM %s
+				WHERE State = @state
+				  AND StartTimestamp >= @minWatermark
+				ORDER BY FARM_FINGERPRINT(CAST(CURRENT_TIMESTAMP() AS STRING) || PartitionToken),
+				         StartTimestamp ASC
+				LIMIT @limit`, s.tableName),
 			Params: map[string]interface{}{
 				"state":        screamer.StateCreated,
 				"minWatermark": minWatermark,
+				"limit":        limit,
 			},
 		}
 
