@@ -1,6 +1,6 @@
 .PHONY: build
 build:
-	go build -o .bin/screamer main.go
+	go build -o .bin/screamer cmd/main.go
 
 .PHONY: test
 test:

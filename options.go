@@ -14,21 +14,23 @@ type Option interface {
 }
 
 type config struct {
-	startTimestamp         time.Time
-	endTimestamp           time.Time
-	heartbeatInterval      time.Duration
-	spannerRequestPriority spannerpb.RequestOptions_Priority
-	serializedConsumer     bool
-	logLevel               zerolog.Level
+	startTimestamp          time.Time
+	endTimestamp            time.Time
+	heartbeatInterval       time.Duration
+	spannerRequestPriority  spannerpb.RequestOptions_Priority
+	serializedConsumer      bool
+	logLevel                zerolog.Level
+	maxConcurrentPartitions int
 }
 
 type (
-	withStartTimestamp         time.Time
-	withEndTimestamp           time.Time
-	withLogLevel               zerolog.Level
-	withHeartbeatInterval      time.Duration
-	withSpannerRequestPriotiry spannerpb.RequestOptions_Priority
-	withSerializedConsumer     bool
+	withStartTimestamp          time.Time
+	withEndTimestamp            time.Time
+	withLogLevel                zerolog.Level
+	withHeartbeatInterval       time.Duration
+	withSpannerRequestPriotiry  spannerpb.RequestOptions_Priority
+	withSerializedConsumer      bool
+	withMaxConcurrentPartitions int
 )
 
 func (o withStartTimestamp) Apply(c *config) {
@@ -97,4 +99,16 @@ func (o withSerializedConsumer) Apply(c *config) {
 // Default is false (concurrent consumption is allowed if the Consumer is re-entrant safe).
 func WithSerializedConsumer(serialized bool) Option {
 	return withSerializedConsumer(serialized)
+}
+
+func (o withMaxConcurrentPartitions) Apply(c *config) {
+	c.maxConcurrentPartitions = int(o)
+}
+
+// WithMaxConcurrentPartitions sets the maximum number of partitions that can be processed concurrently by a single runner.
+// This helps prevent resource exhaustion when dealing with large numbers of partitions.
+// A value of 0 (default) means no limit, maintaining backward compatibility.
+// Recommended value: 100 for production workloads.
+func WithMaxConcurrentPartitions(max int) Option {
+	return withMaxConcurrentPartitions(max)
 }
