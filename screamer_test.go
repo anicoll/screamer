@@ -37,6 +37,7 @@ type IntegrationTestSuite struct {
 	client    *spanner.Client
 	dsn       string
 	proxy     *interceptor.QueueInterceptor
+	ddlMutex  sync.Mutex // Serialize DDL operations to avoid Spanner emulator conflicts
 }
 
 func TestIntegrationTestSuite(t *testing.T) {
@@ -111,6 +112,10 @@ func (c *testConsumer) getChanges() []json.RawMessage {
 }
 
 func (s *IntegrationTestSuite) createTableAndStream(ctx context.Context, name string) (string, string) {
+	// Serialize DDL operations to avoid conflicts with Spanner emulator
+	s.ddlMutex.Lock()
+	defer s.ddlMutex.Unlock()
+
 	adminClient, err := database.NewDatabaseAdminClient(ctx, option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(s.proxy.UnaryInterceptor)))
 	s.NoError(err)
 	defer adminClient.Close()
@@ -136,7 +141,13 @@ func (s *IntegrationTestSuite) createTableAndStream(ctx context.Context, name st
 
 func (s *IntegrationTestSuite) setupSpannerStorage(ctx context.Context, runnerID, tableName string) *partitionstorage.SpannerPartitionStorage {
 	storage := partitionstorage.NewSpanner(s.client, tableName)
-	s.NoError(storage.RunMigrations(ctx))
+
+	// Serialize DDL operations to avoid conflicts with Spanner emulator
+	s.ddlMutex.Lock()
+	err := storage.RunMigrations(ctx)
+	s.ddlMutex.Unlock()
+	s.NoError(err)
+
 	s.NoError(storage.RegisterRunner(ctx, runnerID))
 
 	// Keep runner alive
