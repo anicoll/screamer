@@ -21,11 +21,13 @@ type PartitionStorage interface {
 	// GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark, or nil if none exist.
 	GetUnfinishedMinWatermarkPartition(ctx context.Context) (*PartitionMetadata, error)
 	// GetInterruptedPartitions returns partitions that are scheduled or running but have lost their runner.
-	GetInterruptedPartitions(ctx context.Context, runnerID string) ([]*PartitionMetadata, error)
+	// The limit parameter restricts the maximum number of partitions to recover.
+	GetInterruptedPartitions(ctx context.Context, runnerID string, limit int) ([]*PartitionMetadata, error)
 	// InitializeRootPartition creates or updates the root partition metadata.
 	InitializeRootPartition(ctx context.Context, startTimestamp time.Time, endTimestamp time.Time, heartbeatInterval time.Duration) error
 	// GetAndSchedulePartitions finds partitions ready to be scheduled and assigns them to the given runnerID.
-	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string) ([]*PartitionMetadata, error)
+	// The limit parameter restricts the maximum number of partitions to schedule.
+	GetAndSchedulePartitions(ctx context.Context, minWatermark time.Time, runnerID string, limit int) ([]*PartitionMetadata, error)
 	// AddChildPartitions adds new child partitions for a parent partition based on a ChildPartitionsRecord.
 	AddChildPartitions(ctx context.Context, parentPartition *PartitionMetadata, childPartitionsRecord *ChildPartitionsRecord) error
 	// UpdateToRunning marks the given partition as running.
@@ -48,12 +50,15 @@ type Subscriber struct {
 	heartbeatInterval      time.Duration
 	spannerRequestPriority spannerpb.RequestOptions_Priority
 
-	partitionStorage   PartitionStorage
-	consumer           Consumer
-	eg                 *errgroup.Group
-	mu                 sync.Mutex
-	serializedConsumer bool
-	consumerMu         sync.Mutex
+	partitionStorage        PartitionStorage
+	consumer                Consumer
+	eg                      *errgroup.Group
+	mu                      sync.Mutex
+	serializedConsumer      bool
+	consumerMu              sync.Mutex
+	maxConcurrentPartitions int
+	activePartitions        map[string]struct{}
+	partitionCountMu        sync.RWMutex
 }
 
 var (
@@ -83,15 +88,17 @@ func NewSubscriber(
 	zerolog.SetGlobalLevel(c.logLevel)
 
 	return &Subscriber{
-		spannerClient:          client,
-		streamName:             streamName,
-		startTimestamp:         c.startTimestamp,
-		endTimestamp:           c.endTimestamp,
-		heartbeatInterval:      c.heartbeatInterval,
-		spannerRequestPriority: c.spannerRequestPriority,
-		partitionStorage:       partitionStorage,
-		runnerID:               runnerID,
-		serializedConsumer:     c.serializedConsumer,
+		spannerClient:           client,
+		streamName:              streamName,
+		startTimestamp:          c.startTimestamp,
+		endTimestamp:            c.endTimestamp,
+		heartbeatInterval:       c.heartbeatInterval,
+		spannerRequestPriority:  c.spannerRequestPriority,
+		partitionStorage:        partitionStorage,
+		runnerID:                runnerID,
+		serializedConsumer:      c.serializedConsumer,
+		maxConcurrentPartitions: c.maxConcurrentPartitions,
+		activePartitions:        make(map[string]struct{}),
 	}
 }
 
@@ -185,10 +192,27 @@ func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
 }
 
 func (s *Subscriber) processInterruptedPartitions(ctx context.Context) error {
-	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx, s.runnerID)
+	// Calculate available capacity for recovering partitions
+	availableSlots := s.getAvailablePartitionSlots()
+	if availableSlots <= 0 {
+		log.Trace().
+			Str("runner_id", s.runnerID).
+			Msg("at capacity, skipping interrupted partition recovery")
+		return nil
+	}
+
+	interruptedPartitions, err := s.partitionStorage.GetInterruptedPartitions(ctx, s.runnerID, availableSlots)
 	if err != nil {
 		return fmt.Errorf("failed to get interrupted partitions: %w", err)
 	}
+
+	if len(interruptedPartitions) > 0 {
+		log.Info().
+			Str("runner_id", s.runnerID).
+			Int("recovered_partitions", len(interruptedPartitions)).
+			Msg("recovering interrupted partitions")
+	}
+
 	for _, p := range interruptedPartitions {
 		p := p
 		s.eg.Go(func() error {
@@ -221,6 +245,18 @@ var errDone = errors.New("all partitions have been processed")
 
 func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 	log.Debug().Str("stream_name", s.streamName).Str("runner_id", s.runnerID).Msg("detecting new partitions")
+
+	// Calculate available capacity
+	availableSlots := s.getAvailablePartitionSlots()
+	if availableSlots <= 0 {
+		log.Trace().
+			Str("runner_id", s.runnerID).
+			Int("active_partitions", s.getRunningPartitionCount()).
+			Int("max_concurrent", s.maxConcurrentPartitions).
+			Msg("at capacity, skipping partition detection")
+		return nil
+	}
+
 	minWatermarkPartition, err := s.partitionStorage.GetUnfinishedMinWatermarkPartition(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get unfinished min watermark partition: %w", err)
@@ -230,13 +266,19 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 		return errDone
 	}
 
-	partitions, err := s.partitionStorage.GetAndSchedulePartitions(ctx, minWatermarkPartition.Watermark, s.runnerID)
+	partitions, err := s.partitionStorage.GetAndSchedulePartitions(ctx, minWatermarkPartition.Watermark, s.runnerID, availableSlots)
 	if err != nil {
 		return fmt.Errorf("failed to get schedulable partitions: %w", err)
 	}
 	if len(partitions) == 0 {
 		return nil
 	}
+
+	log.Info().
+		Str("runner_id", s.runnerID).
+		Int("scheduled_partitions", len(partitions)).
+		Int("available_slots", availableSlots).
+		Msg("scheduled new partitions")
 
 	for _, p := range partitions {
 		p := p
@@ -249,6 +291,9 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 }
 
 func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata) error {
+	s.markPartitionActive(p.PartitionToken)
+	defer s.markPartitionInactive(p.PartitionToken)
+
 	if err := s.partitionStorage.UpdateToRunning(ctx, p); err != nil {
 		return fmt.Errorf("failed to update to running: %w", err)
 	}
@@ -355,4 +400,42 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 	}
 
 	return nil
+}
+
+// markPartitionActive adds a partition to the active tracking set.
+func (s *Subscriber) markPartitionActive(token string) {
+	s.partitionCountMu.Lock()
+	defer s.partitionCountMu.Unlock()
+	s.activePartitions[token] = struct{}{}
+}
+
+// markPartitionInactive removes a partition from the active tracking set.
+func (s *Subscriber) markPartitionInactive(token string) {
+	s.partitionCountMu.Lock()
+	defer s.partitionCountMu.Unlock()
+	delete(s.activePartitions, token)
+}
+
+// getRunningPartitionCount returns the number of currently active partitions.
+func (s *Subscriber) getRunningPartitionCount() int {
+	s.partitionCountMu.RLock()
+	defer s.partitionCountMu.RUnlock()
+	return len(s.activePartitions)
+}
+
+// getAvailablePartitionSlots calculates how many partitions can be scheduled based on the current load.
+// Returns 0 if at capacity, or the number of available slots if under the limit.
+func (s *Subscriber) getAvailablePartitionSlots() int {
+	if s.maxConcurrentPartitions == 0 {
+		// No limit set, return a reasonable batch size
+		return 100
+	}
+
+	currentlyRunning := s.getRunningPartitionCount()
+	available := s.maxConcurrentPartitions - currentlyRunning
+
+	if available <= 0 {
+		return 0
+	}
+	return available
 }

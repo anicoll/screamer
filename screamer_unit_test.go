@@ -3,6 +3,7 @@ package screamer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -206,4 +207,138 @@ func callHandleMethod(t *testing.T, s *Subscriber, records []*ChangeRecord) erro
 	}
 
 	return nil
+}
+
+// TestPartitionTracking verifies partition tracking methods
+func TestPartitionTracking(t *testing.T) {
+	t.Run("MarkPartitionActive", func(t *testing.T) {
+		subscriber := &Subscriber{
+			activePartitions: make(map[string]struct{}),
+		}
+
+		subscriber.markPartitionActive("partition1")
+		require.Equal(t, 1, subscriber.getRunningPartitionCount())
+
+		subscriber.markPartitionActive("partition2")
+		require.Equal(t, 2, subscriber.getRunningPartitionCount())
+
+		// Adding same partition again should not increase count
+		subscriber.markPartitionActive("partition1")
+		require.Equal(t, 2, subscriber.getRunningPartitionCount())
+	})
+
+	t.Run("MarkPartitionInactive", func(t *testing.T) {
+		subscriber := &Subscriber{
+			activePartitions: make(map[string]struct{}),
+		}
+
+		subscriber.markPartitionActive("partition1")
+		subscriber.markPartitionActive("partition2")
+		require.Equal(t, 2, subscriber.getRunningPartitionCount())
+
+		subscriber.markPartitionInactive("partition1")
+		require.Equal(t, 1, subscriber.getRunningPartitionCount())
+
+		subscriber.markPartitionInactive("partition2")
+		require.Equal(t, 0, subscriber.getRunningPartitionCount())
+
+		// Removing non-existent partition should not error
+		subscriber.markPartitionInactive("partition3")
+		require.Equal(t, 0, subscriber.getRunningPartitionCount())
+	})
+
+	t.Run("ConcurrentPartitionTracking", func(t *testing.T) {
+		subscriber := &Subscriber{
+			activePartitions: make(map[string]struct{}),
+		}
+
+		var wg sync.WaitGroup
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				token := fmt.Sprintf("partition_%d", id)
+				subscriber.markPartitionActive(token)
+				time.Sleep(time.Millisecond)
+				subscriber.markPartitionInactive(token)
+			}(i)
+		}
+
+		wg.Wait()
+		require.Equal(t, 0, subscriber.getRunningPartitionCount())
+	})
+}
+
+// TestGetAvailablePartitionSlots verifies available slot calculation
+func TestGetAvailablePartitionSlots(t *testing.T) {
+	t.Run("NoLimit", func(t *testing.T) {
+		subscriber := &Subscriber{
+			maxConcurrentPartitions: 0, // No limit
+			activePartitions:        make(map[string]struct{}),
+		}
+
+		// Should return default batch size
+		slots := subscriber.getAvailablePartitionSlots()
+		require.Equal(t, 100, slots)
+
+		// Even with active partitions, should still return default
+		subscriber.markPartitionActive("p1")
+		subscriber.markPartitionActive("p2")
+		slots = subscriber.getAvailablePartitionSlots()
+		require.Equal(t, 100, slots)
+	})
+
+	t.Run("WithLimit", func(t *testing.T) {
+		subscriber := &Subscriber{
+			maxConcurrentPartitions: 50,
+			activePartitions:        make(map[string]struct{}),
+		}
+
+		// No active partitions
+		slots := subscriber.getAvailablePartitionSlots()
+		require.Equal(t, 50, slots)
+
+		// Add some active partitions
+		for i := 0; i < 20; i++ {
+			subscriber.markPartitionActive(fmt.Sprintf("partition_%d", i))
+		}
+		slots = subscriber.getAvailablePartitionSlots()
+		require.Equal(t, 30, slots)
+
+		// At capacity
+		for i := 0; i < 30; i++ {
+			subscriber.markPartitionActive(fmt.Sprintf("partition_cap_%d", i))
+		}
+		slots = subscriber.getAvailablePartitionSlots()
+		require.Equal(t, 0, slots)
+
+		// Over capacity
+		for i := 0; i < 10; i++ {
+			subscriber.markPartitionActive(fmt.Sprintf("partition_over_%d", i))
+		}
+		slots = subscriber.getAvailablePartitionSlots()
+		require.Equal(t, 0, slots)
+	})
+}
+
+// TestWithMaxConcurrentPartitions verifies the option constructor
+func TestWithMaxConcurrentPartitions(t *testing.T) {
+	tests := []struct {
+		name     string
+		limit    int
+		expected int
+	}{
+		{"zero limit", 0, 0},
+		{"small limit", 10, 10},
+		{"medium limit", 100, 100},
+		{"large limit", 1000, 1000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &config{}
+			WithMaxConcurrentPartitions(tt.limit).Apply(c)
+			require.Equal(t, tt.expected, c.maxConcurrentPartitions)
+		})
+	}
 }
