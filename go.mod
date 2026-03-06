@@ -13,7 +13,7 @@ require (
 	github.com/urfave/cli/v3 v3.7.0
 	golang.org/x/sync v0.19.0
 	google.golang.org/api v0.269.0
-	google.golang.org/grpc v1.79.1
+	google.golang.org/grpc v1.79.2
 )
 
 require (
