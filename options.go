@@ -21,6 +21,7 @@ type config struct {
 	serializedConsumer      bool
 	logLevel                zerolog.Level
 	maxConcurrentPartitions int
+	ackTimeout              time.Duration
 }
 
 type (
@@ -31,6 +32,7 @@ type (
 	withSpannerRequestPriotiry  spannerpb.RequestOptions_Priority
 	withSerializedConsumer      bool
 	withMaxConcurrentPartitions int
+	withAckTimeout              time.Duration
 )
 
 func (o withStartTimestamp) Apply(c *config) {
@@ -111,4 +113,17 @@ func (o withMaxConcurrentPartitions) Apply(c *config) {
 // Recommended value: 100 for production workloads.
 func WithMaxConcurrentPartitions(max int) Option {
 	return withMaxConcurrentPartitions(max)
+}
+
+func (o withAckTimeout) Apply(c *config) {
+	c.ackTimeout = time.Duration(o)
+}
+
+// WithAckTimeout sets the maximum duration the subscriber will wait for a consumer to
+// acknowledge each batch of records when using ConsumerWithAck.
+// If the timeout elapses before all acks in a batch are received, the subscriber returns
+// an error and stops processing that partition.
+// A value of 0 (default) disables the timeout — the subscriber waits indefinitely.
+func WithAckTimeout(d time.Duration) Option {
+	return withAckTimeout(d)
 }

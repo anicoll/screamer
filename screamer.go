@@ -55,11 +55,13 @@ type Subscriber struct {
 
 	partitionStorage        PartitionStorage
 	consumer                Consumer
+	consumerWithAck         ConsumerWithAck
 	eg                      *errgroup.Group
 	mu                      sync.Mutex
 	serializedConsumer      bool
 	consumerMu              sync.Mutex
 	maxConcurrentPartitions int
+	ackTimeout              time.Duration
 	activePartitions        map[string]struct{}
 	partitionCountMu        sync.RWMutex
 }
@@ -101,6 +103,7 @@ func NewSubscriber(
 		runnerID:                runnerID,
 		serializedConsumer:      c.serializedConsumer,
 		maxConcurrentPartitions: c.maxConcurrentPartitions,
+		ackTimeout:              c.ackTimeout,
 		activePartitions:        make(map[string]struct{}),
 	}
 }
@@ -108,9 +111,31 @@ func NewSubscriber(
 // Subscribe starts subscribing to the change stream and processing records using the provided Consumer.
 // This method blocks until all partitions are processed or the context is canceled.
 func (s *Subscriber) Subscribe(ctx context.Context, consumer Consumer) error {
+	s.consumer = consumer
+	return s.subscribe(ctx)
+}
+
+// SubscribeWithAck starts subscribing to the change stream using a ConsumerWithAck.
+// Each record is delivered with an AckFunc that the consumer must call exactly once.
+// The subscriber will not advance to the next batch until all acks for the current batch are received.
+// This method blocks until all partitions are processed or the context is canceled.
+func (s *Subscriber) SubscribeWithAck(ctx context.Context, consumer ConsumerWithAck) error {
+	s.consumerWithAck = consumer
+	return s.subscribe(ctx)
+}
+
+// SubscribeFuncWithAck is an adapter to allow the use of ordinary functions as ConsumerWithAck.
+func (s *Subscriber) SubscribeFuncWithAck(ctx context.Context, f ConsumerFuncWithAck) error {
+	return s.SubscribeWithAck(ctx, f)
+}
+
+func (s *Subscriber) subscribe(ctx context.Context) error {
+	if s.consumer != nil && s.consumerWithAck != nil {
+		return fmt.Errorf("screamer: Consumer and ConsumerWithAck are mutually exclusive; use Subscribe or SubscribeWithAck, not both")
+	}
+
 	log.Debug().Msg("Starting subscription to change stream")
 	ctx = s.initErrGroup(ctx)
-	s.consumer = consumer
 
 	s.eg.Go(func() error {
 		ticker := time.NewTicker(time.Second * 2)
@@ -378,46 +403,95 @@ func (w *watermarker) get() time.Time {
 }
 
 func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records []*ChangeRecord) error {
-	var watermarker watermarker
+	var wm watermarker
+
+	// In ack mode, pre-count records so we know exactly how many acks to wait for.
+	var ackCh chan error
+	if s.consumerWithAck != nil {
+		n := 0
+		for _, cr := range records {
+			n += len(cr.DataChangeRecords)
+		}
+		ackCh = make(chan error, n)
+	}
+
 	for _, cr := range records {
 		log.Trace().
 			Str("partition_token", p.PartitionToken).
 			Int("data_change_records", len(cr.DataChangeRecords)).
 			Msg("processing change record")
 		for _, record := range cr.DataChangeRecords {
-			watermarker.set(record.CommitTimestamp)
-			out, err := json.Marshal(record.DecodeToNonSpannerType(p, watermarker.get()))
+			wm.set(record.CommitTimestamp)
+			out, err := json.Marshal(record.DecodeToNonSpannerType(p, wm.get()))
 			if err != nil {
 				return err
 			}
-			if s.serializedConsumer {
-				s.consumerMu.Lock()
-				defer s.consumerMu.Unlock()
-				if err = s.consumer.Consume(out); err != nil {
-					return err
-				}
-			} else {
-				if err := s.consumer.Consume(out); err != nil {
-					return err
-				}
+			if err := s.dispatchRecord(out, ackCh); err != nil {
+				return err
 			}
 		}
 		for _, record := range cr.HeartbeatRecords {
-			watermarker.set(record.Timestamp)
+			wm.set(record.Timestamp)
 		}
 		for _, record := range cr.ChildPartitionsRecords {
 			if err := s.partitionStorage.AddChildPartitions(ctx, p, record); err != nil {
 				return fmt.Errorf("failed to add child partitions: %w", err)
 			}
-			watermarker.set(record.StartTimestamp)
+			wm.set(record.StartTimestamp)
 		}
 	}
 
-	if err := s.partitionStorage.UpdateWatermark(ctx, p, watermarker.get()); err != nil {
+	// In ack mode: block until every record in this batch has been acked or nacked
+	// before advancing the watermark. This is the batch gate.
+	if ackCh != nil {
+		var timeoutCh <-chan time.Time
+		if s.ackTimeout > 0 {
+			timer := time.NewTimer(s.ackTimeout)
+			defer timer.Stop()
+			timeoutCh = timer.C
+		}
+		for i := 0; i < cap(ackCh); i++ {
+			select {
+			case err := <-ackCh:
+				if err != nil {
+					return fmt.Errorf("consumer nacked record: %w", err)
+				}
+			case <-timeoutCh:
+				return fmt.Errorf("ack timeout: consumer did not acknowledge all records within %s", s.ackTimeout)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	if err := s.partitionStorage.UpdateWatermark(ctx, p, wm.get()); err != nil {
 		return fmt.Errorf("failed to update watermark: %w", err)
 	}
 
 	return nil
+}
+
+// dispatchRecord delivers a serialized DataChangeRecord to whichever consumer is configured.
+// In ack mode, ackCh receives the result of the consumer's AckFunc call.
+func (s *Subscriber) dispatchRecord(out []byte, ackCh chan error) error {
+	if s.consumerWithAck != nil {
+		ack := AckFunc(func(err error) { ackCh <- err })
+		if s.serializedConsumer {
+			s.consumerMu.Lock()
+			err := s.consumerWithAck.Consume(out, ack)
+			s.consumerMu.Unlock()
+			return err
+		}
+		return s.consumerWithAck.Consume(out, ack)
+	}
+
+	if s.serializedConsumer {
+		s.consumerMu.Lock()
+		err := s.consumer.Consume(out)
+		s.consumerMu.Unlock()
+		return err
+	}
+	return s.consumer.Consume(out)
 }
 
 // markPartitionActive adds a partition to the active tracking set.

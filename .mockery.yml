@@ -1,12 +1,12 @@
 all: false
-dir: "{{.InterfaceDir}}/mocks"
-filename: "{{.InterfaceName}}.go"
+dir: "{{.InterfaceDir}}"
+filename: "{{.InterfaceName}}_test.go"
 force-file-write: true
 formatter: goimports
 include-auto-generated: false
 log-level: info
 structname: "{{.Mock}}{{.InterfaceName}}"
-pkgname: "mocks"
+# pkgname: "mocks"
 recursive: false
 require-template-schema-exists: true
 template: testify
@@ -15,4 +15,5 @@ packages:
   github.com/anicoll/screamer:
     interfaces:
       Consumer: {}
+      ConsumerWithAck: {}
       Gauge: {}
