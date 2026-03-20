@@ -14,21 +14,25 @@ type Option interface {
 }
 
 type config struct {
-	startTimestamp         time.Time
-	endTimestamp           time.Time
-	heartbeatInterval      time.Duration
-	spannerRequestPriority spannerpb.RequestOptions_Priority
-	serializedConsumer     bool
-	logLevel               zerolog.Level
+	startTimestamp          time.Time
+	endTimestamp            time.Time
+	heartbeatInterval       time.Duration
+	spannerRequestPriority  spannerpb.RequestOptions_Priority
+	serializedConsumer      bool
+	logLevel                zerolog.Level
+	maxConcurrentPartitions int
+	ackTimeout              time.Duration
 }
 
 type (
-	withStartTimestamp         time.Time
-	withEndTimestamp           time.Time
-	withLogLevel               zerolog.Level
-	withHeartbeatInterval      time.Duration
-	withSpannerRequestPriotiry spannerpb.RequestOptions_Priority
-	withSerializedConsumer     bool
+	withStartTimestamp          time.Time
+	withEndTimestamp            time.Time
+	withLogLevel                zerolog.Level
+	withHeartbeatInterval       time.Duration
+	withSpannerRequestPriotiry  spannerpb.RequestOptions_Priority
+	withSerializedConsumer      bool
+	withMaxConcurrentPartitions int
+	withAckTimeout              time.Duration
 )
 
 func (o withStartTimestamp) Apply(c *config) {
@@ -97,4 +101,29 @@ func (o withSerializedConsumer) Apply(c *config) {
 // Default is false (concurrent consumption is allowed if the Consumer is re-entrant safe).
 func WithSerializedConsumer(serialized bool) Option {
 	return withSerializedConsumer(serialized)
+}
+
+func (o withMaxConcurrentPartitions) Apply(c *config) {
+	c.maxConcurrentPartitions = int(o)
+}
+
+// WithMaxConcurrentPartitions sets the maximum number of partitions that can be processed concurrently by a single runner.
+// This helps prevent resource exhaustion when dealing with large numbers of partitions.
+// A value of 0 (default) means no limit, maintaining backward compatibility.
+// Recommended value: 100 for production workloads.
+func WithMaxConcurrentPartitions(max int) Option {
+	return withMaxConcurrentPartitions(max)
+}
+
+func (o withAckTimeout) Apply(c *config) {
+	c.ackTimeout = time.Duration(o)
+}
+
+// WithAckTimeout sets the maximum duration the subscriber will wait for a consumer to
+// acknowledge each batch of records when using ConsumerWithAck.
+// If the timeout elapses before all acks in a batch are received, the subscriber returns
+// an error and stops processing that partition.
+// A value of 0 (default) disables the timeout — the subscriber waits indefinitely.
+func WithAckTimeout(d time.Duration) Option {
+	return withAckTimeout(d)
 }
