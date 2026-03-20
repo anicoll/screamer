@@ -10,7 +10,6 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/anicoll/screamer/mocks"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/require"
@@ -260,7 +259,7 @@ func TestMetricsLoggingInterval(t *testing.T) {
 			endTimestamp:            time.Now().Add(24 * time.Hour),
 			heartbeatInterval:       3 * time.Second,
 			partitionStorage:        storage,
-			consumer:                mocks.NewMockConsumer(t),
+			consumer:                NewMockConsumer(t),
 			maxConcurrentPartitions: 100,
 			activePartitions:        make(map[string]struct{}),
 		}
@@ -291,6 +290,307 @@ func TestMetricsLoggingInterval(t *testing.T) {
 		// Cancel and wait for goroutine to finish before defer runs
 		cancel()
 		<-done
+	})
+}
+
+func makePartitionAndRecords(commitTime time.Time) (*PartitionMetadata, []*ChangeRecord) {
+	p := &PartitionMetadata{
+		PartitionToken: "test-token",
+		StartTimestamp: commitTime.Add(-time.Second),
+		Watermark:      commitTime.Add(-time.Second),
+		CreatedAt:      commitTime.Add(-time.Second),
+	}
+	records := []*ChangeRecord{
+		{
+			DataChangeRecords: []*dataChangeRecord{
+				{
+					CommitTimestamp: commitTime,
+					TableName:       "TestTable",
+					ModType:         "INSERT",
+				},
+			},
+		},
+	}
+	return p, records
+}
+
+func TestSubscribeMutualExclusion(t *testing.T) {
+	s := &Subscriber{
+		partitionStorage: &mockPartitionStorage{partitions: make(map[string]*PartitionMetadata)},
+		activePartitions: make(map[string]struct{}),
+		consumer:         ConsumerFunc(func([]byte) error { return nil }),
+		consumerWithAck:  ConsumerFuncWithAck(func([]byte, AckFunc) error { return nil }),
+	}
+	err := s.subscribe(context.Background())
+	require.ErrorContains(t, err, "mutually exclusive")
+}
+
+func TestHandleWithAck(t *testing.T) {
+	t.Run("ack_advances_watermark", func(t *testing.T) {
+		storage := &mockPartitionStorage{partitions: make(map[string]*PartitionMetadata)}
+		commitTime := time.Now().Truncate(time.Millisecond)
+		p, records := makePartitionAndRecords(commitTime)
+		storage.partitions[p.PartitionToken] = p
+
+		s := &Subscriber{
+			partitionStorage: storage,
+			activePartitions: make(map[string]struct{}),
+		}
+		s.consumerWithAck = ConsumerFuncWithAck(func(change []byte, ack AckFunc) error {
+			go ack(nil) // ack asynchronously
+			return nil
+		})
+
+		err := s.handle(context.Background(), p, records)
+		require.NoError(t, err)
+		require.Equal(t, commitTime, storage.partitions[p.PartitionToken].Watermark)
+	})
+
+	t.Run("nack_returns_error", func(t *testing.T) {
+		storage := &mockPartitionStorage{partitions: make(map[string]*PartitionMetadata)}
+		commitTime := time.Now().Truncate(time.Millisecond)
+		p, records := makePartitionAndRecords(commitTime)
+		storage.partitions[p.PartitionToken] = p
+
+		s := &Subscriber{
+			partitionStorage: storage,
+			activePartitions: make(map[string]struct{}),
+		}
+		nackErr := fmt.Errorf("processing failed")
+		s.consumerWithAck = ConsumerFuncWithAck(func(change []byte, ack AckFunc) error {
+			go ack(nackErr)
+			return nil
+		})
+
+		err := s.handle(context.Background(), p, records)
+		require.ErrorContains(t, err, "consumer nacked record")
+		require.ErrorContains(t, err, "processing failed")
+	})
+
+	t.Run("consume_error_stops_immediately", func(t *testing.T) {
+		storage := &mockPartitionStorage{partitions: make(map[string]*PartitionMetadata)}
+		commitTime := time.Now().Truncate(time.Millisecond)
+		p, records := makePartitionAndRecords(commitTime)
+		storage.partitions[p.PartitionToken] = p
+
+		s := &Subscriber{
+			partitionStorage: storage,
+			activePartitions: make(map[string]struct{}),
+		}
+		consumeErr := fmt.Errorf("consume failed immediately")
+		s.consumerWithAck = ConsumerFuncWithAck(func(change []byte, ack AckFunc) error {
+			return consumeErr
+		})
+
+		err := s.handle(context.Background(), p, records)
+		require.ErrorIs(t, err, consumeErr)
+	})
+
+	t.Run("batch_gate_waits_for_all_acks", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			storage := &mockPartitionStorage{partitions: make(map[string]*PartitionMetadata)}
+			commitTime := time.Now().Truncate(time.Millisecond)
+			p := &PartitionMetadata{
+				PartitionToken: "test-token",
+				StartTimestamp: commitTime.Add(-time.Second),
+				Watermark:      commitTime.Add(-time.Second),
+				CreatedAt:      commitTime.Add(-time.Second),
+			}
+			// Three records in one batch
+			records := []*ChangeRecord{
+				{
+					DataChangeRecords: []*dataChangeRecord{
+						{CommitTimestamp: commitTime, TableName: "T", ModType: "INSERT"},
+						{CommitTimestamp: commitTime.Add(time.Millisecond), TableName: "T", ModType: "UPDATE"},
+						{CommitTimestamp: commitTime.Add(2 * time.Millisecond), TableName: "T", ModType: "DELETE"},
+					},
+				},
+			}
+			storage.partitions[p.PartitionToken] = p
+
+			var acks []AckFunc
+			var mu sync.Mutex
+			s := &Subscriber{
+				partitionStorage: storage,
+				activePartitions: make(map[string]struct{}),
+			}
+			s.consumerWithAck = ConsumerFuncWithAck(func(change []byte, ack AckFunc) error {
+				mu.Lock()
+				acks = append(acks, ack)
+				mu.Unlock()
+				return nil
+			})
+
+			done := make(chan error, 1)
+			go func() { done <- s.handle(context.Background(), p, records) }()
+
+			// Wait until handle is blocked on the ack select.
+			synctest.Wait()
+			select {
+			case <-done:
+				t.Fatal("handle returned before all acks were called")
+			default:
+			}
+
+			require.Len(t, acks, 3)
+
+			acks[0](nil)
+			acks[1](nil)
+
+			// Wait until handle processes those two acks and blocks again on the third.
+			synctest.Wait()
+			select {
+			case <-done:
+				t.Fatal("handle returned before last ack was called")
+			default:
+			}
+
+			acks[2](nil)
+			require.NoError(t, <-done)
+		})
+	})
+
+	t.Run("context_cancellation_unblocks", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			storage := &mockPartitionStorage{partitions: make(map[string]*PartitionMetadata)}
+			commitTime := time.Now().Truncate(time.Millisecond)
+			p, records := makePartitionAndRecords(commitTime)
+			storage.partitions[p.PartitionToken] = p
+
+			s := &Subscriber{
+				partitionStorage: storage,
+				activePartitions: make(map[string]struct{}),
+			}
+			// Consume never calls ack.
+			s.consumerWithAck = ConsumerFuncWithAck(func(change []byte, ack AckFunc) error {
+				return nil
+			})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- s.handle(ctx, p, records) }()
+
+			// Wait until handle is blocked in the ack select, then cancel.
+			synctest.Wait()
+			cancel()
+
+			err := <-done
+			require.ErrorIs(t, err, context.Canceled)
+		})
+	})
+
+	t.Run("watermark_not_updated_before_all_acks", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			storage := &mockPartitionStorage{partitions: make(map[string]*PartitionMetadata)}
+			commitTime := time.Now().Truncate(time.Millisecond)
+			p, records := makePartitionAndRecords(commitTime)
+			initialWatermark := p.Watermark
+			storage.partitions[p.PartitionToken] = p
+
+			ackReady := make(chan AckFunc, 1)
+			s := &Subscriber{
+				partitionStorage: storage,
+				activePartitions: make(map[string]struct{}),
+			}
+			s.consumerWithAck = ConsumerFuncWithAck(func(change []byte, ack AckFunc) error {
+				ackReady <- ack
+				return nil
+			})
+
+			done := make(chan error, 1)
+			go func() { done <- s.handle(context.Background(), p, records) }()
+
+			// Receive the ack callback, then wait until handle is blocked in the ack select.
+			ack := <-ackReady
+			synctest.Wait()
+
+			// Watermark must not have advanced yet.
+			storage.mu.Lock()
+			watermarkBeforeAck := storage.partitions[p.PartitionToken].Watermark
+			storage.mu.Unlock()
+			require.Equal(t, initialWatermark, watermarkBeforeAck, "watermark must not be updated before ack is called")
+
+			// Now ack — handle should complete and update the watermark.
+			ack(nil)
+			require.NoError(t, <-done)
+
+			storage.mu.Lock()
+			watermarkAfterAck := storage.partitions[p.PartitionToken].Watermark
+			storage.mu.Unlock()
+			require.Equal(t, commitTime, watermarkAfterAck, "watermark must equal commit time after ack")
+		})
+	})
+
+	t.Run("ack_timeout_returns_error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			storage := &mockPartitionStorage{partitions: make(map[string]*PartitionMetadata)}
+			commitTime := time.Now().Truncate(time.Millisecond)
+			p, records := makePartitionAndRecords(commitTime)
+			storage.partitions[p.PartitionToken] = p
+
+			const ackTimeout = 5 * time.Second
+			s := &Subscriber{
+				partitionStorage: storage,
+				activePartitions: make(map[string]struct{}),
+				ackTimeout:       ackTimeout,
+			}
+			// Consume never calls ack — timeout should fire.
+			s.consumerWithAck = ConsumerFuncWithAck(func(change []byte, ack AckFunc) error {
+				return nil
+			})
+
+			done := make(chan error, 1)
+			go func() { done <- s.handle(context.Background(), p, records) }()
+
+			// Advance fake time past the ack timeout. Once the handle goroutine is blocked
+			// in its select (timer + ackCh + ctx.Done), all goroutines are idle and the
+			// fake clock advances, firing the timer.
+			time.Sleep(ackTimeout + time.Millisecond)
+
+			err := <-done
+			require.ErrorContains(t, err, "ack timeout")
+		})
+	})
+
+	t.Run("serialized_consumer_serializes_consume_calls", func(t *testing.T) {
+		storage := &mockPartitionStorage{partitions: make(map[string]*PartitionMetadata)}
+		commitTime := time.Now().Truncate(time.Millisecond)
+		p := &PartitionMetadata{
+			PartitionToken: "test-token",
+			StartTimestamp: commitTime.Add(-time.Second),
+			Watermark:      commitTime.Add(-time.Second),
+			CreatedAt:      commitTime.Add(-time.Second),
+		}
+		records := []*ChangeRecord{
+			{
+				DataChangeRecords: []*dataChangeRecord{
+					{CommitTimestamp: commitTime, TableName: "T", ModType: "INSERT"},
+					{CommitTimestamp: commitTime.Add(time.Millisecond), TableName: "T", ModType: "UPDATE"},
+				},
+			},
+		}
+		storage.partitions[p.PartitionToken] = p
+
+		callOrder := make([]int, 0, 2)
+		var orderMu sync.Mutex
+		s := &Subscriber{
+			partitionStorage:   storage,
+			activePartitions:   make(map[string]struct{}),
+			serializedConsumer: true,
+		}
+		i := 0
+		s.consumerWithAck = ConsumerFuncWithAck(func(change []byte, ack AckFunc) error {
+			orderMu.Lock()
+			callOrder = append(callOrder, i)
+			i++
+			orderMu.Unlock()
+			go ack(nil)
+			return nil
+		})
+
+		err := s.handle(context.Background(), p, records)
+		require.NoError(t, err)
+		require.Equal(t, []int{0, 1}, callOrder)
 	})
 }
 
