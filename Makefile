@@ -8,4 +8,4 @@ test:
 
 # Assumes v3.5.0 mockery installed.
 gen-mocks:
-	mockery
+	mockery 
