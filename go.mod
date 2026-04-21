@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	cloud.google.com/go/spanner v1.90.0
 	github.com/google/uuid v1.6.0
-	github.com/rs/zerolog v1.35.0
+	github.com/rs/zerolog v1.35.1
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/urfave/cli/v3 v3.8.0
