@@ -3,7 +3,7 @@ module github.com/anicoll/screamer
 go 1.25.0
 
 require (
-	cloud.google.com/go/spanner v1.90.0
+	cloud.google.com/go/spanner v1.91.0
 	github.com/google/uuid v1.6.0
 	github.com/rs/zerolog v1.35.1
 	github.com/stretchr/testify v1.11.1
