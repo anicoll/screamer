@@ -10,7 +10,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/urfave/cli/v3 v3.10.1
 	golang.org/x/sync v0.21.0
-	google.golang.org/api v0.286.0
+	google.golang.org/api v0.287.0
 	google.golang.org/grpc v1.82.0
 )
 
@@ -50,7 +50,7 @@ require (
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
-	github.com/googleapis/enterprise-certificate-proxy v0.3.16 // indirect
+	github.com/googleapis/enterprise-certificate-proxy v0.3.17 // indirect
 	github.com/googleapis/gax-go/v2 v2.22.0 // indirect
 	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/lufia/plan9stats v0.0.0-20250317134145-8bc96cf8fc35 // indirect
@@ -96,7 +96,7 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260610212136-7ab31c22f7ad // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260622175928-b703f567277d // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
