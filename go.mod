@@ -6,7 +6,7 @@ require (
 	cloud.google.com/go/spanner v1.94.0
 	github.com/google/uuid v1.6.0
 	github.com/rs/zerolog v1.35.1
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/urfave/cli/v3 v3.11.0
 	golang.org/x/sync v0.22.0
