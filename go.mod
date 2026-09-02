@@ -1,6 +1,6 @@
 module github.com/anicoll/screamer
 
-go 1.25.8
+go 1.26.0
 
 require (
 	cloud.google.com/go/spanner v1.95.0
@@ -10,7 +10,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/urfave/cli/v3 v3.11.0
 	golang.org/x/sync v0.22.0
-	google.golang.org/api v0.296.0
+	google.golang.org/api v0.297.0
 	google.golang.org/grpc v1.83.2
 )
 
