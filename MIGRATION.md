@@ -1,5 +1,11 @@
 # Migration guide
 
+## Faster record decoding and encoding
+
+Change records are now decoded without reflection, and the JSON delivered to consumers is written directly. That's about 11x less CPU and 7x less garbage per record (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)). Nothing to change in your code.
+
+One visible difference: inside `mods[].keys`, `mods[].new_values` and `mods[].old_values`, object keys now keep the order Spanner sent them in, and strings keep Spanner's escaping. Before, `encoding/json` sorted keys alphabetically and escaped `<`, `>` and `&` as `\u003c` and friends. The JSON values are the same, so a consumer that parses the JSON is unaffected. One that compares the raw bytes of a mod with an earlier delivery will see a difference. Everything outside the mods is byte-for-byte the same as before.
+
 ## Parent gating and batched checkpoints
 
 ### What changed

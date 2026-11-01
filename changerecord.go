@@ -1,6 +1,7 @@
 package screamer
 
 import (
+	"encoding/json"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -39,6 +40,10 @@ type RawColumnType struct {
 	Type            spanner.NullJSON `spanner:"type" json:"type"`
 	IsPrimaryKey    bool             `spanner:"is_primary_key" json:"is_primary_key"`
 	OrdinalPosition int64            `spanner:"ordinal_position" json:"ordinal_position"`
+
+	// typeJSON is Type as the JSON text Spanner sent, set by the built-in
+	// reader instead of Type so the record is never unmarshalled.
+	typeJSON string
 }
 
 // RawMod is one modified row of a RawDataChangeRecord.
@@ -46,6 +51,17 @@ type RawMod struct {
 	Keys      spanner.NullJSON `spanner:"keys" json:"keys"`
 	NewValues spanner.NullJSON `spanner:"new_values" json:"new_values"`
 	OldValues spanner.NullJSON `spanner:"old_values" json:"old_values"`
+
+	// The JSON text Spanner sent, set by the built-in reader instead of the
+	// NullJSON fields. It is copied into the output as is, which saves
+	// unmarshalling and re-marshalling every row.
+	keysJSON, newValuesJSON, oldValuesJSON rawJSON
+}
+
+// rawJSON is a JSON value as Spanner sent it. A zero rawJSON means SQL NULL.
+type rawJSON struct {
+	text  string
+	valid bool
 }
 
 // DataChangeRecord is the change set of the table.
@@ -136,11 +152,11 @@ type ChildPartition struct {
 }
 
 func (r *RawDataChangeRecord) DecodeToNonSpannerType(p *PartitionMetadata, watermark time.Time) *DataChangeRecordWithPartitionMeta {
-	columnTypes := []*ColumnType{}
+	columnTypes := make([]*ColumnType, 0, len(r.ColumnTypes))
 	for _, t := range r.ColumnTypes {
 		columnTypes = append(columnTypes, &ColumnType{
 			Name:            t.Name,
-			Type:            decodeColumnTypeJSONToType(t.Type),
+			Type:            t.decodedType(),
 			IsPrimaryKey:    t.IsPrimaryKey,
 			OrdinalPosition: t.OrdinalPosition,
 		})
@@ -149,9 +165,9 @@ func (r *RawDataChangeRecord) DecodeToNonSpannerType(p *PartitionMetadata, water
 	mods := make([]*Mod, 0, len(r.Mods))
 	for _, m := range r.Mods {
 		mods = append(mods, &Mod{
-			Keys:      decodeNullJSONToMap(m.Keys),
-			NewValues: decodeNullJSONToMap(m.NewValues),
-			OldValues: decodeNullJSONToMap(m.OldValues),
+			Keys:      modMap(m.Keys, m.keysJSON),
+			NewValues: modMap(m.NewValues, m.newValuesJSON),
+			OldValues: modMap(m.OldValues, m.oldValuesJSON),
 		})
 	}
 
@@ -181,23 +197,45 @@ func (r *RawDataChangeRecord) DecodeToNonSpannerType(p *PartitionMetadata, water
 }
 
 func decodeColumnTypeJSONToType(columnType spanner.NullJSON) Type {
-	m := columnType.Value.(map[string]interface{})
-	code := TypeCode(m["code"].(string))
+	m, _ := columnType.Value.(map[string]interface{})
+	code, _ := m["code"].(string)
 
 	if aet, ok := m["array_element_type"].(map[string]interface{}); ok {
-		arrayElementType := TypeCode(aet["code"].(string))
+		arrayElementType, _ := aet["code"].(string)
 		return Type{
-			Code:             code,
-			ArrayElementType: arrayElementType,
+			Code:             TypeCode(code),
+			ArrayElementType: TypeCode(arrayElementType),
 		}
 	}
 
-	return Type{Code: code}
+	return Type{Code: TypeCode(code)}
 }
 
+// decodedType returns the column's Type, from whichever form the reader filled in.
+func (t *RawColumnType) decodedType() Type {
+	if t.typeJSON != "" {
+		return columnTypes.get(t.typeJSON).typ
+	}
+	return decodeColumnTypeJSONToType(t.Type)
+}
+
+// decodeNullJSONToMap returns the JSON object in j, or nil if j is NULL or not an object.
 func decodeNullJSONToMap(j spanner.NullJSON) map[string]interface{} {
 	if j.IsNull() {
 		return nil
 	}
-	return j.Value.(map[string]interface{})
+	m, _ := j.Value.(map[string]interface{})
+	return m
+}
+
+// modMap returns a mod's keys or values as a map, from whichever form the reader filled in.
+func modMap(j spanner.NullJSON, raw rawJSON) map[string]interface{} {
+	if !raw.valid {
+		return decodeNullJSONToMap(j)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw.text), &m); err != nil {
+		return nil
+	}
+	return m
 }

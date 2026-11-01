@@ -28,20 +28,22 @@ func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx contex
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	partitions := []*screamer.PartitionMetadata{}
+	// A single pass: this runs every second, and sorting every partition to find
+	// the minimum cost O(n log n) time and an O(n) allocation each time.
+	var min *screamer.PartitionMetadata
 	for _, p := range s.m {
-		if p.State != screamer.StateFinished {
-			partitions = append(partitions, p)
+		if p.State == screamer.StateFinished {
+			continue
+		}
+		if min == nil || p.Watermark.Before(min.Watermark) || (p.Watermark.Equal(min.Watermark) && p.PartitionToken < min.PartitionToken) {
+			min = p
 		}
 	}
-
-	if len(partitions) == 0 {
+	if min == nil {
 		return nil, nil
 	}
-
-	sort.Slice(partitions, func(i, j int) bool { return partitions[i].Watermark.Before(partitions[j].Watermark) })
 	// Return a copy: the stored partition keeps changing under s.mu while the caller reads it.
-	c := *partitions[0]
+	c := *min
 	return &c, nil
 }
 
