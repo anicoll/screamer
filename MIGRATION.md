@@ -1,5 +1,27 @@
 # Migration guide
 
+## Fair share across runners
+
+### What changed
+
+Runners now even out the streaming partitions between them (see [Fair share across runners](README.md#fair-share-across-runners)). A runner that holds more than `ceil(partitions / runners × 1.1)` hands its quietest partitions to other runners, a few at a time. Before, the first runner kept everything it claimed. `WithFairShare(false)` or `--fair-share=false` keeps that behaviour.
+
+`screamer.runners.desired` now counts a parked partition as a fraction of a query slot, so it asks for fewer runners on a mostly idle stream.
+
+`GetActiveRunnerCount` on the Spanner storage now counts only runners of the same metadata table. The `Runner` table is shared by every stream in the database, so before this change `screamer.runners.live` counted runners of every stream.
+
+### Do I need to do anything?
+
+**If you use `partitionstorage.NewSpanner`**, the `Runner` table needs a `MetadataTable` column. `RunMigrations` adds it; otherwise apply:
+
+```sql
+ALTER TABLE Runner ADD COLUMN MetadataTable STRING(MAX);
+```
+
+Runners from before this release don't set it, so they aren't counted while both versions run.
+
+**If you have your own `PartitionStorage`**, implement `screamer.PartitionStateCounter` (`CountPartitionsByState`) to get fair share and the parking-aware desired runners, and honour `ClaimRequest.Exclude` in `ClaimPartitions`. Without `PartitionStateCounter`, fair share is off and desired runners counts every unfinished partition as before. `GetActiveRunnerCount` should count only runners that use the same storage.
+
 ## Parking idle partitions
 
 ### What changed

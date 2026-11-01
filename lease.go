@@ -73,6 +73,9 @@ type ClaimRequest struct {
 	// Parked also claims PARKED partitions whose NextReadAt has passed (see
 	// PartitionParker). Their state stays PARKED until UpdateToRunning.
 	Parked bool
+	// Exclude lists partitions not to claim: ones this runner just handed to
+	// other runners to even out the load (see WithFairShare).
+	Exclude []string
 }
 
 // Lease identifies a lease held by a runner, with the watermark to write when
@@ -98,8 +101,10 @@ var errLeaseLost = errors.New("partition lease lost to another runner")
 
 // heldLease is a lease this runner holds on a partition it is reading.
 type heldLease struct {
-	epoch  int64
-	cancel context.CancelCauseFunc
+	epoch       int64
+	cancel      context.CancelCauseFunc
+	lastData    time.Time // when the partition last delivered data, or was claimed
+	handingOver bool      // being handed to another runner (see rebalance)
 }
 
 // leaseSet tracks the leases this runner holds.
@@ -118,7 +123,7 @@ func newLeaseSet() *leaseSet {
 func (l *leaseSet) add(token string, epoch int64, cancel context.CancelCauseFunc) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.held[token] = heldLease{epoch: epoch, cancel: cancel}
+	l.held[token] = heldLease{epoch: epoch, cancel: cancel, lastData: time.Now()}
 }
 
 func (l *leaseSet) remove(token string) {
@@ -206,6 +211,7 @@ func (s *Subscriber) claimPartitions(ctx context.Context, minWatermark time.Time
 		ParentGating: s.parentGating,
 		MinWatermark: minWatermark,
 		Parked:       s.parker != nil,
+		Exclude:      s.fair.recentlyHandedOver(),
 	})
 	if err != nil {
 		return nil, err

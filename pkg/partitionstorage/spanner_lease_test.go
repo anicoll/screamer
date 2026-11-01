@@ -279,3 +279,60 @@ func (s *SpannerTestSuite) TestParkPartition() {
 	s.False(held)
 	s.Equal(screamer.StateRunning, s.getPartitionState(ctx, storage, "p1"))
 }
+
+func (s *SpannerTestSuite) TestCountPartitionsByState() {
+	ctx := context.Background()
+	storage, cleanup := s.setupStorage(ctx, "CountByState")
+	defer cleanup()
+
+	now := time.Now()
+	s.insertPartitions(ctx, storage, map[string]screamer.State{
+		"c1": screamer.StateCreated, "c2": screamer.StateCreated,
+		"r1": screamer.StateRunning,
+		"p1": screamer.StateParked, "p2": screamer.StateParked, "p3": screamer.StateParked,
+		"f1": screamer.StateFinished,
+	}, now)
+
+	counts, err := storage.CountPartitionsByState(ctx)
+	s.Require().NoError(err)
+	s.Equal(map[screamer.State]int{screamer.StateCreated: 2, screamer.StateRunning: 1, screamer.StateParked: 3}, counts)
+}
+
+// Partitions a runner just handed over are left for other runners.
+func (s *SpannerTestSuite) TestClaimPartitionsExclude() {
+	ctx := context.Background()
+	storage, cleanup := s.setupStorage(ctx, "ClaimExclude")
+	defer cleanup()
+
+	start := time.Now().Add(-time.Hour).Truncate(time.Microsecond).UTC()
+	s.insertPartition(ctx, storage, "given", nil, screamer.StateRunning, start, start)
+	s.insertPartition(ctx, storage, "other", nil, screamer.StateRunning, start, start.Add(time.Second))
+
+	ps, err := storage.ClaimPartitions(ctx, screamer.ClaimRequest{RunnerID: "a", TTL: time.Minute, Limit: 10, ParentGating: true, Parked: true, Exclude: []string{"given"}})
+	s.Require().NoError(err)
+	s.Equal([]string{"other"}, tokens(ps))
+
+	ps = s.claim(ctx, storage, "b", 10)
+	s.Equal([]string{"given"}, tokens(ps))
+}
+
+// Runners are counted per metadata table: the Runner table is shared by every
+// stream in the database.
+func (s *SpannerTestSuite) TestGetActiveRunnerCountPerMetadataTable() {
+	ctx := context.Background()
+	first, cleanup1 := s.setupStorage(ctx, "RunnersFirst")
+	defer cleanup1()
+	second, cleanup2 := s.setupStorage(ctx, "RunnersSecond")
+	defer cleanup2()
+
+	s.Require().NoError(first.RegisterRunner(ctx, "a"))
+	s.Require().NoError(first.RegisterRunner(ctx, "b"))
+	s.Require().NoError(second.RegisterRunner(ctx, "c"))
+
+	n, err := first.GetActiveRunnerCount(ctx)
+	s.Require().NoError(err)
+	s.Equal(2, n)
+	n, err = second.GetActiveRunnerCount(ctx)
+	s.Require().NoError(err)
+	s.Equal(1, n)
+}

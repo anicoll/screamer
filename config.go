@@ -15,6 +15,8 @@ type Config struct {
 	MaxConcurrentPartitions int
 	// LeaseTTL is how long a partition lease lasts without renewal (0 = default, 30s).
 	LeaseTTL time.Duration
+	// DisableFairShare lets each runner keep every partition it claims.
+	DisableFairShare bool
 	// DisableParking streams every partition instead of parking idle ones.
 	DisableParking bool
 	// ParkInterval is how long a parked partition waits between catch-up reads (0 = default, 10s).

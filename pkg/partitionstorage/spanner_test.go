@@ -162,9 +162,10 @@ func (s *SpannerTestSuite) insertPartitions(ctx context.Context, storage *testSt
 func (s *SpannerTestSuite) setupRunner(ctx context.Context, storage *testStorage, runnerID string, updatedAt time.Time) {
 	_, err := storage.client.Apply(ctx, []*spanner.Mutation{
 		spanner.InsertOrUpdateMap(tableRunner, map[string]interface{}{
-			columnRunnerID:  runnerID,
-			columnCreatedAt: updatedAt,
-			columnUpdatedAt: updatedAt,
+			columnRunnerID:      runnerID,
+			columnCreatedAt:     updatedAt,
+			columnUpdatedAt:     updatedAt,
+			columnMetadataTable: storage.tableName,
 		}),
 	})
 	s.NoError(err)
