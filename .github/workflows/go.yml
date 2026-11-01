@@ -74,9 +74,12 @@ jobs:
           merge-multiple: true
 
       - name: Build summary
+        env:
+          # GITHUB_SHA is the merge commit on pull_request events; show the PR head instead.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           echo '<!-- screamer-test-report -->' > report.md
-          echo "## Test results for ${GITHUB_SHA::7}" >> report.md
+          echo "## Test results for ${HEAD_SHA::7}" >> report.md
           echo >> report.md
           for group in unit integration simulator; do
             case $group in
