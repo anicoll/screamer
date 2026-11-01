@@ -24,6 +24,8 @@ type PartitionMetadata struct {
 	Epoch *int64 `spanner:"Epoch" json:"epoch,omitempty"`
 	// LeaseExpiresAt is when the owner's lease lapses unless it is renewed.
 	LeaseExpiresAt *time.Time `spanner:"LeaseExpiresAt" json:"lease_expires_at,omitempty"`
+	// NextReadAt is when a PARKED partition is next read.
+	NextReadAt *time.Time `spanner:"NextReadAt" json:"next_read_at,omitempty"`
 }
 
 // State represents the state of a partition in the change stream lifecycle.
@@ -36,6 +38,9 @@ const (
 	StateScheduled State = "SCHEDULED"
 	// StateRunning indicates the partition is currently being processed.
 	StateRunning   State = "RUNNING"
+	// StateParked indicates the partition is idle and waits, with no query
+	// open, until its NextReadAt (see PartitionParker).
+	StateParked State = "PARKED"
 	// StateFinished indicates the partition has been fully processed.
 	StateFinished  State = "FINISHED"
 )

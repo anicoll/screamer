@@ -326,43 +326,46 @@ func (s *InmemoryPartitionStorage) prune(now time.Time) {
 	}
 }
 
-// ClaimPartitions leases up to req.Limit partitions to req.RunnerID: CREATED
-// partitions that are ready, oldest first, then SCHEDULED or RUNNING partitions
-// whose lease has expired or that have none, lowest watermark first.
+// ClaimPartitions leases up to req.Limit partitions to req.RunnerID, lowest
+// watermark first, from: SCHEDULED or RUNNING partitions whose lease has
+// expired or that have none; with req.Parked, PARKED partitions whose
+// NextReadAt has passed; and CREATED partitions that are ready.
 func (s *InmemoryPartitionStorage) ClaimPartitions(ctx context.Context, req screamer.ClaimRequest) ([]*screamer.PartitionMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now().UTC()
-	var ready, expired []*screamer.PartitionMetadata
+	var ready, expired, parked []*screamer.PartitionMetadata
 	for _, p := range s.m {
+		free := p.LeaseExpiresAt == nil || !p.LeaseExpiresAt.After(now)
 		switch p.State {
 		case screamer.StateCreated:
 			if req.ParentGating && s.parentsFinished(p) || !req.ParentGating && !req.MinWatermark.After(p.StartTimestamp) {
 				ready = append(ready, p)
 			}
 		case screamer.StateScheduled, screamer.StateRunning:
-			if p.LeaseExpiresAt == nil || !p.LeaseExpiresAt.After(now) {
+			if free {
 				expired = append(expired, p)
+			}
+		case screamer.StateParked:
+			if req.Parked && free && p.NextReadAt != nil && !p.NextReadAt.After(now) {
+				parked = append(parked, p)
 			}
 		}
 	}
-	sort.Slice(ready, func(i, j int) bool {
-		if !ready[i].StartTimestamp.Equal(ready[j].StartTimestamp) {
-			return ready[i].StartTimestamp.Before(ready[j].StartTimestamp)
+	// Most behind first, whatever the reason it is claimable: a new child, an
+	// expired lease or a parked partition that is due.
+	claimable := append(append(expired, parked...), ready...)
+	sort.Slice(claimable, func(i, j int) bool {
+		if !claimable[i].Watermark.Equal(claimable[j].Watermark) {
+			return claimable[i].Watermark.Before(claimable[j].Watermark)
 		}
-		return ready[i].PartitionToken < ready[j].PartitionToken
-	})
-	sort.Slice(expired, func(i, j int) bool {
-		if !expired[i].Watermark.Equal(expired[j].Watermark) {
-			return expired[i].Watermark.Before(expired[j].Watermark)
-		}
-		return expired[i].PartitionToken < expired[j].PartitionToken
+		return claimable[i].PartitionToken < claimable[j].PartitionToken
 	})
 
 	expiresAt := now.Add(req.TTL)
-	out := make([]*screamer.PartitionMetadata, 0, min(req.Limit, len(ready)+len(expired)))
-	for _, p := range append(ready, expired...) {
+	out := make([]*screamer.PartitionMetadata, 0, min(req.Limit, len(claimable)))
+	for _, p := range claimable {
 		if len(out) >= req.Limit {
 			break
 		}
@@ -423,6 +426,24 @@ func (s *InmemoryPartitionStorage) ReleaseLeases(ctx context.Context, runnerID s
 	return nil
 }
 
+// ParkPartition ends runnerID's lease on the partition, moves its watermark
+// forward and parks it until after from now.
+func (s *InmemoryPartitionStorage) ParkPartition(ctx context.Context, runnerID string, l screamer.Lease, after time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	p, ok := s.held(runnerID, l)
+	if !ok {
+		return false, nil
+	}
+	if l.Watermark.After(p.Watermark) {
+		p.Watermark = l.Watermark
+	}
+	next := time.Now().UTC().Add(after)
+	p.State, p.NextReadAt, p.Owner, p.LeaseExpiresAt = screamer.StateParked, &next, nil, nil
+	return true, nil
+}
+
 // held returns the partition of l if runnerID still holds its lease at l's
 // epoch. s.mu must be held.
 func (s *InmemoryPartitionStorage) held(runnerID string, l screamer.Lease) (*screamer.PartitionMetadata, bool) {
@@ -447,6 +468,10 @@ func copyPartition(p *screamer.PartitionMetadata) *screamer.PartitionMetadata {
 	if p.LeaseExpiresAt != nil {
 		t := *p.LeaseExpiresAt
 		c.LeaseExpiresAt = &t
+	}
+	if p.NextReadAt != nil {
+		t := *p.NextReadAt
+		c.NextReadAt = &t
 	}
 	return &c
 }
@@ -487,6 +512,7 @@ var (
 	_ screamer.ParentGatedScheduler  = (*InmemoryPartitionStorage)(nil)
 	_ screamer.WatermarkBatchUpdater = (*InmemoryPartitionStorage)(nil)
 	_ screamer.PartitionLeaser       = (*InmemoryPartitionStorage)(nil)
+	_ screamer.PartitionParker       = (*InmemoryPartitionStorage)(nil)
 )
 
 // Assert that InmemoryPartitionStorage implements PartitionStorage.

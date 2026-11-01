@@ -192,6 +192,12 @@ func (s *Subscriber) registerMetrics(mp metric.MeterProvider) (metric.Registrati
 		return nil, err
 	}
 
+	parks, err := meter.Int64ObservableCounter("screamer.partitions.parks",
+		metric.WithDescription("Times this runner parked an idle partition, including parking it again after a catch-up read found nothing."), metric.WithUnit("{park}"))
+	if err != nil {
+		return nil, err
+	}
+
 	attrs := metric.WithAttributes(
 		attribute.String("stream", s.streamName),
 		attribute.String("runner_id", s.runnerID),
@@ -207,6 +213,9 @@ func (s *Subscriber) registerMetrics(mp metric.MeterProvider) (metric.Registrati
 			o.ObserveInt64(leasesLost, s.leases.lostCount(), attrs)
 			o.ObserveInt64(takeovers, s.leases.takeoverCount(), attrs)
 		}
+		if s.parker != nil {
+			o.ObserveInt64(parks, s.parked.Load(), attrs)
+		}
 
 		c := s.GetClusterMetrics()
 		if c.UpdatedAt.IsZero() {
@@ -221,5 +230,5 @@ func (s *Subscriber) registerMetrics(mp metric.MeterProvider) (metric.Registrati
 		}
 		o.ObserveFloat64(lag, c.WatermarkLag.Seconds(), clusterAttrs)
 		return nil
-	}, active, capacity, retries, unfinished, live, desired, lag, leasesHeld, leasesLost, takeovers)
+	}, active, capacity, retries, unfinished, live, desired, lag, leasesHeld, leasesLost, takeovers, parks)
 }

@@ -1,5 +1,25 @@
 # Migration guide
 
+## Parking idle partitions
+
+### What changed
+
+A partition that delivers nothing but heartbeats for a minute is now parked: its query is closed, and it is read every 10 seconds in a short catch-up query until it has changes again (see [Parking idle partitions](README.md#parking-idle-partitions)). A change to a partition that had been idle can therefore arrive up to 10 seconds later than before. `WithParking(false)` or `--park=false` keeps every partition streaming. Partitions also have a new state, `PARKED`.
+
+### Do I need to do anything?
+
+**If you use `partitionstorage.NewSpanner`**, the metadata table needs one more nullable column. `RunMigrations` adds it; otherwise apply:
+
+```sql
+ALTER TABLE <metadata table> ADD COLUMN NextReadAt TIMESTAMP;
+```
+
+**If you use `partitionstorage.NewInmemory`**, nothing to do.
+
+**If you have your own `PartitionStorage`**, implement `screamer.PartitionParker` (`ParkPartition`), and have `ClaimPartitions` also claim `PARKED` partitions whose `NextReadAt` has passed when `ClaimRequest.Parked` is set. Treat `PARKED` as unfinished everywhere you filter on state. Or turn parking off with `screamer.WithParking(false)`.
+
+If anything reads the metadata table directly, for example a dashboard counting partitions by state, add `PARKED` to it.
+
 ## Partition leases
 
 ### What changed
@@ -20,6 +40,7 @@ Runners now own partitions through leases with fencing (see [Partition leases](R
 ALTER TABLE <metadata table> ADD COLUMN Owner STRING(MAX);
 ALTER TABLE <metadata table> ADD COLUMN Epoch INT64;
 ALTER TABLE <metadata table> ADD COLUMN LeaseExpiresAt TIMESTAMP;
+ALTER TABLE <metadata table> ADD COLUMN NextReadAt TIMESTAMP;
 CREATE INDEX <metadata table>_State_idx ON <metadata table>(State, Watermark)
   STORING (ParentTokens, StartTimestamp, Owner, Epoch, LeaseExpiresAt);
 ```

@@ -49,7 +49,7 @@ With no `WithMaxConcurrentPartitions`, detection scheduled at most 100 partition
 
 At 5,000 partitions on one runner, Screamer itself holds about **1.6 KB of heap and 9 KB of goroutine stack per partition**, roughly 55 MB in total. The stack is the goroutine that holds each partition's query open for its whole life.
 
-The simulator does not include the Spanner client's per-stream state (gRPC flow-control windows, `RowIterator` buffers), which is likely larger and is worth measuring on a real instance. Parking idle partitions (step 5 of the partition scaling design) removes both costs for partitions with no traffic, which in most deployments is most of them.
+The simulator does not include the Spanner client's per-stream state (gRPC flow-control windows, `RowIterator` buffers), which is likely larger and is worth measuring on a real instance. Parking idle partitions (on by default, see the README) removes both costs for partitions with no traffic, which in most deployments is most of them: a parked partition has no goroutine and no query. In the simulator, 200 mostly idle partitions settle at under 50 open queries.
 
 ## 5. Metadata table load
 

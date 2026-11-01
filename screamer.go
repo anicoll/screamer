@@ -79,6 +79,11 @@ type Subscriber struct {
 	useLeases               bool
 	leaser                  PartitionLeaser
 	leases                  *leaseSet
+	useParking              bool
+	parker                  PartitionParker
+	parkInterval            time.Duration
+	parkIdleAfter           time.Duration
+	parked                  atomic.Int64
 }
 
 var (
@@ -106,11 +111,18 @@ func NewSubscriber(
 		checkpointInterval:  defaultCheckpointInterval,
 		leases:              true,
 		leaseTTL:            defaultLeaseTTL,
+		parking:             true,
+		parkInterval:        defaultParkInterval,
+		parkIdleAfter:       defaultParkIdleAfter,
 	}
 	for _, o := range options {
 		o.Apply(c)
 	}
 	zerolog.SetGlobalLevel(c.logLevel)
+
+	if min := 2 * c.heartbeatInterval; c.parkIdleAfter < min {
+		c.parkIdleAfter = min
+	}
 
 	reader := c.changeStreamReader
 	if reader == nil {
@@ -143,6 +155,9 @@ func NewSubscriber(
 		useLeases:               c.leases,
 		leaseTTL:                c.leaseTTL,
 		leases:                  newLeaseSet(),
+		useParking:              c.parking,
+		parkInterval:            c.parkInterval,
+		parkIdleAfter:           c.parkIdleAfter,
 	}
 }
 
@@ -184,6 +199,9 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 			return fmt.Errorf("screamer: leases are on but %T does not implement screamer.PartitionLeaser; implement it, or turn leases off with WithLeases(false) (see MIGRATION.md)", s.partitionStorage)
 		}
 		s.leaser = l
+	}
+	if err := s.parkingCheck(); err != nil {
+		return err
 	}
 
 	log.Debug().Msg("Starting subscription to change stream")
@@ -453,15 +471,27 @@ func (s *Subscriber) queryChangeStream(parent context.Context, p *PartitionMetad
 	ctx, release := s.leasedContext(parent, p)
 	defer release()
 
+	// A parked partition is read up to now, then parked again or streamed.
+	slice := s.parker != nil && p.State == StateParked
+
 	attempt := 0
 	for {
 		before := p.Watermark
-		err := s.readPartition(ctx, p)
+		outcome, err := s.readPartition(ctx, p, slice)
 		if err == nil {
+			switch outcome {
+			case readSliceData:
+				slice, attempt = false, 0
+				continue
+			case readIdle, readSliceEmpty:
+				s.park(ctx, p)
+			}
 			return nil
 		}
 		if parent.Err() != nil {
-			return err
+			// Stopping. Report why, not how the read noticed (an idle timer
+			// or a lost lease can cancel it at the same moment).
+			return parent.Err()
 		}
 		if errors.Is(context.Cause(ctx), errLeaseLost) {
 			// Another runner owns the partition now and reads it from the last
@@ -513,26 +543,78 @@ func retryDelay(attempt int) time.Duration {
 	return d + time.Duration(rand.Int64N(int64(d)/5+1))
 }
 
-func (s *Subscriber) readPartition(ctx context.Context, p *PartitionMetadata) error {
+// readPartition reads p once. A streaming read (slice false) runs until the
+// partition ends or, with parking, until it has been idle for parkIdleAfter.
+// A catch-up read of a parked partition (slice true) runs until now.
+func (s *Subscriber) readPartition(ctx context.Context, p *PartitionMetadata, slice bool) (readOutcome, error) {
 	if err := s.partitionStorage.UpdateToRunning(ctx, p); err != nil {
-		return fmt.Errorf("failed to update to running: %w", err)
+		return 0, fmt.Errorf("failed to update to running: %w", err)
 	}
 
-	if err := s.reader.Read(ctx, p, func(records []*ChangeRecord) error {
+	query := p
+	var end time.Time
+	if slice {
+		end, slice = sliceEnd(p, time.Now())
+		if slice {
+			q := *p
+			q.EndTimestamp = end
+			query = &q
+		}
+	}
+	// With parking, a streaming read is stopped once the partition has
+	// delivered no data for parkIdleAfter. A timer does it rather than the
+	// heartbeats, which may not arrive while nothing changes.
+	readCtx := ctx
+	var idle *time.Timer
+	if s.parker != nil && !slice {
+		var stop context.CancelCauseFunc
+		readCtx, stop = context.WithCancelCause(ctx)
+		defer stop(nil)
+		idle = time.AfterFunc(s.parkIdleAfter, func() { stop(errIdle) })
+		defer idle.Stop()
+	}
+
+	var data, child bool
+	err := s.reader.Read(readCtx, query, func(records []*ChangeRecord) error {
 		log.Trace().
 			Str("partition_token", p.PartitionToken).
 			Int("num_records", len(records)).
 			Msg("processing partition")
-		if err := s.handle(ctx, p, records); err != nil {
+		batchData := false
+		for _, r := range records {
+			batchData = batchData || len(r.DataChangeRecords) > 0
+			child = child || len(r.ChildPartitionsRecords) > 0
+		}
+		if err := s.handle(readCtx, p, records); err != nil {
 			return err
 		}
-		log.Trace().
-			Str("partition_token", p.PartitionToken).
-			Int("num_records", len(records)).
-			Msg("processing partition complete")
+		if batchData {
+			data = true
+			if idle != nil {
+				idle.Reset(s.parkIdleAfter)
+			}
+		}
 		return nil
-	}); err != nil {
-		return err
+	})
+	if err != nil && errors.Is(context.Cause(readCtx), errIdle) && ctx.Err() == nil {
+		return readIdle, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	if slice && !child {
+		// The query ended at end, so every change up to end has been delivered.
+		if err := s.checkpoint(ctx, p, end); err != nil {
+			return 0, fmt.Errorf("failed to update watermark: %w", err)
+		}
+		if end.After(p.Watermark) {
+			p.Watermark = end
+		}
+		if data {
+			return readSliceData, nil
+		}
+		return readSliceEmpty, nil
 	}
 
 	log.Info().Str("partition_token", p.PartitionToken).
@@ -542,10 +624,10 @@ func (s *Subscriber) readPartition(ctx context.Context, p *PartitionMetadata) er
 		s.checkpoints.forget(p.PartitionToken)
 	}
 	if err := s.partitionStorage.UpdateToFinished(ctx, p, s.runnerID); err != nil {
-		return fmt.Errorf("failed to update to finished: %w", err)
+		return 0, fmt.Errorf("failed to update to finished: %w", err)
 	}
 
-	return nil
+	return readFinished, nil
 }
 
 type watermarker struct {
@@ -720,6 +802,9 @@ type PartitionMetrics struct {
 	// LeaseTakeovers is the number of partitions this runner claimed after
 	// another runner's lease on them expired or was released.
 	LeaseTakeovers int64
+	// PartitionsParked is the number of times this runner parked an idle
+	// partition (see WithParking).
+	PartitionsParked int64
 }
 
 // GetMetrics returns current partition processing metrics for observability.
@@ -736,6 +821,7 @@ func (s *Subscriber) GetMetrics() PartitionMetrics {
 		LeasesHeld:              s.leases.count(),
 		LeasesLost:              s.leases.lostCount(),
 		LeaseTakeovers:          s.leases.takeoverCount(),
+		PartitionsParked:        s.parked.Load(),
 	}
 
 	// Calculate capacity percentage

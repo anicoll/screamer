@@ -3,6 +3,7 @@ package partitionstorage
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,13 +86,14 @@ const (
 	columnOwner          = "Owner"
 	columnEpoch          = "Epoch"
 	columnLeaseExpiresAt = "LeaseExpiresAt"
+	columnNextReadAt     = "NextReadAt"
 )
 
 // unfinishedStates lists every state but FINISHED. Queries filter on
 // State IN UNNEST(@unfinished) rather than State != FINISHED so that they can
 // use the State index and skip the finished rows kept by the row deletion
 // policy.
-var unfinishedStates = []screamer.State{screamer.StateCreated, screamer.StateScheduled, screamer.StateRunning}
+var unfinishedStates = []screamer.State{screamer.StateCreated, screamer.StateScheduled, screamer.StateRunning, screamer.StateParked}
 
 // GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark.
 // Returns nil if there are no unfinished partitions.
@@ -524,9 +526,10 @@ func (s *SpannerPartitionStorage) UpdateWatermarks(ctx context.Context, watermar
 const leaseBatchSize = 500
 
 // ClaimPartitions leases up to req.Limit partitions to req.RunnerID in one
-// read-write transaction: first SCHEDULED or RUNNING partitions whose lease has
-// expired or that have none, lowest watermark first, then CREATED partitions
-// that are ready to read. Each claimed partition's Epoch is incremented. Lease
+// read-write transaction, lowest watermark first, from: SCHEDULED or RUNNING
+// partitions whose lease has expired or that have none; with req.Parked,
+// PARKED partitions whose NextReadAt has passed; and CREATED partitions that
+// are ready to read. Each claimed partition's Epoch is incremented. Lease
 // expiry is set from Spanner's clock, so runners' clocks do not need to agree.
 func (s *SpannerPartitionStorage) ClaimPartitions(ctx context.Context, req screamer.ClaimRequest) ([]*screamer.PartitionMetadata, error) {
 	log.Trace().Str("runner_id", req.RunnerID).Int("limit", req.Limit).Msg("ClaimPartitions called")
@@ -543,34 +546,57 @@ func (s *SpannerPartitionStorage) ClaimPartitions(ctx context.Context, req screa
 			LIMIT @limit`, s.tableName),
 		Params: map[string]interface{}{
 			"claimable": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
+			"limit":     req.Limit,
+		},
+	}
+	parked := spanner.Statement{
+		SQL: fmt.Sprintf(`
+			SELECT * FROM %s
+			WHERE State = @parked
+			  AND NextReadAt <= CURRENT_TIMESTAMP()
+			  AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt < CURRENT_TIMESTAMP())
+			ORDER BY NextReadAt ASC
+			LIMIT @limit`, s.tableName),
+		Params: map[string]interface{}{
+			"parked": screamer.StateParked,
+			"limit":  req.Limit,
 		},
 	}
 	ready := s.readyStatement(req)
+	ready.Params["limit"] = req.Limit
 
 	var partitions []*screamer.PartitionMetadata
 	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		partitions = make([]*screamer.PartitionMetadata, 0)
-		var reclaimed, created []string
-
-		expired.Params["limit"] = req.Limit
-		if err := s.queryPartitions(ctx, tx, expired, "ClaimPartitions", func(p *screamer.PartitionMetadata) {
-			reclaimed = append(reclaimed, p.PartitionToken)
-			partitions = append(partitions, p)
-		}); err != nil {
+		// Read up to Limit candidates of each kind and keep the Limit furthest
+		// behind, so new children, expired leases and parked partitions that
+		// are due share the runner's free slots fairly.
+		candidates := make([]*screamer.PartitionMetadata, 0)
+		collect := func(p *screamer.PartitionMetadata) { candidates = append(candidates, p) }
+		if err := s.queryPartitions(ctx, tx, expired, "ClaimPartitions", collect); err != nil {
 			return err
 		}
-		if left := req.Limit - len(partitions); left > 0 {
-			ready.Params["limit"] = left
-			if err := s.queryPartitions(ctx, tx, ready, "ClaimPartitions", func(p *screamer.PartitionMetadata) {
-				p.State = screamer.StateScheduled
-				created = append(created, p.PartitionToken)
-				partitions = append(partitions, p)
-			}); err != nil {
+		if req.Parked {
+			if err := s.queryPartitions(ctx, tx, parked, "ClaimPartitions", collect); err != nil {
 				return err
 			}
 		}
+		if err := s.queryPartitions(ctx, tx, ready, "ClaimPartitions", collect); err != nil {
+			return err
+		}
+		sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Watermark.Before(candidates[j].Watermark) })
+		partitions = candidates[:min(req.Limit, len(candidates))]
 		if len(partitions) == 0 {
 			return nil
+		}
+
+		var reclaimed, created []string
+		for _, p := range partitions {
+			if p.State == screamer.StateCreated {
+				p.State = screamer.StateScheduled
+				created = append(created, p.PartitionToken)
+			} else {
+				reclaimed = append(reclaimed, p.PartitionToken)
+			}
 		}
 
 		const lease = `Owner = @owner, Epoch = COALESCE(Epoch, 0) + 1,
@@ -702,6 +728,23 @@ func (s *SpannerPartitionStorage) ReleaseLeases(ctx context.Context, runnerID st
 	return err
 }
 
+// ParkPartition ends runnerID's lease on the partition, moves its watermark
+// forward, and parks it until after from now by Spanner's clock.
+func (s *SpannerPartitionStorage) ParkPartition(ctx context.Context, runnerID string, lease screamer.Lease, after time.Duration) (bool, error) {
+	log.Trace().Str("runner_id", runnerID).Str("partition_token", lease.PartitionToken).Msg("ParkPartition called")
+	sql := fmt.Sprintf(`UPDATE %s SET
+			State = @parked, Owner = NULL, LeaseExpiresAt = NULL,
+			NextReadAt = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL @after MILLISECOND),
+			Watermark = IF(@watermark > Watermark, @watermark, Watermark)
+		WHERE PartitionToken = @token AND Owner = @owner AND Epoch = @epoch AND State != @finished`, s.tableName)
+	lost, err := s.updateLeases(ctx, runnerID, []screamer.Lease{lease}, sql,
+		map[string]interface{}{"parked": screamer.StateParked, "after": after.Milliseconds()}, "ParkPartition")
+	if err != nil {
+		return false, err
+	}
+	return len(lost) == 0, nil
+}
+
 // updateLeases runs sql once per lease and returns the tokens it matched no row for.
 func (s *SpannerPartitionStorage) updateLeases(ctx context.Context, runnerID string, leases []screamer.Lease, sql string, extra map[string]interface{}, tag string) ([]string, error) {
 	var lost []string
@@ -743,9 +786,9 @@ func (s *SpannerPartitionStorage) updateLeases(ctx context.Context, runnerID str
 // have the lease columns yet.
 func leaseColumnsHint(err error) error {
 	msg := err.Error()
-	for _, c := range []string{columnOwner, columnEpoch, columnLeaseExpiresAt} {
+	for _, c := range []string{columnOwner, columnEpoch, columnLeaseExpiresAt, columnNextReadAt} {
 		if strings.Contains(msg, c) && (spanner.ErrCode(err) == codes.InvalidArgument || spanner.ErrCode(err) == codes.NotFound) {
-			return fmt.Errorf("%w (the partition metadata table has no %s column: run RunMigrations, or add the lease columns as MIGRATION.md shows)", err, c)
+			return fmt.Errorf("%w (the partition metadata table has no %s column: run RunMigrations, or add the columns as MIGRATION.md shows)", err, c)
 		}
 	}
 	return err
@@ -812,6 +855,7 @@ var (
 	_ screamer.ParentGatedScheduler  = (*SpannerPartitionStorage)(nil)
 	_ screamer.WatermarkBatchUpdater = (*SpannerPartitionStorage)(nil)
 	_ screamer.PartitionLeaser       = (*SpannerPartitionStorage)(nil)
+	_ screamer.PartitionParker       = (*SpannerPartitionStorage)(nil)
 )
 
 // Assert that SpannerPartitionStorage implements PartitionStorage.

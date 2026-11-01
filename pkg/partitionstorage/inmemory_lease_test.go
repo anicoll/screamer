@@ -164,3 +164,60 @@ func TestInMemoryKeepsFinishedPartitionsWithoutRetention(t *testing.T) {
 		require.Contains(t, s.m, "a")
 	})
 }
+
+func TestInMemoryParkPartition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		s := NewInmemory()
+		start := time.Now()
+		require.NoError(t, s.InitializeRootPartition(ctx, start, start.Add(time.Hour), time.Second))
+		ps := claim(t, s, "a", 10)
+		require.Len(t, ps, 1)
+		token := ps[0].PartitionToken
+
+		held, err := s.ParkPartition(ctx, "a", screamer.Lease{PartitionToken: token, Epoch: 1, Watermark: start.Add(time.Second)}, 10*time.Second)
+		require.NoError(t, err)
+		require.True(t, held)
+		p := s.m[token]
+		require.Equal(t, screamer.StateParked, p.State)
+		require.Nil(t, p.Owner)
+		require.Equal(t, start.Add(time.Second), p.Watermark)
+
+		parked := screamer.ClaimRequest{RunnerID: "b", TTL: 30 * time.Second, Limit: 10, ParentGating: true, Parked: true}
+		got, err := s.ClaimPartitions(ctx, parked)
+		require.NoError(t, err)
+		require.Empty(t, got, "not due yet")
+
+		time.Sleep(10 * time.Second)
+		require.Empty(t, claim(t, s, "b", 10), "parked partitions are only claimed when asked for")
+		got, err = s.ClaimPartitions(ctx, parked)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		require.Equal(t, screamer.StateParked, got[0].State)
+		require.EqualValues(t, 2, *got[0].Epoch)
+
+		held, err = s.ParkPartition(ctx, "a", screamer.Lease{PartitionToken: token, Epoch: 1}, time.Second)
+		require.NoError(t, err)
+		require.False(t, held, "a runner that lost the lease cannot park it")
+	})
+}
+
+// Claims take the partitions furthest behind first, whatever makes them
+// claimable, so new children and parked partitions share free slots.
+func TestInMemoryClaimTakesFurthestBehindFirst(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		s := NewInmemory()
+		now := time.Now()
+		past := now.Add(-time.Second)
+		s.m["parked-old"] = &screamer.PartitionMetadata{PartitionToken: "parked-old", State: screamer.StateParked, Watermark: now.Add(-3 * time.Minute), NextReadAt: &past}
+		s.m["created"] = &screamer.PartitionMetadata{PartitionToken: "created", ParentTokens: []string{}, State: screamer.StateCreated, Watermark: now.Add(-2 * time.Minute), StartTimestamp: now.Add(-2 * time.Minute)}
+		s.m["parked-new"] = &screamer.PartitionMetadata{PartitionToken: "parked-new", State: screamer.StateParked, Watermark: now.Add(-time.Minute), NextReadAt: &past}
+
+		got, err := s.ClaimPartitions(ctx, screamer.ClaimRequest{RunnerID: "a", TTL: time.Minute, Limit: 2, ParentGating: true, Parked: true})
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+		require.Equal(t, "parked-old", got[0].PartitionToken)
+		require.Equal(t, "created", got[1].PartitionToken)
+	})
+}

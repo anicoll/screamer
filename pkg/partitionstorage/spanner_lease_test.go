@@ -211,3 +211,71 @@ func (s *SpannerTestSuite) TestRunMigrationsAddsLeaseColumns() {
 	ps := s.claim(ctx, storage, "a", 10)
 	s.Equal([]string{"p1"}, tokens(ps))
 }
+
+func (s *SpannerTestSuite) TestParkPartition() {
+	ctx := context.Background()
+	storage, cleanup := s.setupStorage(ctx, "Park")
+	defer cleanup()
+
+	start := time.Now().Add(-time.Minute).Truncate(time.Microsecond).UTC()
+	s.insertPartition(ctx, storage, "p1", nil, screamer.StateCreated, start, start)
+	ps := s.claim(ctx, storage, "a", 10)
+	s.Require().Len(ps, 1)
+	s.Require().NoError(storage.UpdateToRunning(ctx, ps[0]))
+
+	// Parking writes the watermark, ends the lease and sets NextReadAt.
+	held, err := storage.ParkPartition(ctx, "a", screamer.Lease{PartitionToken: "p1", Epoch: 1, Watermark: start.Add(10 * time.Second)}, 10*time.Second)
+	s.Require().NoError(err)
+	s.True(held)
+	row, err := storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{"p1"}, []string{columnState, columnWatermark, columnOwner, columnNextReadAt})
+	s.Require().NoError(err)
+	var (
+		state     screamer.State
+		watermark time.Time
+		owner     spanner.NullString
+		next      spanner.NullTime
+	)
+	s.Require().NoError(row.Columns(&state, &watermark, &owner, &next))
+	s.Equal(screamer.StateParked, state)
+	s.Equal(start.Add(10*time.Second), watermark)
+	s.False(owner.Valid)
+	s.WithinDuration(time.Now().Add(10*time.Second), next.Time, 5*time.Second)
+
+	// A parked partition still counts as unfinished.
+	n, err := storage.CountUnfinishedPartitions(ctx)
+	s.Require().NoError(err)
+	s.Equal(1, n)
+	minWM, err := storage.GetUnfinishedMinWatermarkPartition(ctx)
+	s.Require().NoError(err)
+	s.Require().NotNil(minWM)
+	s.Equal("p1", minWM.PartitionToken)
+
+	// It is not claimed before NextReadAt, nor without req.Parked.
+	parkedClaim := screamer.ClaimRequest{RunnerID: "b", TTL: 30 * time.Second, Limit: 10, ParentGating: true, Parked: true}
+	ps, err = storage.ClaimPartitions(ctx, parkedClaim)
+	s.Require().NoError(err)
+	s.Empty(ps)
+	_, err = storage.client.Apply(ctx, []*spanner.Mutation{spanner.UpdateMap(storage.tableName, map[string]interface{}{
+		columnPartitionToken: "p1",
+		columnNextReadAt:     time.Now().Add(-time.Second),
+	})})
+	s.Require().NoError(err)
+	s.Empty(s.claim(ctx, storage, "b", 10))
+
+	// Once due, it is claimed at the next epoch and stays PARKED until it is read.
+	ps, err = storage.ClaimPartitions(ctx, parkedClaim)
+	s.Require().NoError(err)
+	s.Require().Len(ps, 1)
+	s.Equal(screamer.StateParked, ps[0].State)
+	s.EqualValues(2, *ps[0].Epoch)
+	s.Equal(start.Add(10*time.Second), ps[0].Watermark)
+	s.Equal(screamer.StateParked, s.getPartitionState(ctx, storage, "p1"))
+	s.Require().NoError(storage.UpdateToRunning(ctx, ps[0]))
+	s.Equal(screamer.StateRunning, s.getPartitionState(ctx, storage, "p1"))
+
+	// A runner that no longer holds the lease cannot park it.
+	held, err = storage.ParkPartition(ctx, "a", screamer.Lease{PartitionToken: "p1", Epoch: 1}, time.Second)
+	s.Require().NoError(err)
+	s.False(held)
+	s.Equal(screamer.StateRunning, s.getPartitionState(ctx, storage, "p1"))
+}
