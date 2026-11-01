@@ -37,10 +37,13 @@ const maxCheckpointFailures = 5
 type checkpointer struct {
 	mu      sync.Mutex
 	pending map[string]time.Time
+	// spare is the map take swapped out last time, kept to be reused so a
+	// flush does not allocate a new map sized for every partition.
+	spare map[string]time.Time
 }
 
 func newCheckpointer() *checkpointer {
-	return &checkpointer{pending: make(map[string]time.Time)}
+	return &checkpointer{pending: make(map[string]time.Time), spare: make(map[string]time.Time)}
 }
 
 // set records wm for token, keeping the later of wm and any watermark already pending.
@@ -70,7 +73,8 @@ func (c *checkpointer) take() []PartitionWatermark {
 	for token, wm := range c.pending {
 		out = append(out, PartitionWatermark{PartitionToken: token, Watermark: wm})
 	}
-	c.pending = make(map[string]time.Time, len(out))
+	clear(c.spare)
+	c.pending, c.spare = c.spare, c.pending
 	return out
 }
 

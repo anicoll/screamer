@@ -56,10 +56,27 @@ func (r *spannerChangeStreamReader) Read(ctx context.Context, p *PartitionMetada
 	iter := r.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: r.priority})
 
 	return iter.Do(func(row *spanner.Row) error {
-		records := []*ChangeRecord{}
-		if err := row.Columns(&records); err != nil {
+		records, err := decodeChangeRecordRow(row)
+		if err != nil {
 			return err
 		}
 		return fn(records)
 	})
+}
+
+// decodeChangeRecordRow decodes one change stream row with the fast decoder,
+// falling back to the Spanner client's reflection decoder if the row does not
+// have the shape the fast decoder expects.
+func decodeChangeRecordRow(row *spanner.Row) ([]*ChangeRecord, error) {
+	var col spanner.GenericColumnValue
+	if err := row.Column(0, &col); err == nil {
+		if records, err := decodeChangeRecordColumn(col); err == nil {
+			return records, nil
+		}
+	}
+	records := []*ChangeRecord{}
+	if err := row.Columns(&records); err != nil {
+		return nil, err
+	}
+	return records, nil
 }

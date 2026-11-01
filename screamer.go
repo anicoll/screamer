@@ -2,7 +2,6 @@ package screamer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -376,29 +375,41 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 		return errDone
 	}
 
-	partitions, err := s.schedulePartitions(ctx, minWatermarkPartition.Watermark, availableSlots)
-	if err != nil {
-		return fmt.Errorf("failed to get schedulable partitions: %w", err)
-	}
-	if len(partitions) == 0 {
-		return nil
-	}
+	for batches := 0; ; batches++ {
+		partitions, err := s.schedulePartitions(ctx, minWatermarkPartition.Watermark, availableSlots)
+		if err != nil {
+			return fmt.Errorf("failed to get schedulable partitions: %w", err)
+		}
+		if len(partitions) == 0 {
+			return nil
+		}
 
-	log.Info().
-		Str("runner_id", s.runnerID).
-		Int("scheduled_partitions", len(partitions)).
-		Int("available_slots", availableSlots).
-		Msg("scheduled new partitions")
+		log.Info().
+			Str("runner_id", s.runnerID).
+			Int("scheduled_partitions", len(partitions)).
+			Int("available_slots", availableSlots).
+			Msg("scheduled new partitions")
 
-	for _, p := range partitions {
-		p := p
-		s.eg.Go(func() error {
-			return s.queryChangeStream(ctx, p)
-		})
+		for _, p := range partitions {
+			p := p
+			s.eg.Go(func() error {
+				return s.queryChangeStream(ctx, p)
+			})
+		}
+
+		// With no partition limit, keep scheduling in batches until nothing is
+		// ready, rather than one batch a second: otherwise starting up with
+		// 5,000 partitions, or a burst of splits, takes 50 seconds to schedule.
+		// With a limit, the one call above already asked for every free slot.
+		if s.maxConcurrentPartitions > 0 || len(partitions) < availableSlots || batches+1 >= maxScheduleBatchesPerTick {
+			return nil
+		}
 	}
-
-	return nil
 }
+
+// maxScheduleBatchesPerTick bounds how many scheduling transactions one tick of
+// partition detection runs when there is no partition limit.
+const maxScheduleBatchesPerTick = 100
 
 // consumerError marks an error from the consumer (a failed Consume, a nack or an
 // ack timeout). It is never retried: it stops the subscriber, as before.
@@ -536,7 +547,7 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			Msg("processing change record")
 		for _, record := range cr.DataChangeRecords {
 			wm.set(record.CommitTimestamp)
-			out, err := json.Marshal(record.DecodeToNonSpannerType(p, wm.get()))
+			out, err := encodeDataChangeRecord(record, p, wm.get())
 			if err != nil {
 				return &consumerError{err}
 			}
