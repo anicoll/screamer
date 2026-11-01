@@ -788,3 +788,136 @@ func (s *SpannerTestSuite) TestAddChildPartitions_Idempotent() {
 	s.NoError(row.Columns(&count))
 	s.Equal(int64(1), count, "Should only have one child partition despite duplicate adds")
 }
+
+func (s *SpannerTestSuite) insertPartition(ctx context.Context, storage *testStorage, token string, parents []string, state screamer.State, start, watermark time.Time) {
+	if parents == nil {
+		parents = []string{} // ParentTokens is NOT NULL
+	}
+	_, err := storage.client.Apply(ctx, []*spanner.Mutation{spanner.InsertMap(storage.tableName, map[string]interface{}{
+		columnPartitionToken:  token,
+		columnParentTokens:    parents,
+		columnStartTimestamp:  start,
+		columnEndTimestamp:    time.Now().AddDate(1, 0, 0),
+		columnHeartbeatMillis: 10000,
+		columnState:           state,
+		columnWatermark:       watermark,
+		columnCreatedAt:       spanner.CommitTimestamp,
+	})})
+	s.NoError(err)
+}
+
+func tokens(ps []*screamer.PartitionMetadata) []string {
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, p.PartitionToken)
+	}
+	return out
+}
+
+func (s *SpannerTestSuite) TestGetAndScheduleReadyPartitions() {
+	ctx := context.Background()
+	storage, cleanup := s.setupStorage(ctx, "ScheduleReady")
+	defer cleanup()
+
+	runnerID := uuid.NewString()
+	s.NoError(storage.RegisterRunner(ctx, runnerID))
+	t0 := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Minute)
+
+	s.Run("waits_for_every_parent", func() {
+		storage.cleanup(ctx)
+		s.NoError(storage.RegisterRunner(ctx, runnerID))
+		s.insertPartition(ctx, storage, "a", nil, screamer.StateFinished, t0, t1)
+		s.insertPartition(ctx, storage, "b", nil, screamer.StateRunning, t0, t0.Add(30*time.Second))
+		s.insertPartition(ctx, storage, "split", []string{"a"}, screamer.StateCreated, t1, t1)
+		s.insertPartition(ctx, storage, "merge", []string{"a", "b"}, screamer.StateCreated, t1, t1)
+
+		ps, err := storage.GetAndScheduleReadyPartitions(ctx, runnerID, 100)
+		s.NoError(err)
+		s.ElementsMatch([]string{"split"}, tokens(ps), "merge must wait for b")
+		s.Equal(screamer.StateScheduled, s.getPartitionState(ctx, storage, "split"))
+		s.Equal(screamer.StateCreated, s.getPartitionState(ctx, storage, "merge"))
+
+		s.NoError(storage.UpdateToFinished(ctx, &screamer.PartitionMetadata{PartitionToken: "b"}, runnerID))
+		ps, err = storage.GetAndScheduleReadyPartitions(ctx, runnerID, 100)
+		s.NoError(err)
+		s.ElementsMatch([]string{"merge"}, tokens(ps))
+	})
+
+	s.Run("partitions_without_parents_are_ready", func() {
+		storage.cleanup(ctx)
+		s.NoError(storage.RegisterRunner(ctx, runnerID))
+		s.insertPartition(ctx, storage, "p1", nil, screamer.StateCreated, t0, t0)
+		s.insertPartition(ctx, storage, "p2", []string{}, screamer.StateCreated, t0, t0)
+
+		ps, err := storage.GetAndScheduleReadyPartitions(ctx, runnerID, 100)
+		s.NoError(err)
+		s.ElementsMatch([]string{"p1", "p2"}, tokens(ps))
+	})
+
+	s.Run("missing_parent_waits_until_nothing_is_behind", func() {
+		storage.cleanup(ctx)
+		s.NoError(storage.RegisterRunner(ctx, runnerID))
+		// "gone" has no row yet: its own parent "slow" is still behind the merge point.
+		s.insertPartition(ctx, storage, "a", nil, screamer.StateFinished, t0, t1)
+		s.insertPartition(ctx, storage, "slow", nil, screamer.StateRunning, t0, t0.Add(10*time.Second))
+		s.insertPartition(ctx, storage, "merge", []string{"a", "gone"}, screamer.StateCreated, t1, t1)
+
+		ps, err := storage.GetAndScheduleReadyPartitions(ctx, runnerID, 100)
+		s.NoError(err)
+		s.Empty(ps)
+
+		// Once nothing unfinished is behind the merge point, the missing parent can
+		// only be one that finished and was removed.
+		s.NoError(storage.UpdateWatermark(ctx, &screamer.PartitionMetadata{PartitionToken: "slow"}, t1.Add(time.Second)))
+		ps, err = storage.GetAndScheduleReadyPartitions(ctx, runnerID, 100)
+		s.NoError(err)
+		s.ElementsMatch([]string{"merge"}, tokens(ps))
+	})
+
+	s.Run("respect_limit", func() {
+		storage.cleanup(ctx)
+		s.NoError(storage.RegisterRunner(ctx, runnerID))
+		for i := 0; i < 10; i++ {
+			s.insertPartition(ctx, storage, fmt.Sprintf("p%d", i), nil, screamer.StateCreated, t0, t0)
+		}
+		ps, err := storage.GetAndScheduleReadyPartitions(ctx, runnerID, 4)
+		s.NoError(err)
+		s.Len(ps, 4)
+	})
+}
+
+func (s *SpannerTestSuite) TestUpdateWatermarks() {
+	ctx := context.Background()
+	storage, cleanup := s.setupStorage(ctx, "UpdateWatermarks")
+	defer cleanup()
+
+	t0 := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	// More rows than one transaction holds, so the writes are split.
+	n := watermarkBatchSize + 20
+	want := make([]screamer.PartitionWatermark, 0, n+2)
+	for i := 0; i < n; i++ {
+		token := fmt.Sprintf("p%04d", i)
+		s.insertPartition(ctx, storage, token, nil, screamer.StateRunning, t0, t0)
+		want = append(want, screamer.PartitionWatermark{PartitionToken: token, Watermark: t0.Add(time.Duration(i+1) * time.Second)})
+	}
+	s.insertPartition(ctx, storage, "ahead", nil, screamer.StateRunning, t0, t0.Add(time.Hour))
+
+	ws := append(append([]screamer.PartitionWatermark{}, want...),
+		screamer.PartitionWatermark{PartitionToken: "ahead", Watermark: t0.Add(time.Minute)}, // older: must not move back
+		screamer.PartitionWatermark{PartitionToken: "unknown", Watermark: t0},                // no row: ignored
+	)
+	s.NoError(storage.UpdateWatermarks(ctx, ws))
+
+	readWatermark := func(token string) time.Time {
+		row, err := storage.client.Single().ReadRow(ctx, storage.tableName, spanner.Key{token}, []string{columnWatermark})
+		s.NoError(err)
+		var wm time.Time
+		s.NoError(row.Columns(&wm))
+		return wm
+	}
+	for _, w := range []screamer.PartitionWatermark{want[0], want[watermarkBatchSize], want[n-1]} {
+		s.True(w.Watermark.Equal(readWatermark(w.PartitionToken)), "watermark of %s", w.PartitionToken)
+	}
+	s.True(t0.Add(time.Hour).Equal(readWatermark("ahead")), "watermark must not move backwards")
+}

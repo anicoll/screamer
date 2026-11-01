@@ -257,30 +257,80 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 		Str("runner_id", runnerID).
 		Int("limit", limit).
 		Msg("GetAndSchedulePartitions called")
+	// Use randomized ordering to reduce conflicts between runners
+	// No FOR UPDATE - optimistic concurrency handles conflicts via transaction retry
+	stmt := spanner.Statement{
+		SQL: fmt.Sprintf(`
+			SELECT * FROM %s
+			WHERE State = @state
+			  AND StartTimestamp >= @minWatermark
+			ORDER BY FARM_FINGERPRINT(CAST(CURRENT_TIMESTAMP() AS STRING) || PartitionToken),
+			         StartTimestamp ASC
+			LIMIT @limit`, s.tableName),
+		Params: map[string]interface{}{
+			"state":        screamer.StateCreated,
+			"minWatermark": minWatermark,
+			"limit":        limit,
+		},
+	}
+	return s.schedule(ctx, stmt, runnerID, "GetAndSchedulePartitions")
+}
+
+// GetAndScheduleReadyPartitions finds CREATED partitions whose parents have all
+// FINISHED and assigns up to limit of them to runnerID. The parent check runs in
+// the same read-write transaction as the assignment, so a child is never
+// scheduled while a parent is still being read.
+//
+// A parent with no row may still be on its way: the other parent of a merge can
+// report the child before this parent's own ancestors have reported it. So a
+// missing parent only counts as finished once no unfinished partition has a
+// watermark before the child's start. That also covers a parent that finished
+// and was removed by the row deletion policy.
+func (s *SpannerPartitionStorage) GetAndScheduleReadyPartitions(ctx context.Context, runnerID string, limit int) ([]*screamer.PartitionMetadata, error) {
+	log.Trace().
+		Str("runner_id", runnerID).
+		Int("limit", limit).
+		Msg("GetAndScheduleReadyPartitions called")
+
+	stmt := spanner.Statement{
+		SQL: fmt.Sprintf(`
+			SELECT c.* FROM %[1]s AS c
+			WHERE c.State = @created
+			  AND NOT EXISTS (
+			    SELECT 1 FROM %[1]s AS p
+			    WHERE p.PartitionToken IN UNNEST(c.ParentTokens)
+			      AND p.State != @finished
+			  )
+			  AND (
+			    (SELECT COUNT(*) FROM %[1]s AS p WHERE p.PartitionToken IN UNNEST(c.ParentTokens)) = ARRAY_LENGTH(c.ParentTokens)
+			    OR NOT EXISTS (
+			      SELECT 1 FROM %[1]s AS o
+			      WHERE o.State != @finished
+			        AND o.Watermark < c.StartTimestamp
+			    )
+			  )
+			ORDER BY FARM_FINGERPRINT(CAST(CURRENT_TIMESTAMP() AS STRING) || c.PartitionToken),
+			         c.StartTimestamp ASC
+			LIMIT @limit`, s.tableName),
+		Params: map[string]interface{}{
+			"created":  screamer.StateCreated,
+			"finished": screamer.StateFinished,
+			"limit":    limit,
+		},
+	}
+	return s.schedule(ctx, stmt, runnerID, "GetAndScheduleReadyPartitions")
+}
+
+// schedule runs stmt, which selects CREATED partitions, and assigns every
+// partition it returns to runnerID in the same transaction.
+func (s *SpannerPartitionStorage) schedule(ctx context.Context, stmt spanner.Statement, runnerID, tag string) ([]*screamer.PartitionMetadata, error) {
 	var partitions []*screamer.PartitionMetadata
 
 	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		partitions = make([]*screamer.PartitionMetadata, 0)
 		mutations := make([]*spanner.Mutation, 0)
 
-		// Use randomized ordering to reduce conflicts between runners
-		// No FOR UPDATE - optimistic concurrency handles conflicts via transaction retry
-		stmt := spanner.Statement{
-			SQL: fmt.Sprintf(`
-				SELECT * FROM %s
-				WHERE State = @state
-				  AND StartTimestamp >= @minWatermark
-				ORDER BY FARM_FINGERPRINT(CAST(CURRENT_TIMESTAMP() AS STRING) || PartitionToken),
-				         StartTimestamp ASC
-				LIMIT @limit`, s.tableName),
-			Params: map[string]interface{}{
-				"state":        screamer.StateCreated,
-				"minWatermark": minWatermark,
-				"limit":        limit,
-			},
-		}
-
-		iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "GetAndSchedulePartitions"})
+		iter := tx.QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: tag})
 
 		if err := iter.Do(func(r *spanner.Row) error {
 			p := new(screamer.PartitionMetadata)
@@ -315,7 +365,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 
 		// writes the updates to spanner.
 		return tx.BufferWrite(mutations)
-	}, spanner.TransactionOptions{TransactionTag: "GetAndSchedulePartitions"})
+	}, spanner.TransactionOptions{TransactionTag: tag})
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +376,7 @@ func (s *SpannerPartitionStorage) GetAndSchedulePartitions(ctx context.Context, 
 	log.Trace().
 		Int("partitions", len(partitions)).
 		Str("runner_id", runnerID).
-		Msg("GetAndSchedulePartitions completed")
+		Msg(tag + " completed")
 	return partitions, nil
 }
 
@@ -417,6 +467,36 @@ func (s *SpannerPartitionStorage) UpdateWatermark(ctx context.Context, partition
 	return err
 }
 
+// watermarkBatchSize is the most watermarks written in one transaction.
+const watermarkBatchSize = 500
+
+// UpdateWatermarks writes many partitions' watermarks, in transactions of up to
+// watermarkBatchSize statements. A watermark only moves forward, and a partition
+// that is not in the table is skipped.
+func (s *SpannerPartitionStorage) UpdateWatermarks(ctx context.Context, watermarks []screamer.PartitionWatermark) error {
+	log.Trace().Int("partitions", len(watermarks)).Msg("UpdateWatermarks called")
+	sql := fmt.Sprintf("UPDATE %s SET Watermark = @watermark WHERE PartitionToken = @token AND Watermark < @watermark", s.tableName)
+
+	for start := 0; start < len(watermarks); start += watermarkBatchSize {
+		chunk := watermarks[start:min(start+watermarkBatchSize, len(watermarks))]
+		stmts := make([]spanner.Statement, 0, len(chunk))
+		for _, w := range chunk {
+			stmts = append(stmts, spanner.Statement{
+				SQL:    sql,
+				Params: map[string]interface{}{"token": w.PartitionToken, "watermark": w.Watermark},
+			})
+		}
+		_, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+			_, err := tx.BatchUpdateWithOptions(ctx, stmts, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "UpdateWatermarks"})
+			return err
+		}, spanner.TransactionOptions{TransactionTag: "UpdateWatermarks"})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // GetActiveRunnerCount returns the number of active runners that have refreshed within the last 5 seconds.
 // Used for metrics and observability to understand cluster size.
 func (s *SpannerPartitionStorage) GetActiveRunnerCount(ctx context.Context) (int, error) {
@@ -473,7 +553,11 @@ func (s *SpannerPartitionStorage) CountUnfinishedPartitions(ctx context.Context)
 	return int(count), nil
 }
 
-var _ screamer.PartitionCounter = (*SpannerPartitionStorage)(nil)
+var (
+	_ screamer.PartitionCounter      = (*SpannerPartitionStorage)(nil)
+	_ screamer.ParentGatedScheduler  = (*SpannerPartitionStorage)(nil)
+	_ screamer.WatermarkBatchUpdater = (*SpannerPartitionStorage)(nil)
+)
 
 // Assert that SpannerPartitionStorage implements PartitionStorage.
 var _ screamer.PartitionStorage = (*SpannerPartitionStorage)(nil)
