@@ -22,6 +22,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -124,27 +126,43 @@ func (s *IntegrationTestSuite) createTableAndStream(ctx context.Context, name st
 	defer adminClient.Close()
 
 	streamName := name + "Stream"
-	op, err := adminClient.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
-		Database: s.client.DatabaseName(),
-		Statements: []string{
-			fmt.Sprintf(`CREATE TABLE %s (
-				Bool       BOOL,
-				Int64      INT64,
-				Float64    FLOAT64,
-				String     STRING(MAX),
-				Timestamp  TIMESTAMP,
-			) PRIMARY KEY (Int64)`, name),
-			fmt.Sprintf(`CREATE CHANGE STREAM %s FOR %s`, streamName, name),
-		},
-	})
-	s.NoError(err)
-	if op != nil {
-		s.NoError(op.Wait(ctx))
-	}
+	s.NoError(retrySchemaChange(ctx, func() error {
+		op, err := adminClient.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
+			Database: s.client.DatabaseName(),
+			Statements: []string{
+				fmt.Sprintf(`CREATE TABLE %s (
+					Bool       BOOL,
+					Int64      INT64,
+					Float64    FLOAT64,
+					String     STRING(MAX),
+					Timestamp  TIMESTAMP,
+				) PRIMARY KEY (Int64)`, name),
+				fmt.Sprintf(`CREATE CHANGE STREAM %s FOR %s`, streamName, name),
+			},
+		})
+		if err != nil {
+			return err
+		}
+		return op.Wait(ctx)
+	}))
 
 	// Small delay to ensure DDL operations complete before releasing mutex
 	time.Sleep(100 * time.Millisecond)
 	return name, streamName
+}
+
+// retrySchemaChange retries a schema change that the emulator rejected because a
+// read-write transaction was in progress, such as a runner from an earlier test
+// that is still shutting down. Real Spanner does not have this restriction.
+func retrySchemaChange(ctx context.Context, f func() error) error {
+	var err error
+	for range 40 {
+		if err = f(); status.Code(err) != codes.FailedPrecondition {
+			return err
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return err
 }
 
 func (s *IntegrationTestSuite) setupSpannerStorage(ctx context.Context, runnerID, tableName string) *partitionstorage.SpannerPartitionStorage {
@@ -161,7 +179,7 @@ func (s *IntegrationTestSuite) setupSpannerStorage(ctx context.Context, runnerID
 	if needsMigration {
 		// Serialize DDL operations to avoid conflicts with Spanner emulator
 		s.ddlMutex.Lock()
-		err := storage.RunMigrations(ctx)
+		err := retrySchemaChange(ctx, func() error { return storage.RunMigrations(ctx) })
 		// Small delay to ensure DDL operations complete before releasing mutex
 		time.Sleep(100 * time.Millisecond)
 		s.ddlMutex.Unlock()
@@ -266,7 +284,11 @@ func (s *IntegrationTestSuite) TestSpannerStorage() {
 }
 
 func (s *IntegrationTestSuite) TestInterruptedPartitions() {
-	ctx := context.Background()
+	// Cancelled at the end so the second runner does not keep writing during
+	// later tests: the emulator rejects schema changes while a read-write
+	// transaction is in progress.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runnerID := uuid.NewString()
 	tableName, streamName := s.createTableAndStream(ctx, "interrupted")
 	metaTable := tableName + "_meta"
