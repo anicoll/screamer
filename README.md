@@ -150,6 +150,46 @@ Because partition count is externally driven and non-linear, you should design y
 
 ---
 
+## Running at scale
+
+### Clients
+
+Every open partition is a long-lived streaming query. Give change stream reads their own Spanner client, sized for your partition limit, and give the `PartitionStorage` a separate client:
+
+```go
+reads, err := screamer.NewChangeStreamClient(ctx, database, 400) // 400 partitions → 8 gRPC channels
+metadata, err := spanner.NewClient(ctx, database)
+storage := partitionstorage.NewSpanner(metadata, "PartitionMetadata_FooStream")
+subscriber := screamer.NewSubscriber(reads, "FooStream", runnerID, storage,
+	screamer.WithMaxConcurrentPartitions(400))
+```
+
+The Spanner Go client opens 4 gRPC channels by default, and each channel carries a limited number of concurrent streams (Screamer plans for 50). Past that, new queries queue. If metadata writes share those channels, runner heartbeats stall and other runners take over partitions that are still being read. The CLI does this split automatically; set `--max-concurrent-partitions` to size it.
+
+### Failed partitions
+
+A partition that fails for a reason other than the consumer, such as a dropped stream or a failed metadata write, is retried from its last watermark with exponential backoff (1s doubling to 30s), up to 5 times in a row. The count resets whenever the partition makes progress. Other partitions on the runner keep going. Consumer errors (a failed `Consume`, a nack, an ack timeout) still stop the subscriber. Tune with `WithPartitionMaxRetries(n)`; `0` restores the old stop-on-first-error behaviour.
+
+### Scaling metrics
+
+Pass an OpenTelemetry `MeterProvider` with `WithMeterProvider` (the global provider is used otherwise). Screamer ships no exporter; use the OpenTelemetry Prometheus exporter or an OTLP exporter in your application.
+
+| Metric | Scope | Meaning |
+| --- | --- | --- |
+| `screamer.runners.desired` | cluster | `ceil(unfinished partitions / (WithMaxConcurrentPartitions × 0.75))`. Only reported when a partition limit is set. |
+| `screamer.runners.live` | cluster | Runners that refreshed recently. |
+| `screamer.partitions.unfinished` | cluster | Partitions not yet finished. |
+| `screamer.watermark.lag` | cluster | Seconds the oldest unfinished partition is behind now. If it keeps growing, you are not keeping up. |
+| `screamer.partitions.active` | runner | Partitions this runner is reading. |
+| `screamer.partitions.capacity` | runner | This runner's partition limit. |
+| `screamer.partition.retries` | runner | Partition reads retried after a failure. |
+
+Cluster metrics are read from the metadata table every 15 seconds, and every runner reports the same values, so aggregate them with `max`, not `sum`. Each runner also logs a warning when `desired_runners` is above `live_runners`.
+
+On Kubernetes, `screamer.runners.desired` already is a replica count. An HPA with an `AverageValue` target of 1 on `max(screamer_runners_desired{stream="FooStream"})` (via prometheus-adapter or KEDA) keeps that many runners running. Note that a partition over a runner's limit is not read until a slot frees up, so `desired_runners > live_runners` means some partitions are falling behind.
+
+---
+
 ## Testing with the simulator
 
 The Spanner emulator only ever returns one partition, which never splits, so it cannot test partition scaling. `pkg/simulator` is an in-process change stream that generates a partition topology (initial partitions, then splits and merges over time) and a stream of writes, and serves it through the `screamer.ChangeStreamReader` interface:

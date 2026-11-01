@@ -202,5 +202,21 @@ func (s *InmemoryPartitionStorage) GetActiveRunnerCount(ctx context.Context) (in
 	return 1, nil
 }
 
+// CountUnfinishedPartitions returns the number of partitions that are not FINISHED.
+func (s *InmemoryPartitionStorage) CountUnfinishedPartitions(ctx context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n := 0
+	for _, p := range s.m {
+		if p.State != screamer.StateFinished {
+			n++
+		}
+	}
+	return n, nil
+}
+
+var _ screamer.PartitionCounter = (*InmemoryPartitionStorage)(nil)
+
 // Assert that InmemoryPartitionStorage implements PartitionStorage.
 var _ screamer.PartitionStorage = (*InmemoryPartitionStorage)(nil)

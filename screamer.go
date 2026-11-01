@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/spanner"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -65,6 +68,10 @@ type Subscriber struct {
 	ackTimeout              time.Duration
 	activePartitions        map[string]struct{}
 	partitionCountMu        sync.RWMutex
+	partitionMaxRetries     int
+	partitionRetries        atomic.Int64
+	meterProvider           metric.MeterProvider
+	cluster                 clusterStats
 }
 
 var (
@@ -83,10 +90,11 @@ func NewSubscriber(
 	zerolog.TimeFieldFormat = time.RFC3339Nano
 
 	c := &config{
-		startTimestamp:    time.Now(),
-		endTimestamp:      defaultEndTimestamp,
-		heartbeatInterval: defaultHeartbeatInterval,
-		logLevel:          zerolog.InfoLevel, // Default log level
+		startTimestamp:      time.Now(),
+		endTimestamp:        defaultEndTimestamp,
+		heartbeatInterval:   defaultHeartbeatInterval,
+		logLevel:            zerolog.InfoLevel, // Default log level
+		partitionMaxRetries: defaultPartitionMaxRetries,
 	}
 	for _, o := range options {
 		o.Apply(c)
@@ -116,6 +124,8 @@ func NewSubscriber(
 		maxConcurrentPartitions: c.maxConcurrentPartitions,
 		ackTimeout:              c.ackTimeout,
 		activePartitions:        make(map[string]struct{}),
+		partitionMaxRetries:     c.partitionMaxRetries,
+		meterProvider:           c.meterProvider,
 	}
 }
 
@@ -152,6 +162,13 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 	// reached), so the background loops stop and Subscribe returns.
 	done := make(chan struct{})
 
+	if reg, err := s.registerMetrics(s.meterProvider); err != nil {
+		log.Warn().Err(err).Msg("failed to register metrics; continuing without them")
+	} else {
+		defer func() { _ = reg.Unregister() }()
+	}
+	s.eg.Go(func() error { return s.clusterStatsLoop(ctx, done) })
+
 	s.eg.Go(func() error {
 		ticker := time.NewTicker(time.Second * 2)
 		defer ticker.Stop()
@@ -172,13 +189,26 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 				if metricsCounter >= 15 {
 					metricsCounter = 0
 					metrics := s.GetMetrics()
+					cluster := s.GetClusterMetrics()
 					log.Info().
 						Str("runner_id", s.runnerID).
 						Int("active_partitions", metrics.ActivePartitions).
 						Int("max_concurrent", metrics.MaxConcurrentPartitions).
 						Float64("capacity_used_percent", metrics.CapacityUsedPercent).
 						Int("available_slots", metrics.AvailableSlots).
+						Int64("partition_retries", metrics.PartitionRetries).
+						Int("unfinished_partitions", cluster.UnfinishedPartitions).
+						Int("live_runners", cluster.LiveRunners).
+						Int("desired_runners", cluster.DesiredRunners).
+						Dur("watermark_lag", cluster.WatermarkLag).
 						Msg("partition processing metrics")
+					if cluster.DesiredRunners > cluster.LiveRunners {
+						log.Warn().
+							Int("desired_runners", cluster.DesiredRunners).
+							Int("live_runners", cluster.LiveRunners).
+							Int("unfinished_partitions", cluster.UnfinishedPartitions).
+							Msgf("cluster needs about %d runners to read every partition, %d are live", cluster.DesiredRunners, cluster.LiveRunners)
+					}
 				}
 			case <-done:
 				return nil
@@ -353,10 +383,74 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 	return nil
 }
 
+// consumerError marks an error from the consumer (a failed Consume, a nack or an
+// ack timeout). It is never retried: it stops the subscriber, as before.
+type consumerError struct{ err error }
+
+func (e *consumerError) Error() string { return e.err.Error() }
+func (e *consumerError) Unwrap() error { return e.err }
+
+// queryChangeStream reads one partition to its end. A failure that does not come
+// from the consumer (a dropped stream, a failed metadata write) is retried from the
+// partition's last watermark with exponential backoff, so one bad partition does
+// not stop every other partition on this runner. The retry budget resets whenever
+// the partition makes progress. Once it is spent, the error stops the subscriber.
 func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata) error {
 	s.markPartitionActive(p.PartitionToken)
 	defer s.markPartitionInactive(p.PartitionToken)
 
+	attempt := 0
+	for {
+		before := p.Watermark
+		err := s.readPartition(ctx, p)
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+		var ce *consumerError
+		if errors.As(err, &ce) {
+			return ce.err
+		}
+		if p.Watermark.After(before) {
+			attempt = 0 // made progress since the last failure
+		}
+		if attempt >= s.partitionMaxRetries {
+			return fmt.Errorf("partition %s failed after %d retries: %w", p.PartitionToken, attempt, err)
+		}
+		delay := retryDelay(attempt)
+		attempt++
+		s.partitionRetries.Add(1)
+		log.Warn().Err(err).
+			Str("partition_token", p.PartitionToken).
+			Int("attempt", attempt).
+			Dur("backoff", delay).
+			Msg("partition failed, retrying from last watermark")
+
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
+const (
+	retryBaseDelay = time.Second
+	retryMaxDelay  = 30 * time.Second
+)
+
+// retryDelay is 1s, 2s, 4s ... capped at 30s, with up to 20% jitter so partitions
+// that failed together do not retry together.
+func retryDelay(attempt int) time.Duration {
+	d := retryBaseDelay << attempt
+	if d <= 0 || d > retryMaxDelay {
+		d = retryMaxDelay
+	}
+	return d + time.Duration(rand.Int64N(int64(d)/5+1))
+}
+
+func (s *Subscriber) readPartition(ctx context.Context, p *PartitionMetadata) error {
 	if err := s.partitionStorage.UpdateToRunning(ctx, p); err != nil {
 		return fmt.Errorf("failed to update to running: %w", err)
 	}
@@ -423,10 +517,10 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			wm.set(record.CommitTimestamp)
 			out, err := json.Marshal(record.DecodeToNonSpannerType(p, wm.get()))
 			if err != nil {
-				return err
+				return &consumerError{err}
 			}
 			if err := s.dispatchRecord(out, ackCh); err != nil {
-				return err
+				return &consumerError{err}
 			}
 		}
 		for _, record := range cr.HeartbeatRecords {
@@ -453,10 +547,10 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 			select {
 			case err := <-ackCh:
 				if err != nil {
-					return fmt.Errorf("consumer nacked record: %w", err)
+					return &consumerError{fmt.Errorf("consumer nacked record: %w", err)}
 				}
 			case <-timeoutCh:
-				return fmt.Errorf("ack timeout: consumer did not acknowledge all records within %s", s.ackTimeout)
+				return &consumerError{fmt.Errorf("ack timeout: consumer did not acknowledge all records within %s", s.ackTimeout)}
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -465,6 +559,11 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 
 	if err := s.partitionStorage.UpdateWatermark(ctx, p, wm.get()); err != nil {
 		return fmt.Errorf("failed to update watermark: %w", err)
+	}
+	// Keep the in-process copy current, so a retry resumes from here
+	// whatever the PartitionStorage implementation does with p.
+	if wm.get().After(p.Watermark) {
+		p.Watermark = wm.get()
 	}
 
 	return nil
@@ -541,6 +640,9 @@ type PartitionMetrics struct {
 	CapacityUsedPercent float64
 	// AvailableSlots is the number of additional partitions this runner can accept.
 	AvailableSlots int
+	// PartitionRetries is the number of times a failed partition has been retried
+	// since the subscriber started (see WithPartitionMaxRetries).
+	PartitionRetries int64
 }
 
 // GetMetrics returns current partition processing metrics for observability.
@@ -553,6 +655,7 @@ func (s *Subscriber) GetMetrics() PartitionMetrics {
 		ActivePartitions:        active,
 		MaxConcurrentPartitions: s.maxConcurrentPartitions,
 		AvailableSlots:          available,
+		PartitionRetries:        s.partitionRetries.Load(),
 	}
 
 	// Calculate capacity percentage
