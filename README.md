@@ -171,6 +171,17 @@ sub := screamer.NewSubscriber(nil, "Stream", "runner-1", partitionstorage.NewInm
 
 Run it inside a `testing/synctest` bubble so simulated minutes take milliseconds. `checker.Report(cutoff)` returns missing, duplicate and out-of-order deliveries. See `pkg/simulator/baseline_test.go` for examples.
 
+## Running the tests
+
+| Command | What it runs |
+| --- | --- |
+| `make test` | Everything. |
+| `make test-unit` | Unit tests in every package except the simulator. No Docker needed. |
+| `make test-integration` | `TestIntegrationTestSuite` and `TestSpannerTestSuite`, which start the Spanner emulator with testcontainers. Needs Docker. |
+| `make test-simulator` | `pkg/simulator`, including the baseline scale tests. |
+
+The three `test-*` targets each print a per-package table (pass, fail, skip, time, coverage) and the output of any failed test, and write `test-<group>.json` and `coverage-<group>.out`. CI runs them as separate jobs and posts the tables as one comment on the pull request.
+
 ---
 
 ## Further Reading

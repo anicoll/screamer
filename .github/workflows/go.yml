@@ -24,8 +24,16 @@ jobs:
       - name: Build
         run: go build -v ./...
 
+  # Each test group is its own job so a failing check on the PR says which
+  # group broke. Every job writes a per-package table to its job summary and
+  # uploads its JSON report for the PR comment below.
   test:
+    name: test (${{ matrix.group }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [unit, integration, simulator]
     steps:
       - uses: actions/checkout@v7
 
@@ -34,7 +42,75 @@ jobs:
         with:
           go-version-file: "go.mod"
 
-      - run: go version
-
       - name: Test
-        run: make test
+        run: make test-${{ matrix.group }}
+
+      - name: Upload report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ matrix.group }}
+          path: |
+            test-${{ matrix.group }}.json
+            coverage-${{ matrix.group }}.out
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Posts one comment on the PR with the results of every test group, and
+  # updates it on each push.
+  report:
+    needs: test
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: test-*
+          merge-multiple: true
+
+      - name: Build summary
+        env:
+          # GITHUB_SHA is the merge commit on pull_request events; show the PR head instead.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo '<!-- screamer-test-report -->' > report.md
+          echo "## Test results for ${HEAD_SHA::7}" >> report.md
+          echo >> report.md
+          for group in unit integration simulator; do
+            case $group in
+              unit) title="Unit tests" ;;
+              integration) title="Integration tests (Spanner emulator)" ;;
+              simulator) title="Simulator tests" ;;
+            esac
+            if [ -s "test-$group.json" ]; then
+              GITHUB_STEP_SUMMARY=report.md ./scripts/test-summary.sh "$title" "test-$group.json" > /dev/null
+            else
+              printf '### %s\n\nNo report: the job did not get as far as running tests.\n\n' "$title" >> report.md
+            fi
+          done
+          echo "[Full run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})" >> report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on PR
+        # Pull requests from forks get a read-only token; the job summary still has the report.
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('report.md', 'utf8');
+            const marker = '<!-- screamer-test-report -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
