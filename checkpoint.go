@@ -95,13 +95,18 @@ func (c *checkpointer) pendingCount() int {
 // checkpoint records a partition's watermark after a batch was delivered. With
 // batched checkpoints it is buffered until the next flush; otherwise it is
 // written straight away, as before.
+//
+// A batch that did not move the watermark forward is not recorded. That
+// includes a row with no records, whose watermark is the zero time: writing it
+// would send the partition back to year 1 on its next read.
 func (s *Subscriber) checkpoint(ctx context.Context, p *PartitionMetadata, wm time.Time) error {
+	if !wm.After(p.Watermark) {
+		return nil
+	}
 	if s.checkpointInterval <= 0 {
 		return s.partitionStorage.UpdateWatermark(ctx, p, wm)
 	}
-	if wm.After(p.Watermark) {
-		s.checkpoints.set(p.PartitionToken, wm)
-	}
+	s.checkpoints.set(p.PartitionToken, wm)
 	return nil
 }
 
