@@ -75,6 +75,10 @@ type Subscriber struct {
 	gatedScheduler          ParentGatedScheduler
 	checkpointInterval      time.Duration
 	checkpoints             *checkpointer
+	leaseTTL                time.Duration
+	useLeases               bool
+	leaser                  PartitionLeaser
+	leases                  *leaseSet
 }
 
 var (
@@ -100,6 +104,8 @@ func NewSubscriber(
 		partitionMaxRetries: defaultPartitionMaxRetries,
 		parentGating:        true,
 		checkpointInterval:  defaultCheckpointInterval,
+		leases:              true,
+		leaseTTL:            defaultLeaseTTL,
 	}
 	for _, o := range options {
 		o.Apply(c)
@@ -134,6 +140,9 @@ func NewSubscriber(
 		parentGating:            c.parentGating,
 		checkpointInterval:      c.checkpointInterval,
 		checkpoints:             newCheckpointer(),
+		useLeases:               c.leases,
+		leaseTTL:                c.leaseTTL,
+		leases:                  newLeaseSet(),
 	}
 }
 
@@ -168,6 +177,13 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 			return fmt.Errorf("screamer: parent gating is on but %T does not implement screamer.ParentGatedScheduler; implement it, or turn gating off with WithParentGating(false) (see MIGRATION.md)", s.partitionStorage)
 		}
 		s.gatedScheduler = g
+	}
+	if s.useLeases {
+		l, ok := s.partitionStorage.(PartitionLeaser)
+		if !ok {
+			return fmt.Errorf("screamer: leases are on but %T does not implement screamer.PartitionLeaser; implement it, or turn leases off with WithLeases(false) (see MIGRATION.md)", s.partitionStorage)
+		}
+		s.leaser = l
 	}
 
 	log.Debug().Msg("Starting subscription to change stream")
@@ -245,8 +261,12 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 		}
 	}
 
-	if err := s.processInterruptedPartitions(ctx); err != nil {
-		return err
+	// With leases, claiming covers partitions whose runner went away: their
+	// leases expire and they are claimed like any other.
+	if s.leaser == nil {
+		if err := s.processInterruptedPartitions(ctx); err != nil {
+			return err
+		}
 	}
 
 	s.eg.Go(func() error {
@@ -274,6 +294,9 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 
 	// periodically check for new stale partitions.
 	s.eg.Go(func() error {
+		if s.leaser != nil {
+			return nil
+		}
 		ticker := time.NewTicker(time.Second * 10)
 		defer ticker.Stop()
 		for {
@@ -423,16 +446,28 @@ func (e *consumerError) Unwrap() error { return e.err }
 // partition's last watermark with exponential backoff, so one bad partition does
 // not stop every other partition on this runner. The retry budget resets whenever
 // the partition makes progress. Once it is spent, the error stops the subscriber.
-func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata) error {
+func (s *Subscriber) queryChangeStream(parent context.Context, p *PartitionMetadata) error {
 	s.markPartitionActive(p.PartitionToken)
 	defer s.markPartitionInactive(p.PartitionToken)
+
+	ctx, release := s.leasedContext(parent, p)
+	defer release()
 
 	attempt := 0
 	for {
 		before := p.Watermark
 		err := s.readPartition(ctx, p)
-		if err == nil || ctx.Err() != nil {
+		if err == nil {
+			return nil
+		}
+		if parent.Err() != nil {
 			return err
+		}
+		if errors.Is(context.Cause(ctx), errLeaseLost) {
+			// Another runner owns the partition now and reads it from the last
+			// watermark this runner wrote. Not an error for this runner.
+			log.Info().Str("partition_token", p.PartitionToken).Msg("stopped reading partition: lease lost")
+			return nil
 		}
 		var ce *consumerError
 		if errors.As(err, &ce) {
@@ -675,6 +710,16 @@ type PartitionMetrics struct {
 	// PartitionRetries is the number of times a failed partition has been retried
 	// since the subscriber started (see WithPartitionMaxRetries).
 	PartitionRetries int64
+	// LeasesHeld is the number of partition leases this runner holds. 0 when
+	// leases are off.
+	LeasesHeld int
+	// LeasesLost is the number of leases this runner found taken by another
+	// runner, typically after a pause longer than the lease TTL. Each one
+	// stopped this runner reading that partition. It should stay near zero.
+	LeasesLost int64
+	// LeaseTakeovers is the number of partitions this runner claimed after
+	// another runner's lease on them expired or was released.
+	LeaseTakeovers int64
 }
 
 // GetMetrics returns current partition processing metrics for observability.
@@ -688,6 +733,9 @@ func (s *Subscriber) GetMetrics() PartitionMetrics {
 		MaxConcurrentPartitions: s.maxConcurrentPartitions,
 		AvailableSlots:          available,
 		PartitionRetries:        s.partitionRetries.Load(),
+		LeasesHeld:              s.leases.count(),
+		LeasesLost:              s.leases.lostCount(),
+		LeaseTakeovers:          s.leases.takeoverCount(),
 	}
 
 	// Calculate capacity percentage

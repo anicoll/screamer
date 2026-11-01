@@ -94,7 +94,8 @@ func (c *checkpointer) pendingCount() int {
 
 // checkpoint records a partition's watermark after a batch was delivered. With
 // batched checkpoints it is buffered until the next flush; otherwise it is
-// written straight away, as before.
+// written straight away, as before. With leases, every write is conditional on
+// this runner still holding the partition's lease.
 //
 // A batch that did not move the watermark forward is not recorded. That
 // includes a row with no records, whose watermark is the zero time: writing it
@@ -104,6 +105,9 @@ func (s *Subscriber) checkpoint(ctx context.Context, p *PartitionMetadata, wm ti
 		return nil
 	}
 	if s.checkpointInterval <= 0 {
+		if s.leaser != nil {
+			return s.renewLeases(ctx, []PartitionWatermark{{PartitionToken: p.PartitionToken, Watermark: wm}}, false)
+		}
 		return s.partitionStorage.UpdateWatermark(ctx, p, wm)
 	}
 	s.checkpoints.set(p.PartitionToken, wm)
@@ -111,9 +115,13 @@ func (s *Subscriber) checkpoint(ctx context.Context, p *PartitionMetadata, wm ti
 }
 
 // flushCheckpoints writes every buffered watermark. On failure they are kept
-// for the next flush.
-func (s *Subscriber) flushCheckpoints(ctx context.Context) error {
+// for the next flush. With leases, renewAll also renews the leases of
+// partitions with nothing new to write.
+func (s *Subscriber) flushCheckpoints(ctx context.Context, renewAll bool) error {
 	ws := s.checkpoints.take()
+	if s.leaser != nil {
+		return s.renewLeases(ctx, ws, renewAll)
+	}
 	if len(ws) == 0 {
 		return nil
 	}
@@ -137,17 +145,28 @@ func (s *Subscriber) flushCheckpoints(ctx context.Context) error {
 // checkpointLoop flushes buffered watermarks every checkpointInterval, and once
 // more when the subscriber stops so that as little as possible is redelivered
 // on restart.
+//
+// With leases it also renews every held lease each renewInterval, and runs at
+// least that often whatever the checkpoint interval. On stop it releases the
+// leases, writing their last watermarks, so other runners can take the
+// partitions over at once.
 func (s *Subscriber) checkpointLoop(ctx context.Context, done <-chan struct{}) error {
-	if s.checkpointInterval <= 0 {
+	tick := s.checkpointInterval
+	if s.leaser != nil && (tick <= 0 || tick > s.renewInterval()) {
+		tick = s.renewInterval()
+	}
+	if tick <= 0 {
 		return nil
 	}
-	ticker := time.NewTicker(s.checkpointInterval)
+	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	failures := 0
+	lastRenewAll := time.Now()
 	for {
 		select {
 		case <-ticker.C:
-			if err := s.flushCheckpoints(ctx); err != nil {
+			renewAll := time.Since(lastRenewAll) >= s.renewInterval()-tick/2
+			if err := s.flushCheckpoints(ctx, renewAll); err != nil {
 				if ctx.Err() != nil {
 					continue // stopping; the final flush below handles it
 				}
@@ -159,6 +178,9 @@ func (s *Subscriber) checkpointLoop(ctx context.Context, done <-chan struct{}) e
 				continue
 			}
 			failures = 0
+			if renewAll {
+				lastRenewAll = time.Now()
+			}
 		case <-done:
 			s.finalFlush(ctx)
 			return nil
@@ -172,7 +194,13 @@ func (s *Subscriber) checkpointLoop(ctx context.Context, done <-chan struct{}) e
 func (s *Subscriber) finalFlush(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := s.flushCheckpoints(ctx); err != nil {
+	if s.leaser != nil {
+		if err := s.releaseLeases(ctx); err != nil {
+			log.Warn().Err(err).Msg("failed to release partition leases; other runners will take them over when they expire, from an earlier watermark")
+		}
+		return
+	}
+	if err := s.flushCheckpoints(ctx, false); err != nil {
 		log.Warn().Err(err).Msg("failed to write final checkpoints; those partitions will resume from an earlier watermark")
 	}
 }

@@ -28,6 +28,8 @@ type config struct {
 	meterProvider           metric.MeterProvider
 	parentGating            bool
 	checkpointInterval      time.Duration
+	leases                  bool
+	leaseTTL                time.Duration
 }
 
 type (
@@ -226,4 +228,48 @@ func WithCheckpointInterval(d time.Duration) Option {
 		d = 0
 	}
 	return withCheckpointInterval(d)
+}
+
+type withLeases bool
+
+func (o withLeases) Apply(c *config) {
+	c.leases = bool(o)
+}
+
+// WithLeases sets whether partitions are owned through leases with fencing. It
+// is on by default, and needs a PartitionStorage that implements
+// PartitionLeaser (both built-in storages do; the Spanner one needs the columns
+// that RunMigrations adds, see MIGRATION.md).
+//
+// With leases, a runner keeps a partition until its lease expires (see
+// WithLeaseTTL), and a runner that loses a lease while paused stops reading
+// that partition and writes nothing more for it. Turning leases off goes back
+// to taking over a partition whose runner has not refreshed for 3 seconds, as
+// releases before leases did.
+func WithLeases(enabled bool) Option {
+	return withLeases(enabled)
+}
+
+type withLeaseTTL time.Duration
+
+func (o withLeaseTTL) Apply(c *config) {
+	c.leaseTTL = time.Duration(o)
+}
+
+// WithLeaseTTL sets how long a partition lease lasts without being renewed.
+// Default is 30 seconds; values under 3 seconds are raised to 3 seconds.
+//
+// Leases are renewed every third of the TTL, together with the checkpoint
+// writes, so a pause or a metadata outage shorter than about two thirds of the
+// TTL changes nothing. When a runner dies without releasing its leases, other
+// runners take its partitions over after one TTL. When it stops cleanly, it
+// releases them and they are taken over within about a second.
+//
+// The checkpoint interval (see WithCheckpointInterval) is capped at a third of
+// the TTL, so renewals are never late.
+func WithLeaseTTL(d time.Duration) Option {
+	if d < minLeaseTTL {
+		d = minLeaseTTL
+	}
+	return withLeaseTTL(d)
 }

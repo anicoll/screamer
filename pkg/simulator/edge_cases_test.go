@@ -79,6 +79,43 @@ func (r *recordingStorage) UpdateWatermarks(ctx context.Context, ws []screamer.P
 	return r.InmemoryPartitionStorage.UpdateWatermarks(ctx, ws)
 }
 
+// RenewLeases is where watermarks are written when leases are on (the
+// default), so it records and fails like UpdateWatermarks.
+func (r *recordingStorage) RenewLeases(ctx context.Context, runnerID string, ttl time.Duration, leases []screamer.Lease) ([]string, error) {
+	r.batchCalls.Add(1)
+	if n := r.failBatches.Load(); n != 0 {
+		if n > 0 {
+			r.failBatches.Add(-1)
+		}
+		return nil, errStorageDown
+	}
+	lost, err := r.InmemoryPartitionStorage.RenewLeases(ctx, runnerID, ttl, leases)
+	if err == nil {
+		r.recordLeases(leases, lost)
+	}
+	return lost, err
+}
+
+func (r *recordingStorage) ReleaseLeases(ctx context.Context, runnerID string, leases []screamer.Lease) error {
+	if err := r.InmemoryPartitionStorage.ReleaseLeases(ctx, runnerID, leases); err != nil {
+		return err
+	}
+	r.recordLeases(leases, nil)
+	return nil
+}
+
+func (r *recordingStorage) recordLeases(leases []screamer.Lease, lost []string) {
+	skip := make(map[string]bool, len(lost))
+	for _, t := range lost {
+		skip[t] = true
+	}
+	for _, l := range leases {
+		if !l.Watermark.IsZero() && !skip[l.PartitionToken] {
+			r.record(l.PartitionToken, l.Watermark)
+		}
+	}
+}
+
 func simOptions(sim *simulator.Simulator, start, end time.Time, extra ...screamer.Option) []screamer.Option {
 	return append([]screamer.Option{
 		screamer.WithChangeStreamReader(sim),

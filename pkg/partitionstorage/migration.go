@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 )
@@ -72,9 +73,32 @@ func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 	partitionMetaIndexStmt := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %[1]s_idx ON %[1]s(%[2]s) STORING (%[3]s, %[4]s, %[5]s, %[6]s, %[7]s, %[8]s, %[9]s, %[10]s, %[11]s)`,
 		s.tableName, columnWatermark, columnCreatedAt, columnEndTimestamp, columnFinishedAt, columnHeartbeatMillis, columnParentTokens, columnRunningAt, columnScheduledAt, columnStartTimestamp, columnState)
 
+	stmts := []string{partitionStmt, partitionToRunnerStmt, runnerStmt, runnerIndexStmt, partitionMetaIndexStmt}
+
+	// Lease columns, added to tables created before leases. Spanner has no
+	// ADD COLUMN IF NOT EXISTS, so add only the ones that are missing.
+	existing, err := s.columns(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range []struct{ name, ddl string }{
+		{columnOwner, "STRING(MAX)"},
+		{columnEpoch, "INT64"},
+		{columnLeaseExpiresAt, "TIMESTAMP"},
+	} {
+		if !existing[c.name] {
+			stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", s.tableName, c.name, c.ddl))
+		}
+	}
+
+	// Unfinished partitions by state. Scheduling, claiming and counting read
+	// only these rows instead of scanning up to a day of finished ones.
+	stmts = append(stmts, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %[1]s_%[2]s_idx ON %[1]s(%[2]s, %[3]s) STORING (%[4]s, %[5]s, %[6]s, %[7]s, %[8]s)`,
+		s.tableName, columnState, columnWatermark, columnParentTokens, columnStartTimestamp, columnOwner, columnEpoch, columnLeaseExpiresAt))
+
 	req := &databasepb.UpdateDatabaseDdlRequest{
 		Database:   s.client.DatabaseName(),
-		Statements: []string{partitionStmt, partitionToRunnerStmt, runnerStmt, runnerIndexStmt, partitionMetaIndexStmt},
+		Statements: stmts,
 	}
 	op, err := databaseAdminClient.UpdateDatabaseDdl(ctx, req)
 	if err != nil {
@@ -86,4 +110,26 @@ func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// columns returns the names of the metadata table's columns, or none if the
+// table does not exist yet.
+func (s *SpannerPartitionStorage) columns(ctx context.Context) (map[string]bool, error) {
+	stmt := spanner.Statement{
+		SQL:    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @table",
+		Params: map[string]interface{}{"table": s.tableName},
+	}
+	cols := map[string]bool{}
+	err := s.client.Single().Query(ctx, stmt).Do(func(r *spanner.Row) error {
+		var name string
+		if err := r.Columns(&name); err != nil {
+			return err
+		}
+		cols[name] = true
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the columns of %s: %w", s.tableName, err)
+	}
+	return cols, nil
 }

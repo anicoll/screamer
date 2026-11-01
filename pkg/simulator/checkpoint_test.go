@@ -14,23 +14,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// countingStorage counts watermark writes.
+// countingStorage counts watermark writes, whichever method makes them.
 type countingStorage struct {
 	*partitionstorage.InmemoryPartitionStorage
-	single  atomic.Int64 // UpdateWatermark calls
-	batches atomic.Int64 // UpdateWatermarks calls
-	batched atomic.Int64 // watermarks written by UpdateWatermarks
+	single atomic.Int64 // UpdateWatermark calls
+	writes atomic.Int64 // calls that wrote at least one watermark
+	rows   atomic.Int64 // watermarks written
 }
 
 func (c *countingStorage) UpdateWatermark(ctx context.Context, p *screamer.PartitionMetadata, wm time.Time) error {
 	c.single.Add(1)
+	c.writes.Add(1)
+	c.rows.Add(1)
 	return c.InmemoryPartitionStorage.UpdateWatermark(ctx, p, wm)
 }
 
 func (c *countingStorage) UpdateWatermarks(ctx context.Context, ws []screamer.PartitionWatermark) error {
-	c.batches.Add(1)
-	c.batched.Add(int64(len(ws)))
+	c.writes.Add(1)
+	c.rows.Add(int64(len(ws)))
 	return c.InmemoryPartitionStorage.UpdateWatermarks(ctx, ws)
+}
+
+// RenewLeases writes watermarks when leases are on. Renewals with no watermark
+// to write are not counted.
+func (c *countingStorage) RenewLeases(ctx context.Context, runnerID string, ttl time.Duration, leases []screamer.Lease) ([]string, error) {
+	n := 0
+	for _, l := range leases {
+		if !l.Watermark.IsZero() {
+			n++
+		}
+	}
+	if n > 0 {
+		c.writes.Add(1)
+		c.rows.Add(int64(n))
+	}
+	return c.InmemoryPartitionStorage.RenewLeases(ctx, runnerID, ttl, leases)
 }
 
 func runCounting(t *testing.T, opts ...screamer.Option) (*countingStorage, simulator.Report, time.Duration) {
@@ -77,19 +95,19 @@ func TestCheckpoints_AreBatched(t *testing.T) {
 	perBatch, r0, _ := runCounting(t, screamer.WithCheckpointInterval(0))
 	batched, r1, horizon := runCounting(t)
 
-	t.Logf("per batch: %d writes; batched: %d flushes holding %d watermarks", perBatch.single.Load(), batched.batches.Load(), batched.batched.Load())
+	t.Logf("per batch: %d writes of %d watermarks; batched: %d writes of %d watermarks",
+		perBatch.writes.Load(), perBatch.rows.Load(), batched.writes.Load(), batched.rows.Load())
 	require.Zero(t, r0.Missing)
 	require.Zero(t, r1.Missing)
 	require.Zero(t, r1.OrderViolations)
 
-	require.Zero(t, perBatch.batches.Load())
 	require.Zero(t, batched.single.Load(), "batched checkpoints should not write watermarks one at a time")
-	// About one flush per second of the run.
-	require.LessOrEqual(t, batched.batches.Load(), int64(horizon/time.Second)+5)
+	// About one write per second of the run.
+	require.LessOrEqual(t, batched.writes.Load(), int64(horizon/time.Second)+5)
 	// Far fewer storage transactions, and never more rows: each partition is
 	// written at most once per flush however many batches it read.
-	require.Less(t, batched.batches.Load()*20, perBatch.single.Load())
-	require.LessOrEqual(t, batched.batched.Load(), perBatch.single.Load())
+	require.Less(t, batched.writes.Load()*20, perBatch.writes.Load())
+	require.LessOrEqual(t, batched.rows.Load(), perBatch.rows.Load())
 }
 
 // When the subscriber stops, buffered watermarks are written one last time, so a

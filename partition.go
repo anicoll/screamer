@@ -15,6 +15,15 @@ type PartitionMetadata struct {
 	ScheduledAt     *time.Time `spanner:"ScheduledAt" json:"scheduled_at,omitempty"`
 	RunningAt       *time.Time `spanner:"RunningAt" json:"running_at,omitempty"`
 	FinishedAt      *time.Time `spanner:"FinishedAt" json:"finished_at,omitempty"`
+
+	// Owner is the runner holding the partition's lease, if any. Only set when
+	// leases are on (see PartitionLeaser).
+	Owner *string `spanner:"Owner" json:"owner,omitempty"`
+	// Epoch counts the times the partition has been claimed. Each claim
+	// increments it, and a lease is only valid at the epoch it was claimed at.
+	Epoch *int64 `spanner:"Epoch" json:"epoch,omitempty"`
+	// LeaseExpiresAt is when the owner's lease lapses unless it is renewed.
+	LeaseExpiresAt *time.Time `spanner:"LeaseExpiresAt" json:"lease_expires_at,omitempty"`
 }
 
 // State represents the state of a partition in the change stream lifecycle.
