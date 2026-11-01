@@ -6,36 +6,43 @@ import (
 	"cloud.google.com/go/spanner"
 )
 
+// ChangeRecord is one row of a change stream query result, as returned by the
+// READ_<stream> table-valued function (GoogleSQL dialect).
 type ChangeRecord struct {
-	DataChangeRecords      []*dataChangeRecord      `spanner:"data_change_record" json:"data_change_record"`
+	DataChangeRecords      []*RawDataChangeRecord   `spanner:"data_change_record" json:"data_change_record"`
 	HeartbeatRecords       []*HeartbeatRecord       `spanner:"heartbeat_record" json:"heartbeat_record"`
 	ChildPartitionsRecords []*ChildPartitionsRecord `spanner:"child_partitions_record" json:"child_partitions_record"`
 }
 
-type dataChangeRecord struct {
-	CommitTimestamp                      time.Time     `spanner:"commit_timestamp" json:"commit_timestamp"`
-	RecordSequence                       string        `spanner:"record_sequence" json:"record_sequence"`
-	ServerTransactionID                  string        `spanner:"server_transaction_id" json:"server_transaction_id"`
-	IsLastRecordInTransactionInPartition bool          `spanner:"is_last_record_in_transaction_in_partition" json:"is_last_record_in_transaction_in_partition"`
-	TableName                            string        `spanner:"table_name" json:"table_name"`
-	ColumnTypes                          []*columnType `spanner:"column_types" json:"column_types"`
-	Mods                                 []*mod        `spanner:"mods" json:"mods"`
-	ModType                              string        `spanner:"mod_type" json:"mod_type"`
-	ValueCaptureType                     string        `spanner:"value_capture_type" json:"value_capture_type"`
-	NumberOfRecordsInTransaction         int64         `spanner:"number_of_records_in_transaction" json:"number_of_records_in_transaction"`
-	NumberOfPartitionsInTransaction      int64         `spanner:"number_of_partitions_in_transaction" json:"number_of_partitions_in_transaction"`
-	TransactionTag                       string        `spanner:"transaction_tag" json:"transaction_tag"`
-	IsSystemTransaction                  bool          `spanner:"is_system_transaction" json:"is_system_transaction"`
+// RawDataChangeRecord is a data change record as returned by Spanner, before it is
+// decoded into DataChangeRecord. It is exported so that ChangeStreamReader
+// implementations (for example test simulators) can build change records.
+type RawDataChangeRecord struct {
+	CommitTimestamp                      time.Time        `spanner:"commit_timestamp" json:"commit_timestamp"`
+	RecordSequence                       string           `spanner:"record_sequence" json:"record_sequence"`
+	ServerTransactionID                  string           `spanner:"server_transaction_id" json:"server_transaction_id"`
+	IsLastRecordInTransactionInPartition bool             `spanner:"is_last_record_in_transaction_in_partition" json:"is_last_record_in_transaction_in_partition"`
+	TableName                            string           `spanner:"table_name" json:"table_name"`
+	ColumnTypes                          []*RawColumnType `spanner:"column_types" json:"column_types"`
+	Mods                                 []*RawMod        `spanner:"mods" json:"mods"`
+	ModType                              string           `spanner:"mod_type" json:"mod_type"`
+	ValueCaptureType                     string           `spanner:"value_capture_type" json:"value_capture_type"`
+	NumberOfRecordsInTransaction         int64            `spanner:"number_of_records_in_transaction" json:"number_of_records_in_transaction"`
+	NumberOfPartitionsInTransaction      int64            `spanner:"number_of_partitions_in_transaction" json:"number_of_partitions_in_transaction"`
+	TransactionTag                       string           `spanner:"transaction_tag" json:"transaction_tag"`
+	IsSystemTransaction                  bool             `spanner:"is_system_transaction" json:"is_system_transaction"`
 }
 
-type columnType struct {
+// RawColumnType is the column metadata of a RawDataChangeRecord.
+type RawColumnType struct {
 	Name            string           `spanner:"name" json:"name"`
 	Type            spanner.NullJSON `spanner:"type" json:"type"`
 	IsPrimaryKey    bool             `spanner:"is_primary_key" json:"is_primary_key"`
 	OrdinalPosition int64            `spanner:"ordinal_position" json:"ordinal_position"`
 }
 
-type mod struct {
+// RawMod is one modified row of a RawDataChangeRecord.
+type RawMod struct {
 	Keys      spanner.NullJSON `spanner:"keys" json:"keys"`
 	NewValues spanner.NullJSON `spanner:"new_values" json:"new_values"`
 	OldValues spanner.NullJSON `spanner:"old_values" json:"old_values"`
@@ -128,7 +135,7 @@ type ChildPartition struct {
 	ParentPartitionTokens []string `spanner:"parent_partition_tokens" json:"parent_partition_tokens"`
 }
 
-func (r *dataChangeRecord) DecodeToNonSpannerType(p *PartitionMetadata, watermark time.Time) *DataChangeRecordWithPartitionMeta {
+func (r *RawDataChangeRecord) DecodeToNonSpannerType(p *PartitionMetadata, watermark time.Time) *DataChangeRecordWithPartitionMeta {
 	columnTypes := []*ColumnType{}
 	for _, t := range r.ColumnTypes {
 		columnTypes = append(columnTypes, &ColumnType{

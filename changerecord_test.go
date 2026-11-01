@@ -26,7 +26,7 @@ func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 
 	tests := []struct {
 		name          string
-		record        *dataChangeRecord
+		record        *RawDataChangeRecord
 		expectedTable string
 		expectedType  ModType
 		expectedMods  int
@@ -34,17 +34,17 @@ func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 	}{
 		{
 			name: "insert_basic_types",
-			record: &dataChangeRecord{
+			record: &RawDataChangeRecord{
 				CommitTimestamp:                      commitTime,
 				RecordSequence:                       "seq-001",
 				ServerTransactionID:                  "txn-001",
 				IsLastRecordInTransactionInPartition: true,
 				TableName:                            "users",
-				ColumnTypes: []*columnType{
+				ColumnTypes: []*RawColumnType{
 					{Name: "id", Type: spanner.NullJSON{Valid: true, Value: map[string]interface{}{"code": "INT64"}}, IsPrimaryKey: true, OrdinalPosition: 1},
 					{Name: "name", Type: spanner.NullJSON{Valid: true, Value: map[string]interface{}{"code": "STRING"}}, IsPrimaryKey: false, OrdinalPosition: 2},
 				},
-				Mods: []*mod{
+				Mods: []*RawMod{
 					{
 						Keys:      spanner.NullJSON{Valid: true, Value: map[string]interface{}{"id": int64(1)}},
 						NewValues: spanner.NullJSON{Valid: true, Value: map[string]interface{}{"id": int64(1), "name": "John"}},
@@ -65,11 +65,11 @@ func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 		},
 		{
 			name: "update_with_array",
-			record: &dataChangeRecord{
+			record: &RawDataChangeRecord{
 				CommitTimestamp: commitTime,
 				RecordSequence:  "seq-002",
 				TableName:       "products",
-				ColumnTypes: []*columnType{
+				ColumnTypes: []*RawColumnType{
 					{
 						Name: "tags",
 						Type: spanner.NullJSON{Valid: true, Value: map[string]interface{}{
@@ -80,7 +80,7 @@ func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 						OrdinalPosition: 1,
 					},
 				},
-				Mods: []*mod{
+				Mods: []*RawMod{
 					{
 						Keys:      spanner.NullJSON{Valid: true, Value: map[string]interface{}{"id": int64(1)}},
 						NewValues: spanner.NullJSON{Valid: true, Value: map[string]interface{}{"tags": []string{"tag1", "tag2"}}},
@@ -96,12 +96,12 @@ func TestDataChangeRecord_DecodeToNonSpannerType(t *testing.T) {
 		},
 		{
 			name: "delete_with_nulls",
-			record: &dataChangeRecord{
+			record: &RawDataChangeRecord{
 				CommitTimestamp: commitTime,
 				RecordSequence:  "seq-003",
 				TableName:       "deleted_items",
-				ColumnTypes:     []*columnType{},
-				Mods: []*mod{
+				ColumnTypes:     []*RawColumnType{},
+				Mods: []*RawMod{
 					{
 						Keys:      spanner.NullJSON{Valid: true, Value: map[string]interface{}{"id": int64(1)}},
 						NewValues: spanner.NullJSON{Valid: false},
