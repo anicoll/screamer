@@ -40,7 +40,9 @@ func (s *InmemoryPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx contex
 	}
 
 	sort.Slice(partitions, func(i, j int) bool { return partitions[i].Watermark.Before(partitions[j].Watermark) })
-	return partitions[0], nil
+	// Return a copy: the stored partition keeps changing under s.mu while the caller reads it.
+	c := *partitions[0]
+	return &c, nil
 }
 
 // GetInterruptedPartitions is a no-op for in-memory storage and always returns nil.
@@ -99,10 +101,11 @@ func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context,
 			break
 		}
 		if p.State == screamer.StateCreated && !minWatermark.After(p.StartTimestamp) {
-			p = s.m[p.PartitionToken]
 			p.ScheduledAt = &now
 			p.State = screamer.StateScheduled
-			partitions = append(partitions, p)
+			// Return a copy: the stored partition keeps changing under s.mu while the caller reads it.
+			c := *p
+			partitions = append(partitions, &c)
 		}
 	}
 
@@ -120,6 +123,11 @@ func (s *InmemoryPartitionStorage) AddChildPartitions(ctx context.Context, paren
 	defer s.mu.Unlock()
 
 	for _, v := range r.ChildPartitions {
+		// A merged child is reported by every parent; only the first report creates it.
+		// Overwriting it would reset a running or finished child to CREATED and read it again.
+		if _, ok := s.m[v.Token]; ok {
+			continue
+		}
 		p := &screamer.PartitionMetadata{
 			PartitionToken:  v.Token,
 			ParentTokens:    v.ParentPartitionTokens,

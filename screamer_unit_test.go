@@ -302,7 +302,7 @@ func makePartitionAndRecords(commitTime time.Time) (*PartitionMetadata, []*Chang
 	}
 	records := []*ChangeRecord{
 		{
-			DataChangeRecords: []*dataChangeRecord{
+			DataChangeRecords: []*RawDataChangeRecord{
 				{
 					CommitTimestamp: commitTime,
 					TableName:       "TestTable",
@@ -399,7 +399,7 @@ func TestHandleWithAck(t *testing.T) {
 			// Three records in one batch
 			records := []*ChangeRecord{
 				{
-					DataChangeRecords: []*dataChangeRecord{
+					DataChangeRecords: []*RawDataChangeRecord{
 						{CommitTimestamp: commitTime, TableName: "T", ModType: "INSERT"},
 						{CommitTimestamp: commitTime.Add(time.Millisecond), TableName: "T", ModType: "UPDATE"},
 						{CommitTimestamp: commitTime.Add(2 * time.Millisecond), TableName: "T", ModType: "DELETE"},
@@ -563,7 +563,7 @@ func TestHandleWithAck(t *testing.T) {
 		}
 		records := []*ChangeRecord{
 			{
-				DataChangeRecords: []*dataChangeRecord{
+				DataChangeRecords: []*RawDataChangeRecord{
 					{CommitTimestamp: commitTime, TableName: "T", ModType: "INSERT"},
 					{CommitTimestamp: commitTime.Add(time.Millisecond), TableName: "T", ModType: "UPDATE"},
 				},

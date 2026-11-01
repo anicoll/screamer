@@ -54,6 +54,7 @@ type Subscriber struct {
 	spannerRequestPriority spannerpb.RequestOptions_Priority
 
 	partitionStorage        PartitionStorage
+	reader                  ChangeStreamReader
 	consumer                Consumer
 	consumerWithAck         ConsumerWithAck
 	eg                      *errgroup.Group
@@ -92,8 +93,18 @@ func NewSubscriber(
 	}
 	zerolog.SetGlobalLevel(c.logLevel)
 
+	reader := c.changeStreamReader
+	if reader == nil {
+		reader = &spannerChangeStreamReader{
+			client:     client,
+			streamName: streamName,
+			priority:   c.spannerRequestPriority,
+		}
+	}
+
 	return &Subscriber{
 		spannerClient:           client,
+		reader:                  reader,
 		streamName:              streamName,
 		startTimestamp:          c.startTimestamp,
 		endTimestamp:            c.endTimestamp,
@@ -137,6 +148,10 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 	log.Debug().Msg("Starting subscription to change stream")
 	ctx = s.initErrGroup(ctx)
 
+	// done is closed when every partition has finished (the end timestamp was
+	// reached), so the background loops stop and Subscribe returns.
+	done := make(chan struct{})
+
 	s.eg.Go(func() error {
 		ticker := time.NewTicker(time.Second * 2)
 		defer ticker.Stop()
@@ -165,6 +180,8 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 						Int("available_slots", metrics.AvailableSlots).
 						Msg("partition processing metrics")
 				}
+			case <-done:
+				return nil
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -195,6 +212,7 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 				err := s.detectNewPartitions(ctx)
 				switch err {
 				case errDone:
+					close(done)
 					return nil
 				case nil:
 					// continue
@@ -224,6 +242,8 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 				default:
 					return err
 				}
+			case <-done:
+				return nil
 			case <-ctx.Done():
 				err := ctx.Err()
 				return err
@@ -341,28 +361,7 @@ func (s *Subscriber) queryChangeStream(ctx context.Context, p *PartitionMetadata
 		return fmt.Errorf("failed to update to running: %w", err)
 	}
 
-	stmt := spanner.Statement{
-		SQL: fmt.Sprintf("SELECT ChangeRecord FROM READ_%s (@startTimestamp, @endTimestamp, @partitionToken, @heartbeatMilliseconds)", s.streamName),
-		Params: map[string]interface{}{
-			"startTimestamp":        p.Watermark,
-			"endTimestamp":          p.EndTimestamp,
-			"partitionToken":        p.PartitionToken,
-			"heartbeatMilliseconds": p.HeartbeatMillis,
-		},
-	}
-
-	if p.IsRootPartition() {
-		// Must be converted to NULL (root partition).
-		stmt.Params["partitionToken"] = nil
-	}
-
-	iter := s.spannerClient.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.spannerRequestPriority})
-
-	if err := iter.Do(func(r *spanner.Row) error {
-		records := []*ChangeRecord{}
-		if err := r.Columns(&records); err != nil {
-			return err
-		}
+	if err := s.reader.Read(ctx, p, func(records []*ChangeRecord) error {
 		log.Trace().
 			Str("partition_token", p.PartitionToken).
 			Int("num_records", len(records)).

@@ -150,6 +150,29 @@ Because partition count is externally driven and non-linear, you should design y
 
 ---
 
+## Testing with the simulator
+
+The Spanner emulator only ever returns one partition, which never splits, so it cannot test partition scaling. `pkg/simulator` is an in-process change stream that generates a partition topology (initial partitions, then splits and merges over time) and a stream of writes, and serves it through the `screamer.ChangeStreamReader` interface:
+
+```go
+sim := simulator.New(simulator.Config{
+	InitialPartitions:     500,
+	MeanPartitionLifetime: 2 * time.Minute,
+	MergeFraction:         0.3,
+	WritesPerSecond:       200,
+	HotKeyFraction:        0.01, // 1% of keys get 90% of writes, so most partitions are idle
+	HotWriteShare:         0.9,
+	MaxConcurrentStreams:  400,  // model running out of gRPC streams
+})
+checker := simulator.NewChecker(sim) // a Consumer that checks delivery and per-key order
+sub := screamer.NewSubscriber(nil, "Stream", "runner-1", partitionstorage.NewInmemory(),
+	screamer.WithChangeStreamReader(sim))
+```
+
+Run it inside a `testing/synctest` bubble so simulated minutes take milliseconds. `checker.Report(cutoff)` returns missing, duplicate and out-of-order deliveries. See `pkg/simulator/baseline_test.go` for examples.
+
+---
+
 ## Further Reading
 
 - [Change streams overview](https://cloud.google.com/spanner/docs/change-streams) — high-level introduction to Cloud Spanner change streams

@@ -22,6 +22,7 @@ type config struct {
 	logLevel                zerolog.Level
 	maxConcurrentPartitions int
 	ackTimeout              time.Duration
+	changeStreamReader      ChangeStreamReader
 }
 
 type (
@@ -126,4 +127,18 @@ func (o withAckTimeout) Apply(c *config) {
 // A value of 0 (default) disables the timeout — the subscriber waits indefinitely.
 func WithAckTimeout(d time.Duration) Option {
 	return withAckTimeout(d)
+}
+
+type withChangeStreamReader struct{ r ChangeStreamReader }
+
+func (o withChangeStreamReader) Apply(c *config) {
+	c.changeStreamReader = o.r
+}
+
+// WithChangeStreamReader replaces the reader used to query change stream partitions.
+// By default the subscriber queries Spanner's READ_<stream> function with the client
+// passed to NewSubscriber. Use this option to run the subscriber against a simulated
+// change stream (see pkg/simulator) or to wrap the default behaviour.
+func WithChangeStreamReader(r ChangeStreamReader) Option {
+	return withChangeStreamReader{r: r}
 }
