@@ -170,6 +170,18 @@ The Spanner Go client opens 4 gRPC channels by default, and each channel carries
 
 A partition that fails for a reason other than the consumer, such as a dropped stream or a failed metadata write, is retried from its last watermark with exponential backoff (1s doubling to 30s), up to 5 times in a row. The count resets whenever the partition makes progress. Other partitions on the runner keep going. Consumer errors (a failed `Consume`, a nack, an ack timeout) still stop the subscriber. Tune with `WithPartitionMaxRetries(n)`; `0` restores the old stop-on-first-error behaviour.
 
+### Ordering across splits and merges
+
+When a partition splits or merges, its children carry on from where it ended. A merged child has several parents, and they can finish at very different times, for example while one of them is catching up. Screamer reads a child only once every one of its parents has finished, so changes to each key are delivered in commit order. This is parent gating, and it is on by default.
+
+`WithParentGating(false)` turns it off and schedules a child as soon as any parent reports it, as releases before it did. Children then start sooner, but a key can be delivered out of order when one parent is behind. Parent gating needs a `PartitionStorage` that implements `screamer.ParentGatedScheduler`; both built-in storages do, and [MIGRATION.md](MIGRATION.md) covers custom ones.
+
+### Checkpoints
+
+After each batch is delivered, Screamer records the partition's watermark, the point it resumes from after a restart or a takeover. Watermarks are buffered in memory and written together once a second, in one transaction of up to 500 partitions, rather than once per batch per partition. With thousands of partitions that each heartbeat every few seconds, that turns thousands of small writes a second into one. Watermarks only ever move forward, and are written one last time when the subscriber stops.
+
+The trade-off: after a crash, a partition resumes from its last written watermark, so up to one interval of changes can be delivered again. Delivery was already at-least-once. Tune it with `WithCheckpointInterval(d)`; `0` writes after every batch, as before.
+
 ### Scaling metrics
 
 Pass an OpenTelemetry `MeterProvider` with `WithMeterProvider` (the global provider is used otherwise). Screamer ships no exporter; use the OpenTelemetry Prometheus exporter or an OTLP exporter in your application.

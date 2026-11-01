@@ -19,12 +19,16 @@ import (
 )
 
 func newSubscriber(sim *simulator.Simulator, opts ...screamer.Option) *screamer.Subscriber {
+	return newSubscriberWithStore(sim, partitionstorage.NewInmemory(), opts...)
+}
+
+func newSubscriberWithStore(sim *simulator.Simulator, store screamer.PartitionStorage, opts ...screamer.Option) *screamer.Subscriber {
 	base := []screamer.Option{
 		screamer.WithChangeStreamReader(sim),
 		screamer.WithHeartbeatInterval(time.Second),
 		screamer.WithLogLevel("error"),
 	}
-	return screamer.NewSubscriber(nil, "SimStream", "runner-1", partitionstorage.NewInmemory(), append(base, opts...)...)
+	return screamer.NewSubscriber(nil, "SimStream", "runner-1", store, append(base, opts...)...)
 }
 
 // With enough capacity and a bounded end timestamp, every write is delivered
@@ -95,32 +99,58 @@ func TestBaseline_ConcurrencyCapStarvesPartitions(t *testing.T) {
 	})
 }
 
-// Known problem 6: a child partition is scheduled as soon as any parent reports
-// it, without waiting for every parent to finish. When a parent is behind (here
-// because queries queue for gRPC streams while catching up), records for the
-// same key are delivered out of commit order.
-func TestBaseline_NoParentGatingBreaksPerKeyOrder(t *testing.T) {
+// orderScenario catches up on ten minutes of history with heavy merging, while
+// queries queue for gRPC streams, so merged children often have a parent that
+// is far behind.
+func orderScenario(start time.Time) simulator.Config {
+	return simulator.Config{
+		Seed:                  3,
+		Start:                 start,
+		Horizon:               10 * time.Minute,
+		InitialPartitions:     30,
+		KeySpace:              3_000,
+		MeanPartitionLifetime: time.Minute,
+		MergeFraction:         0.5,
+		MinPartitions:         10,
+		MaxPartitions:         60,
+		WritesPerSecond:       100,
+		QueryLatency:          200 * time.Millisecond,
+		MaxConcurrentStreams:  8,
+	}
+}
+
+// Known problem 6, now fixed by parent gating (on by default): a child partition
+// waits until every parent has finished, so changes to each key are delivered in
+// commit order through splits and merges.
+func TestParentGating_KeepsPerKeyOrder(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		now := time.Now()
-		start := now.Add(-10 * time.Minute) // catch up on ten minutes of history
-		sim := simulator.New(simulator.Config{
-			Seed:                  3,
-			Start:                 start,
-			Horizon:               10 * time.Minute,
-			InitialPartitions:     30,
-			KeySpace:              3_000,
-			MeanPartitionLifetime: time.Minute,
-			MergeFraction:         0.5,
-			MinPartitions:         10,
-			MaxPartitions:         60,
-			WritesPerSecond:       100,
-			QueryLatency:          200 * time.Millisecond,
-			MaxConcurrentStreams:  8,
-		})
+		start := time.Now().Add(-10 * time.Minute)
+		sim := simulator.New(orderScenario(start))
 		checker := simulator.NewChecker(sim)
 		end := start.Add(10 * time.Minute)
 
 		sub := newSubscriber(sim, screamer.WithStartTimestamp(start), screamer.WithEndTimestamp(end))
+		require.NoError(t, sub.Subscribe(context.Background(), checker))
+
+		r := checker.Report(end)
+		t.Logf("partitions=%d merges=%d %s stats=%+v", len(sim.Partitions()), sim.Merges(), r, sim.Stats())
+		require.Positive(t, sim.Merges())
+		require.Zero(t, r.Missing)
+		require.Zero(t, r.OrderViolations)
+	})
+}
+
+// With WithParentGating(false), a child partition is scheduled as soon as any
+// parent reports it. When another parent is behind, changes to the same key are
+// delivered out of commit order. This is what releases before parent gating did.
+func TestParentGatingOff_BreaksPerKeyOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now().Add(-10 * time.Minute)
+		sim := simulator.New(orderScenario(start))
+		checker := simulator.NewChecker(sim)
+		end := start.Add(10 * time.Minute)
+
+		sub := newSubscriber(sim, screamer.WithStartTimestamp(start), screamer.WithEndTimestamp(end), screamer.WithParentGating(false))
 		require.NoError(t, sub.Subscribe(context.Background(), checker))
 
 		r := checker.Report(end)

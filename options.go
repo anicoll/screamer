@@ -26,6 +26,8 @@ type config struct {
 	changeStreamReader      ChangeStreamReader
 	partitionMaxRetries     int
 	meterProvider           metric.MeterProvider
+	parentGating            bool
+	checkpointInterval      time.Duration
 }
 
 type (
@@ -184,4 +186,44 @@ func (o withMeterProvider) Apply(c *config) {
 // screamer.runners.desired, screamer.watermark.lag.
 func WithMeterProvider(mp metric.MeterProvider) Option {
 	return withMeterProvider{mp: mp}
+}
+
+type withParentGating bool
+
+func (o withParentGating) Apply(c *config) {
+	c.parentGating = bool(o)
+}
+
+// WithParentGating sets whether a child partition waits for all of its parents
+// to finish before it is read. It is on by default, which keeps changes to each
+// key in commit order across partition splits and merges, and needs a
+// PartitionStorage that implements ParentGatedScheduler (both built-in storages
+// do).
+//
+// Turning it off schedules a child as soon as it is reported, as releases
+// before parent gating did. That can deliver changes to the same key out of
+// order when a merged child's other parent is behind.
+func WithParentGating(enabled bool) Option {
+	return withParentGating(enabled)
+}
+
+type withCheckpointInterval time.Duration
+
+func (o withCheckpointInterval) Apply(c *config) {
+	c.checkpointInterval = time.Duration(o)
+}
+
+// WithCheckpointInterval sets how often partition watermarks are written to the
+// PartitionStorage. Watermarks are buffered in memory and written together, so
+// each partition is written at most once per interval however many batches it
+// reads. Default is 1 second.
+//
+// After a crash, a partition resumes from its last written watermark, so up to
+// one interval of changes can be delivered again. 0 writes the watermark after
+// every batch, as releases before batched checkpoints did.
+func WithCheckpointInterval(d time.Duration) Option {
+	if d < 0 {
+		d = 0
+	}
+	return withCheckpointInterval(d)
 }

@@ -112,6 +112,83 @@ func (s *InmemoryPartitionStorage) GetAndSchedulePartitions(ctx context.Context,
 	return partitions, nil
 }
 
+// GetAndScheduleReadyPartitions finds CREATED partitions whose parents have all
+// finished, marks up to limit of them as scheduled and returns them, oldest first.
+func (s *InmemoryPartitionStorage) GetAndScheduleReadyPartitions(ctx context.Context, runnerID string, limit int) ([]*screamer.PartitionMetadata, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var ready []*screamer.PartitionMetadata
+	for _, p := range s.m {
+		if p.State == screamer.StateCreated && s.parentsFinished(p) {
+			ready = append(ready, p)
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool {
+		if !ready[i].StartTimestamp.Equal(ready[j].StartTimestamp) {
+			return ready[i].StartTimestamp.Before(ready[j].StartTimestamp)
+		}
+		return ready[i].PartitionToken < ready[j].PartitionToken
+	})
+	if len(ready) > limit {
+		ready = ready[:limit]
+	}
+
+	now := time.Now().UTC()
+	out := make([]*screamer.PartitionMetadata, 0, len(ready))
+	for _, p := range ready {
+		p.ScheduledAt = &now
+		p.State = screamer.StateScheduled
+		c := *p
+		out = append(out, &c)
+	}
+	return out, nil
+}
+
+// parentsFinished reports whether every parent of p has finished. s.mu must be held.
+//
+// A parent that is not stored yet may still be on its way: the other parent of a
+// merge can report the child before this parent's own ancestors have even
+// reported it. So a missing parent only counts as finished once no unfinished
+// partition is behind the child's start, which also covers a parent that
+// finished and was removed.
+func (s *InmemoryPartitionStorage) parentsFinished(p *screamer.PartitionMetadata) bool {
+	missing := false
+	for _, token := range p.ParentTokens {
+		parent, ok := s.m[token]
+		if !ok {
+			missing = true
+			continue
+		}
+		if parent.State != screamer.StateFinished {
+			return false
+		}
+	}
+	if !missing {
+		return true
+	}
+	for _, o := range s.m {
+		if o.State != screamer.StateFinished && o.Watermark.Before(p.StartTimestamp) {
+			return false
+		}
+	}
+	return true
+}
+
+// UpdateWatermarks updates the watermarks of many partitions at once. A watermark
+// never moves backwards, and unknown partitions are ignored.
+func (s *InmemoryPartitionStorage) UpdateWatermarks(ctx context.Context, watermarks []screamer.PartitionWatermark) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, w := range watermarks {
+		if p, ok := s.m[w.PartitionToken]; ok && w.Watermark.After(p.Watermark) {
+			p.Watermark = w.Watermark
+		}
+	}
+	return nil
+}
+
 // RefreshRunner is a no-op for in-memory storage.
 func (s *InmemoryPartitionStorage) RefreshRunner(ctx context.Context, runnerID string) error {
 	return nil
@@ -216,7 +293,11 @@ func (s *InmemoryPartitionStorage) CountUnfinishedPartitions(ctx context.Context
 	return n, nil
 }
 
-var _ screamer.PartitionCounter = (*InmemoryPartitionStorage)(nil)
+var (
+	_ screamer.PartitionCounter      = (*InmemoryPartitionStorage)(nil)
+	_ screamer.ParentGatedScheduler  = (*InmemoryPartitionStorage)(nil)
+	_ screamer.WatermarkBatchUpdater = (*InmemoryPartitionStorage)(nil)
+)
 
 // Assert that InmemoryPartitionStorage implements PartitionStorage.
 var _ screamer.PartitionStorage = (*InmemoryPartitionStorage)(nil)

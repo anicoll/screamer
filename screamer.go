@@ -72,6 +72,10 @@ type Subscriber struct {
 	partitionRetries        atomic.Int64
 	meterProvider           metric.MeterProvider
 	cluster                 clusterStats
+	parentGating            bool
+	gatedScheduler          ParentGatedScheduler
+	checkpointInterval      time.Duration
+	checkpoints             *checkpointer
 }
 
 var (
@@ -95,6 +99,8 @@ func NewSubscriber(
 		heartbeatInterval:   defaultHeartbeatInterval,
 		logLevel:            zerolog.InfoLevel, // Default log level
 		partitionMaxRetries: defaultPartitionMaxRetries,
+		parentGating:        true,
+		checkpointInterval:  defaultCheckpointInterval,
 	}
 	for _, o := range options {
 		o.Apply(c)
@@ -126,6 +132,9 @@ func NewSubscriber(
 		activePartitions:        make(map[string]struct{}),
 		partitionMaxRetries:     c.partitionMaxRetries,
 		meterProvider:           c.meterProvider,
+		parentGating:            c.parentGating,
+		checkpointInterval:      c.checkpointInterval,
+		checkpoints:             newCheckpointer(),
 	}
 }
 
@@ -154,6 +163,13 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 	if s.consumer != nil && s.consumerWithAck != nil {
 		return fmt.Errorf("screamer: Consumer and ConsumerWithAck are mutually exclusive; use Subscribe or SubscribeWithAck, not both")
 	}
+	if s.parentGating {
+		g, ok := s.partitionStorage.(ParentGatedScheduler)
+		if !ok {
+			return fmt.Errorf("screamer: parent gating is on but %T does not implement screamer.ParentGatedScheduler; implement it, or turn gating off with WithParentGating(false) (see MIGRATION.md)", s.partitionStorage)
+		}
+		s.gatedScheduler = g
+	}
 
 	log.Debug().Msg("Starting subscription to change stream")
 	ctx = s.initErrGroup(ctx)
@@ -168,6 +184,7 @@ func (s *Subscriber) subscribe(ctx context.Context) error {
 		defer func() { _ = reg.Unregister() }()
 	}
 	s.eg.Go(func() error { return s.clusterStatsLoop(ctx, done) })
+	s.eg.Go(func() error { return s.checkpointLoop(ctx, done) })
 
 	s.eg.Go(func() error {
 		ticker := time.NewTicker(time.Second * 2)
@@ -359,7 +376,7 @@ func (s *Subscriber) detectNewPartitions(ctx context.Context) error {
 		return errDone
 	}
 
-	partitions, err := s.partitionStorage.GetAndSchedulePartitions(ctx, minWatermarkPartition.Watermark, s.runnerID, availableSlots)
+	partitions, err := s.schedulePartitions(ctx, minWatermarkPartition.Watermark, availableSlots)
 	if err != nil {
 		return fmt.Errorf("failed to get schedulable partitions: %w", err)
 	}
@@ -474,6 +491,10 @@ func (s *Subscriber) readPartition(ctx context.Context, p *PartitionMetadata) er
 
 	log.Info().Str("partition_token", p.PartitionToken).
 		Msg("partition processing complete")
+	// A finished partition's watermark no longer matters to anyone.
+	if s.checkpoints != nil {
+		s.checkpoints.forget(p.PartitionToken)
+	}
 	if err := s.partitionStorage.UpdateToFinished(ctx, p, s.runnerID); err != nil {
 		return fmt.Errorf("failed to update to finished: %w", err)
 	}
@@ -557,7 +578,7 @@ func (s *Subscriber) handle(ctx context.Context, p *PartitionMetadata, records [
 		}
 	}
 
-	if err := s.partitionStorage.UpdateWatermark(ctx, p, wm.get()); err != nil {
+	if err := s.checkpoint(ctx, p, wm.get()); err != nil {
 		return fmt.Errorf("failed to update watermark: %w", err)
 	}
 	// Keep the in-process copy current, so a retry resumes from here
