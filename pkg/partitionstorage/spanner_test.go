@@ -629,6 +629,24 @@ func (s *SpannerTestSuite) TestGetActiveRunnerCount() {
 	s.Equal(2, count, "Should count only active runners")
 }
 
+func (s *SpannerTestSuite) TestCountUnfinishedPartitions() {
+	ctx := context.Background()
+	storage, cleanup := s.setupStorage(ctx, "CountUnfinished")
+	defer cleanup()
+
+	baseTime := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.insertPartitions(ctx, storage, map[string]screamer.State{
+		"created":   screamer.StateCreated,
+		"scheduled": screamer.StateScheduled,
+		"running":   screamer.StateRunning,
+		"finished":  screamer.StateFinished,
+	}, baseTime)
+
+	count, err := storage.CountUnfinishedPartitions(ctx)
+	s.NoError(err)
+	s.Equal(3, count)
+}
+
 func (s *SpannerTestSuite) TestAddChildPartitions_Split() {
 	ctx := context.Background()
 	storage, cleanup := s.setupStorage(ctx, "ChildSplit")

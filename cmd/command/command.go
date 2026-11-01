@@ -61,6 +61,13 @@ func ScreamerCommand() *cli.Command {
 			Required: false,
 			Value:    defaultHeartbeatInterval,
 		},
+		&cli.IntFlag{
+			Name:     "max-concurrent-partitions",
+			Sources:  cli.EnvVars("MAX_CONCURRENT_PARTITIONS"),
+			Required: false,
+			Value:    0,
+			Usage:    "Maximum partitions this runner reads at once (0 = unlimited). Also sizes the gRPC channel pool for change stream reads.",
+		},
 		&cli.StringFlag{
 			Name:        "partition-dsn",
 			Sources:     cli.EnvVars("PARTITION_DSN"),
@@ -107,6 +114,7 @@ func buildConfig(c *cli.Command) (*screamer.Config, error) {
 	dur := c.Duration("heartbeat-interval")
 	cfg.HeartbeatInterval = &dur
 
+	cfg.MaxConcurrentPartitions = int(c.Int("max-concurrent-partitions"))
 	cfg.MetadataTable = nillableString(c, "metadata-table")
 	cfg.PartitionDSN = nillableString(c, "partition-dsn")
 	if cfg.PartitionDSN == nil {
@@ -153,7 +161,9 @@ func (l *jsonOutputConsumer) Consume(change []byte) error {
 
 func run(ctx context.Context, cfg *screamer.Config) error {
 	eg, ctx := errgroup.WithContext(ctx)
-	spannerClient, err := spanner.NewClient(ctx, cfg.DSN)
+	// Change stream reads get their own client, with a channel pool sized for the
+	// partition limit, so open streams cannot starve metadata writes.
+	spannerClient, err := screamer.NewChangeStreamClient(ctx, cfg.DSN, cfg.MaxConcurrentPartitions)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return err
@@ -206,6 +216,9 @@ func run(ctx context.Context, cfg *screamer.Config) error {
 	}
 	if *cfg.HeartbeatInterval != 0 {
 		options = append(options, screamer.WithHeartbeatInterval(*cfg.HeartbeatInterval))
+	}
+	if cfg.MaxConcurrentPartitions > 0 {
+		options = append(options, screamer.WithMaxConcurrentPartitions(cfg.MaxConcurrentPartitions))
 	}
 	if cfg.Priority != int32(spannerpb.RequestOptions_PRIORITY_UNSPECIFIED) {
 		options = append(options, screamer.WithSpannerRequestPriotiry(spannerpb.RequestOptions_Priority(cfg.Priority)))

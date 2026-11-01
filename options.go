@@ -6,6 +6,7 @@ import (
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Option configures a Subscriber via functional options.
@@ -23,6 +24,8 @@ type config struct {
 	maxConcurrentPartitions int
 	ackTimeout              time.Duration
 	changeStreamReader      ChangeStreamReader
+	partitionMaxRetries     int
+	meterProvider           metric.MeterProvider
 }
 
 type (
@@ -141,4 +144,44 @@ func (o withChangeStreamReader) Apply(c *config) {
 // change stream (see pkg/simulator) or to wrap the default behaviour.
 func WithChangeStreamReader(r ChangeStreamReader) Option {
 	return withChangeStreamReader{r: r}
+}
+
+const defaultPartitionMaxRetries = 5
+
+type withPartitionMaxRetries int
+
+func (o withPartitionMaxRetries) Apply(c *config) {
+	c.partitionMaxRetries = int(o)
+}
+
+// WithPartitionMaxRetries sets how many times in a row a failing partition is retried
+// before its error stops the subscriber. Retries resume from the partition's last
+// watermark with exponential backoff (1s doubling to 30s), and the count resets when
+// the partition makes progress. Errors from the consumer (a failed Consume, a nack or
+// an ack timeout) are never retried.
+// Default is 5. 0 disables retries: any partition error stops the subscriber.
+func WithPartitionMaxRetries(n int) Option {
+	if n < 0 {
+		n = 0
+	}
+	return withPartitionMaxRetries(n)
+}
+
+type withMeterProvider struct{ mp metric.MeterProvider }
+
+func (o withMeterProvider) Apply(c *config) {
+	c.meterProvider = o.mp
+}
+
+// WithMeterProvider sets the OpenTelemetry MeterProvider used for the subscriber's
+// metrics. Default: the global provider (otel.GetMeterProvider()), which records
+// nothing unless the application installs one. Screamer ships no exporter: use the
+// OpenTelemetry Prometheus exporter or an OTLP exporter in your application.
+//
+// Per-runner metrics: screamer.partitions.active, screamer.partitions.capacity,
+// screamer.partition.retries. Cluster-wide metrics, the same on every runner (take
+// the max, not the sum): screamer.partitions.unfinished, screamer.runners.live,
+// screamer.runners.desired, screamer.watermark.lag.
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return withMeterProvider{mp: mp}
 }

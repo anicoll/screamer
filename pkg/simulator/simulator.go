@@ -23,6 +23,8 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"github.com/anicoll/screamer"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Config describes the simulated change stream.
@@ -67,6 +69,12 @@ type Config struct {
 	// queries block until one closes. This models running out of gRPC streams
 	// on the client's channels. 0 means unlimited.
 	MaxConcurrentStreams int
+
+	// ReadFailureRate is the probability that a query fails part way through with
+	// codes.Unavailable, like a dropped stream. The failure comes at a random point
+	// in the first ReadFailureWithin of the query (default 30s). 0 disables it.
+	ReadFailureRate   float64
+	ReadFailureWithin time.Duration
 }
 
 // Write is one generated write, the ground truth that consumers are checked against.
@@ -101,6 +109,8 @@ type Stats struct {
 	BlockedOnStreams int64 // queries that had to wait for a free stream
 	// PartitionsQueried is the number of distinct partition tokens that were queried.
 	PartitionsQueried int
+	// InjectedFailures is the number of queries failed by ReadFailureRate.
+	InjectedFailures int64
 }
 
 // Simulator is a simulated change stream. It implements screamer.ChangeStreamReader.
@@ -117,6 +127,7 @@ type Simulator struct {
 	mu      sync.Mutex
 	stats   Stats
 	queried map[string]struct{}
+	faults  *rand.Rand // guarded by mu
 }
 
 var _ screamer.ChangeStreamReader = (*Simulator)(nil)
@@ -150,6 +161,11 @@ func New(cfg Config) *Simulator {
 		partitions: make(map[string]*Partition),
 		queried:    make(map[string]struct{}),
 	}
+	if cfg.ReadFailureWithin <= 0 {
+		cfg.ReadFailureWithin = 30 * time.Second
+		s.cfg.ReadFailureWithin = cfg.ReadFailureWithin
+	}
+	s.faults = rand.New(rand.NewSource(cfg.Seed + 1))
 	if cfg.MaxConcurrentStreams > 0 {
 		s.streams = make(chan struct{}, cfg.MaxConcurrentStreams)
 	}
@@ -360,6 +376,10 @@ func (s *Simulator) Read(ctx context.Context, p *screamer.PartitionMetadata, fn 
 	if p.IsRootPartition() {
 		return s.readRoot(p, fn)
 	}
+	var failAt time.Time
+	if d, ok := s.plannedFailure(); ok {
+		failAt = time.Now().Add(d)
+	}
 
 	part, ok := s.partitions[p.PartitionToken]
 	if !ok {
@@ -408,6 +428,13 @@ func (s *Simulator) Read(ctx context.Context, p *screamer.PartitionMetadata, fn 
 			lastRow = now
 		}
 
+		if !failAt.IsZero() && !now.Before(failAt) {
+			s.mu.Lock()
+			s.stats.InjectedFailures++
+			s.mu.Unlock()
+			return status.Error(codes.Unavailable, "simulator: injected stream failure")
+		}
+
 		if !now.Before(stop) {
 			if endsHere && len(part.Children) > 0 {
 				cpr := &screamer.ChildPartitionsRecord{StartTimestamp: part.End, RecordSequence: "00000001"}
@@ -430,10 +457,26 @@ func (s *Simulator) Read(ctx context.Context, p *screamer.PartitionMetadata, fn 
 		if stop.Before(wake) {
 			wake = stop
 		}
+		if !failAt.IsZero() && failAt.Before(wake) {
+			wake = failAt
+		}
 		if err := sleep(ctx, time.Until(wake)); err != nil {
 			return err
 		}
 	}
+}
+
+// plannedFailure decides whether the next query fails, and after how long.
+func (s *Simulator) plannedFailure() (time.Duration, bool) {
+	if s.cfg.ReadFailureRate <= 0 {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.faults.Float64() >= s.cfg.ReadFailureRate {
+		return 0, false
+	}
+	return time.Duration(s.faults.Int63n(int64(s.cfg.ReadFailureWithin))), true
 }
 
 // readRoot returns the partitions live at the query's start timestamp, as Spanner does

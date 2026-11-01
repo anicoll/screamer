@@ -449,5 +449,31 @@ func (s *SpannerPartitionStorage) GetActiveRunnerCount(ctx context.Context) (int
 	return int(count), nil
 }
 
+// CountUnfinishedPartitions returns the number of partitions that are not FINISHED.
+// Used for cluster-wide scaling metrics.
+func (s *SpannerPartitionStorage) CountUnfinishedPartitions(ctx context.Context) (int, error) {
+	stmt := spanner.Statement{
+		SQL:    fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE State != @state", s.tableName),
+		Params: map[string]interface{}{"state": screamer.StateFinished},
+	}
+	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{
+		Priority:   s.requestPriority,
+		RequestTag: "CountUnfinishedPartitions",
+	})
+	defer iter.Stop()
+
+	row, err := iter.Next()
+	if err != nil {
+		return 0, fmt.Errorf("failed to count unfinished partitions: %w", err)
+	}
+	var count int64
+	if err := row.Columns(&count); err != nil {
+		return 0, fmt.Errorf("failed to scan unfinished partition count: %w", err)
+	}
+	return int(count), nil
+}
+
+var _ screamer.PartitionCounter = (*SpannerPartitionStorage)(nil)
+
 // Assert that SpannerPartitionStorage implements PartitionStorage.
 var _ screamer.PartitionStorage = (*SpannerPartitionStorage)(nil)
