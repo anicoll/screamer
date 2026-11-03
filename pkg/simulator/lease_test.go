@@ -171,6 +171,9 @@ func startLeaseRun(t *testing.T, extra ...screamer.Option) *leaseRun {
 	r.sim = simulator.New(smallChurn(start))
 	r.checker = simulator.NewChecker(r.sim)
 	r.store = newRecordingStorage()
+	// Fair share also moves partitions between runners; these tests are about
+	// what leases do on their own.
+	extra = append([]screamer.Option{screamer.WithFairShare(false)}, extra...)
 	for i, id := range []string{"runner-a", "runner-b"} {
 		link := newRunnerLink(r.store, r.sim)
 		opts := append(simOptions(r.sim, start, r.end, extra...), screamer.WithChangeStreamReader(link))

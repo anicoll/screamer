@@ -84,6 +84,8 @@ type Subscriber struct {
 	parkInterval            time.Duration
 	parkIdleAfter           time.Duration
 	parked                  atomic.Int64
+	useFairShare            bool
+	fair                    fairShare
 }
 
 var (
@@ -114,6 +116,7 @@ func NewSubscriber(
 		parking:             true,
 		parkInterval:        defaultParkInterval,
 		parkIdleAfter:       defaultParkIdleAfter,
+		fairShare:           true,
 	}
 	for _, o := range options {
 		o.Apply(c)
@@ -158,6 +161,7 @@ func NewSubscriber(
 		useParking:              c.parking,
 		parkInterval:            c.parkInterval,
 		parkIdleAfter:           c.parkIdleAfter,
+		useFairShare:            c.fairShare,
 	}
 }
 
@@ -493,6 +497,10 @@ func (s *Subscriber) queryChangeStream(parent context.Context, p *PartitionMetad
 			// or a lost lease can cancel it at the same moment).
 			return parent.Err()
 		}
+		if errors.Is(context.Cause(ctx), errRebalance) {
+			s.release(ctx, p)
+			return nil
+		}
 		if errors.Is(context.Cause(ctx), errLeaseLost) {
 			// Another runner owns the partition now and reads it from the last
 			// watermark this runner wrote. Not an error for this runner.
@@ -575,6 +583,7 @@ func (s *Subscriber) readPartition(ctx context.Context, p *PartitionMetadata, sl
 	}
 
 	var data, child bool
+	readStart := time.Now()
 	err := s.reader.Read(readCtx, query, func(records []*ChangeRecord) error {
 		log.Trace().
 			Str("partition_token", p.PartitionToken).
@@ -590,6 +599,7 @@ func (s *Subscriber) readPartition(ctx context.Context, p *PartitionMetadata, sl
 		}
 		if batchData {
 			data = true
+			s.leases.touch(p.PartitionToken)
 			if idle != nil {
 				idle.Reset(s.parkIdleAfter)
 			}
@@ -604,6 +614,7 @@ func (s *Subscriber) readPartition(ctx context.Context, p *PartitionMetadata, sl
 	}
 
 	if slice && !child {
+		s.fair.observeSlice(time.Since(readStart))
 		// The query ended at end, so every change up to end has been delivered.
 		if err := s.checkpoint(ctx, p, end); err != nil {
 			return 0, fmt.Errorf("failed to update watermark: %w", err)
@@ -805,6 +816,13 @@ type PartitionMetrics struct {
 	// PartitionsParked is the number of times this runner parked an idle
 	// partition (see WithParking).
 	PartitionsParked int64
+	// PartitionsHandedOver is the number of partitions this runner handed to
+	// other runners because it held more than its fair share.
+	PartitionsHandedOver int64
+	// FairShare is the most partitions this runner aims to hold, from the
+	// last cluster stats refresh. 0 means no limit (it is the only runner, or
+	// fair share is off).
+	FairShare int
 }
 
 // GetMetrics returns current partition processing metrics for observability.
@@ -822,6 +840,8 @@ func (s *Subscriber) GetMetrics() PartitionMetrics {
 		LeasesLost:              s.leases.lostCount(),
 		LeaseTakeovers:          s.leases.takeoverCount(),
 		PartitionsParked:        s.parked.Load(),
+		PartitionsHandedOver:    s.fair.handovers.Load(),
+		FairShare:               int(s.fair.target.Load()),
 	}
 
 	// Calculate capacity percentage

@@ -77,7 +77,7 @@ func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 
 	// Lease and parking columns, added to tables created before them. Spanner has no
 	// ADD COLUMN IF NOT EXISTS, so add only the ones that are missing.
-	existing, err := s.columns(ctx)
+	existing, err := s.columns(ctx, s.tableName)
 	if err != nil {
 		return err
 	}
@@ -90,6 +90,16 @@ func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 		if !existing[c.name] {
 			stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", s.tableName, c.name, c.ddl))
 		}
+	}
+
+	// Runners record which metadata table they work on, so runners of
+	// different streams sharing the Runner table are counted apart.
+	runnerColumns, err := s.columns(ctx, tableRunner)
+	if err != nil {
+		return err
+	}
+	if !runnerColumns[columnMetadataTable] {
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s STRING(MAX)", tableRunner, columnMetadataTable))
 	}
 
 	// Unfinished partitions by state. Scheduling, claiming and counting read
@@ -113,12 +123,12 @@ func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 	return nil
 }
 
-// columns returns the names of the metadata table's columns, or none if the
-// table does not exist yet.
-func (s *SpannerPartitionStorage) columns(ctx context.Context) (map[string]bool, error) {
+// columns returns the names of a table's columns, or none if the table does
+// not exist yet.
+func (s *SpannerPartitionStorage) columns(ctx context.Context, table string) (map[string]bool, error) {
 	stmt := spanner.Statement{
 		SQL:    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @table",
-		Params: map[string]interface{}{"table": s.tableName},
+		Params: map[string]interface{}{"table": table},
 	}
 	cols := map[string]bool{}
 	err := s.client.Single().Query(ctx, stmt).Do(func(r *spanner.Row) error {
@@ -130,7 +140,7 @@ func (s *SpannerPartitionStorage) columns(ctx context.Context) (map[string]bool,
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to read the columns of %s: %w", s.tableName, err)
+		return nil, fmt.Errorf("failed to read the columns of %s: %w", table, err)
 	}
 	return cols, nil
 }

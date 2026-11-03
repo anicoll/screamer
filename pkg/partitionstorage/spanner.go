@@ -87,6 +87,7 @@ const (
 	columnEpoch          = "Epoch"
 	columnLeaseExpiresAt = "LeaseExpiresAt"
 	columnNextReadAt     = "NextReadAt"
+	columnMetadataTable  = "MetadataTable"
 )
 
 // unfinishedStates lists every state but FINISHED. Queries filter on
@@ -136,9 +137,10 @@ func (s *SpannerPartitionStorage) GetUnfinishedMinWatermarkPartition(ctx context
 func (s *SpannerPartitionStorage) RegisterRunner(ctx context.Context, runnerID string) error {
 	log.Debug().Str("runner_id", runnerID).Msg("RegisterRunner called")
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdateMap(tableRunner, map[string]interface{}{
-		columnRunnerID:  runnerID,
-		columnUpdatedAt: spanner.CommitTimestamp,
-		columnCreatedAt: spanner.CommitTimestamp,
+		columnRunnerID:      runnerID,
+		columnUpdatedAt:     spanner.CommitTimestamp,
+		columnCreatedAt:     spanner.CommitTimestamp,
+		columnMetadataTable: s.tableName,
 	})}, spanner.TransactionTag("RegisterRunner"))
 	return err
 }
@@ -148,8 +150,9 @@ func (s *SpannerPartitionStorage) RegisterRunner(ctx context.Context, runnerID s
 func (s *SpannerPartitionStorage) RefreshRunner(ctx context.Context, runnerID string) error {
 	log.Trace().Str("runner_id", runnerID).Msg("RefreshRunner called")
 	_, err := s.client.Apply(ctx, []*spanner.Mutation{spanner.UpdateMap(tableRunner, map[string]interface{}{
-		columnRunnerID:  runnerID,
-		columnUpdatedAt: spanner.CommitTimestamp,
+		columnRunnerID:      runnerID,
+		columnUpdatedAt:     spanner.CommitTimestamp,
+		columnMetadataTable: s.tableName,
 	})}, spanner.TransactionTag("RefreshRunner"))
 	return err
 }
@@ -537,16 +540,22 @@ func (s *SpannerPartitionStorage) ClaimPartitions(ctx context.Context, req screa
 		return nil, nil
 	}
 
+	exclude := req.Exclude
+	if exclude == nil {
+		exclude = []string{}
+	}
 	expired := spanner.Statement{
 		SQL: fmt.Sprintf(`
 			SELECT * FROM %s
 			WHERE State IN UNNEST(@claimable)
 			  AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt < CURRENT_TIMESTAMP())
+			  AND PartitionToken NOT IN UNNEST(@exclude)
 			ORDER BY Watermark ASC
 			LIMIT @limit`, s.tableName),
 		Params: map[string]interface{}{
 			"claimable": []screamer.State{screamer.StateScheduled, screamer.StateRunning},
 			"limit":     req.Limit,
+			"exclude":   exclude,
 		},
 	}
 	parked := spanner.Statement{
@@ -555,15 +564,18 @@ func (s *SpannerPartitionStorage) ClaimPartitions(ctx context.Context, req screa
 			WHERE State = @parked
 			  AND NextReadAt <= CURRENT_TIMESTAMP()
 			  AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt < CURRENT_TIMESTAMP())
+			  AND PartitionToken NOT IN UNNEST(@exclude)
 			ORDER BY NextReadAt ASC
 			LIMIT @limit`, s.tableName),
 		Params: map[string]interface{}{
-			"parked": screamer.StateParked,
-			"limit":  req.Limit,
+			"parked":  screamer.StateParked,
+			"limit":   req.Limit,
+			"exclude": exclude,
 		},
 	}
 	ready := s.readyStatement(req)
 	ready.Params["limit"] = req.Limit
+	ready.Params["exclude"] = exclude
 
 	var partitions []*screamer.PartitionMetadata
 	ts, err := s.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
@@ -656,6 +668,7 @@ func (s *SpannerPartitionStorage) readyStatement(req screamer.ClaimRequest) span
 			SQL: fmt.Sprintf(`
 				SELECT * FROM %s
 				WHERE State = @created AND StartTimestamp >= @minWatermark
+				  AND PartitionToken NOT IN UNNEST(@exclude)
 				ORDER BY FARM_FINGERPRINT(CAST(CURRENT_TIMESTAMP() AS STRING) || PartitionToken), StartTimestamp ASC
 				LIMIT @limit`, s.tableName),
 			Params: map[string]interface{}{
@@ -668,6 +681,7 @@ func (s *SpannerPartitionStorage) readyStatement(req screamer.ClaimRequest) span
 		SQL: fmt.Sprintf(`
 			SELECT c.* FROM %[1]s AS c
 			WHERE c.State = @created
+			  AND c.PartitionToken NOT IN UNNEST(@exclude)
 			  AND NOT EXISTS (
 			    SELECT 1 FROM %[1]s AS p
 			    WHERE p.PartitionToken IN UNNEST(c.ParentTokens)
@@ -794,8 +808,10 @@ func leaseColumnsHint(err error) error {
 	return err
 }
 
-// GetActiveRunnerCount returns the number of active runners that have refreshed within the last 5 seconds.
-// Used for metrics and observability to understand cluster size.
+// GetActiveRunnerCount returns the number of runners of this metadata table
+// that have refreshed within the last 5 seconds. The Runner table is shared by
+// every metadata table in the database, so runners are told apart by the
+// metadata table they last refreshed for. Used for metrics and fair share.
 func (s *SpannerPartitionStorage) GetActiveRunnerCount(ctx context.Context) (int, error) {
 	log.Trace().Msg("GetActiveRunnerCount called")
 
@@ -803,7 +819,9 @@ func (s *SpannerPartitionStorage) GetActiveRunnerCount(ctx context.Context) (int
 		SQL: fmt.Sprintf(`
 			SELECT COUNT(*) as ActiveRunners
 			FROM %s
-			WHERE UpdatedAt > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 SECOND)`, tableRunner),
+			WHERE UpdatedAt > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 SECOND)
+			  AND MetadataTable = @table`, tableRunner),
+		Params: map[string]interface{}{"table": s.tableName},
 	}
 
 	iter := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{
@@ -824,6 +842,30 @@ func (s *SpannerPartitionStorage) GetActiveRunnerCount(ctx context.Context) (int
 
 	log.Trace().Int("active_runners", int(count)).Msg("GetActiveRunnerCount completed")
 	return int(count), nil
+}
+
+// CountPartitionsByState returns the number of unfinished partitions in each state.
+func (s *SpannerPartitionStorage) CountPartitionsByState(ctx context.Context) (map[screamer.State]int, error) {
+	stmt := spanner.Statement{
+		SQL:    fmt.Sprintf("SELECT State, COUNT(*) FROM %s WHERE State IN UNNEST(@unfinished) GROUP BY State", s.tableName),
+		Params: map[string]interface{}{"unfinished": unfinishedStates},
+	}
+	counts := map[screamer.State]int{}
+	err := s.client.Single().QueryWithOptions(ctx, stmt, spanner.QueryOptions{Priority: s.requestPriority, RequestTag: "CountPartitionsByState"}).Do(func(r *spanner.Row) error {
+		var (
+			state string
+			n     int64
+		)
+		if err := r.Columns(&state, &n); err != nil {
+			return err
+		}
+		counts[screamer.State(state)] = int(n)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to count partitions by state: %w", err)
+	}
+	return counts, nil
 }
 
 // CountUnfinishedPartitions returns the number of partitions that are not FINISHED.
@@ -856,6 +898,7 @@ var (
 	_ screamer.WatermarkBatchUpdater = (*SpannerPartitionStorage)(nil)
 	_ screamer.PartitionLeaser       = (*SpannerPartitionStorage)(nil)
 	_ screamer.PartitionParker       = (*SpannerPartitionStorage)(nil)
+	_ screamer.PartitionStateCounter = (*SpannerPartitionStorage)(nil)
 )
 
 // Assert that SpannerPartitionStorage implements PartitionStorage.

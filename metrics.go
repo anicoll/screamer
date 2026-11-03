@@ -39,15 +39,24 @@ type ClusterMetrics struct {
 	UnfinishedPartitions int
 	// LiveRunners is the number of runners that refreshed recently.
 	LiveRunners int
-	// DesiredRunners is how many runners are needed to read every unfinished
-	// partition at TargetUtilization:
-	// ceil(UnfinishedPartitions / (MaxConcurrentPartitions × TargetUtilization)).
+	// DesiredRunners is how many runners are needed to serve the cluster's
+	// Demand at TargetUtilization:
+	// ceil(Demand / (MaxConcurrentPartitions × TargetUtilization)).
 	// It is 0 when it cannot be computed: no partition limit is set, or the
 	// storage does not count partitions.
 	DesiredRunners int
 	// WatermarkLag is how far the oldest unfinished partition's watermark is behind
 	// the current time. When it keeps growing, the runners are not keeping up.
 	WatermarkLag time.Duration
+	// PartitionsByState counts unfinished partitions by state, when the storage
+	// implements PartitionStateCounter: CREATED ones wait to be read, SCHEDULED
+	// and RUNNING ones stream, PARKED ones are idle.
+	PartitionsByState map[State]int
+	// Demand is the number of query slots the cluster needs: one per partition
+	// that streams or waits to, plus the share of a slot that each parked
+	// partition's catch-up reads use. DesiredRunners is computed from it. Equal
+	// to UnfinishedPartitions when the storage does not count by state.
+	Demand int
 }
 
 // DesiredRunners returns ceil(unfinished / (maxConcurrentPartitions × TargetUtilization)),
@@ -108,11 +117,26 @@ func (s *Subscriber) refreshClusterStats(ctx context.Context) {
 			m.WatermarkLag = lag
 		}
 	}
-	m.DesiredRunners = DesiredRunners(m.UnfinishedPartitions, s.maxConcurrentPartitions)
+	m.Demand = m.UnfinishedPartitions
+	if sc, ok := s.partitionStorage.(PartitionStateCounter); ok {
+		counts, err := sc.CountPartitionsByState(ctx)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to count partitions by state for metrics")
+			return
+		}
+		m.PartitionsByState = copyCounts(counts)
+		m.Demand = s.demand(counts)
+		if s.useFairShare && s.leaser != nil {
+			s.fair.target.Store(int64(fairShareTarget(counts[StateCreated]+counts[StateScheduled]+counts[StateRunning], m.LiveRunners)))
+		}
+	}
+	m.DesiredRunners = DesiredRunners(m.Demand, s.maxConcurrentPartitions)
 
 	s.cluster.mu.Lock()
 	s.cluster.m = m
 	s.cluster.mu.Unlock()
+
+	s.rebalance()
 }
 
 // clusterStatsLoop refreshes cluster metrics until ctx is done or done is closed.
@@ -198,6 +222,22 @@ func (s *Subscriber) registerMetrics(mp metric.MeterProvider) (metric.Registrati
 		return nil, err
 	}
 
+	byState, err := meter.Int64ObservableGauge("screamer.partitions.by_state",
+		metric.WithDescription("Cluster-wide unfinished partitions by state (CREATED waits, SCHEDULED and RUNNING stream, PARKED is idle). Same on every runner: aggregate with max."), metric.WithUnit("{partition}"))
+	if err != nil {
+		return nil, err
+	}
+	handovers, err := meter.Int64ObservableCounter("screamer.partitions.handovers",
+		metric.WithDescription("Partitions this runner handed to other runners because it held more than its fair share."), metric.WithUnit("{partition}"))
+	if err != nil {
+		return nil, err
+	}
+	share, err := meter.Int64ObservableGauge("screamer.partitions.fair_share",
+		metric.WithDescription("The most partitions this runner aims to hold. 0 means no limit."), metric.WithUnit("{partition}"))
+	if err != nil {
+		return nil, err
+	}
+
 	attrs := metric.WithAttributes(
 		attribute.String("stream", s.streamName),
 		attribute.String("runner_id", s.runnerID),
@@ -216,6 +256,10 @@ func (s *Subscriber) registerMetrics(mp metric.MeterProvider) (metric.Registrati
 		if s.parker != nil {
 			o.ObserveInt64(parks, s.parked.Load(), attrs)
 		}
+		if s.leaser != nil && s.useFairShare {
+			o.ObserveInt64(handovers, s.fair.handovers.Load(), attrs)
+			o.ObserveInt64(share, s.fair.target.Load(), attrs)
+		}
 
 		c := s.GetClusterMetrics()
 		if c.UpdatedAt.IsZero() {
@@ -229,6 +273,9 @@ func (s *Subscriber) registerMetrics(mp metric.MeterProvider) (metric.Registrati
 			o.ObserveInt64(desired, int64(c.DesiredRunners), clusterAttrs)
 		}
 		o.ObserveFloat64(lag, c.WatermarkLag.Seconds(), clusterAttrs)
+		for state, n := range c.PartitionsByState {
+			o.ObserveInt64(byState, int64(n), metric.WithAttributes(attribute.String("stream", s.streamName), attribute.String("state", string(state))))
+		}
 		return nil
-	}, active, capacity, retries, unfinished, live, desired, lag, leasesHeld, leasesLost, takeovers, parks)
+	}, active, capacity, retries, unfinished, live, desired, lag, leasesHeld, leasesLost, takeovers, parks, byState, handovers, share)
 }

@@ -110,6 +110,7 @@ OPTIONS:
    --park                      Park idle partitions and read them in short catch-up queries (default: true) [$PARK]
    --park-interval value       How long a parked partition waits between catch-up reads (0 = default, 10s) [$PARK_INTERVAL]
    --park-idle-after value     How long a partition delivers only heartbeats before it is parked (0 = default, 1m) [$PARK_IDLE_AFTER]
+   --fair-share                Even out streaming partitions across runners (default: true) [$FAIR_SHARE]
    --lease-ttl value           How long a partition lease lasts without renewal (0 = default, 30s). A runner that dies is taken over after this long. (default: 0s) [$LEASE_TTL]
    --partition-dsn value       (default: Database dsn for use by the partition metadata table. If not provided, the main dsn will be used.) [$PARTITION_DSN]
    --help, -h                  show help
@@ -211,6 +212,12 @@ The cost is latency on idle partitions: a change to a parked partition is delive
 
 Parking needs leases. `screamer.watermark.lag` includes parked partitions, so expect it to sit at around the park interval on a quiet stream.
 
+### Fair share across runners
+
+A runner claims whatever is ready and it has slots for, so the first runner to start, or the one that happens to be polling when partitions split, would otherwise keep most of the work. Every 15 seconds each runner now reads how many runners are live and how many partitions are streaming or waiting to, and aims to hold at most `ceil(partitions / runners × 1.1)`. A runner over that hands its quietest partitions back with their watermarks, at most 5% of them every 15 seconds, and doesn't claim those back for a minute, so they go to runners with room. It still claims anything else, so fair share never leaves a partition unread: a runner that stops or dies is taken over as quickly as without it.
+
+In the simulator, a runner that joins a cluster of one busy runner with 40 partitions holds 18 of them three minutes later. Without fair share it holds none until something splits. `WithFairShare(false)` / `--fair-share=false` turns it off. Runners are counted per metadata table, so streams that share a database and its `Runner` table don't distort each other's shares.
+
 ### Checkpoints
 
 After each batch is delivered, Screamer records the partition's watermark, the point it resumes from after a restart or a takeover. Watermarks are buffered in memory and written together once a second, in one transaction of up to 500 partitions, rather than once per batch per partition. With thousands of partitions that each heartbeat every few seconds, that turns thousands of small writes a second into one. Watermarks only ever move forward, and are written one last time when the subscriber stops.
@@ -223,9 +230,10 @@ Pass an OpenTelemetry `MeterProvider` with `WithMeterProvider` (the global provi
 
 | Metric | Scope | Meaning |
 | --- | --- | --- |
-| `screamer.runners.desired` | cluster | `ceil(unfinished partitions / (WithMaxConcurrentPartitions × 0.75))`. Only reported when a partition limit is set. |
+| `screamer.runners.desired` | cluster | `ceil(demand / (WithMaxConcurrentPartitions × 0.75))`, where demand is one slot per partition that streams or waits to, plus the share of a slot each parked partition's catch-up reads use (measured slice time ÷ park interval). Only reported when a partition limit is set. |
 | `screamer.runners.live` | cluster | Runners that refreshed recently. |
 | `screamer.partitions.unfinished` | cluster | Partitions not yet finished. |
+| `screamer.partitions.by_state` | cluster | Unfinished partitions by `state`: `CREATED` (waiting), `SCHEDULED` and `RUNNING` (streaming), `PARKED` (idle). A `CREATED` count that stays high means you are short of capacity. |
 | `screamer.watermark.lag` | cluster | Seconds the oldest unfinished partition is behind now. If it keeps growing, you are not keeping up. |
 | `screamer.partitions.active` | runner | Partitions this runner is reading. |
 | `screamer.partitions.capacity` | runner | This runner's partition limit. |
@@ -234,10 +242,55 @@ Pass an OpenTelemetry `MeterProvider` with `WithMeterProvider` (the global provi
 | `screamer.leases.lost` | runner | Leases this runner found taken by another runner, after a pause longer than the lease TTL. Should stay near zero. |
 | `screamer.leases.takeovers` | runner | Partitions this runner claimed after another runner's lease expired or was released. |
 | `screamer.partitions.parks` | runner | Times this runner parked an idle partition, including after a catch-up read found nothing. |
+| `screamer.partitions.fair_share` | runner | The most partitions this runner aims to hold (0 = no limit). |
+| `screamer.partitions.handovers` | runner | Partitions this runner handed to others because it held more than its fair share. |
 
 Cluster metrics are read from the metadata table every 15 seconds, and every runner reports the same values, so aggregate them with `max`, not `sum`. Each runner also logs a warning when `desired_runners` is above `live_runners`.
 
-On Kubernetes, `screamer.runners.desired` already is a replica count. An HPA with an `AverageValue` target of 1 on `max(screamer_runners_desired{stream="FooStream"})` (via prometheus-adapter or KEDA) keeps that many runners running. Note that a partition over a runner's limit is not read until a slot frees up, so `desired_runners > live_runners` means some partitions are falling behind.
+### Autoscaling on Kubernetes
+
+`screamer.runners.desired` already is a replica count, so the autoscaler doesn't need a formula of its own. Set `WithMaxConcurrentPartitions` (or `--max-concurrent-partitions`) on every runner, since desired runners is only reported with a limit, and export the metrics to Prometheus.
+
+With KEDA:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: screamer-foostream
+spec:
+  scaleTargetRef:
+    name: screamer-foostream        # the Deployment
+  minReplicaCount: 2                # keep a spare so a dead runner is covered
+  maxReplicaCount: 20
+  pollingInterval: 30
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 600   # every scale-down moves partitions
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 120
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        query: max(screamer_runners_desired{stream="FooStream"})
+        threshold: "1"
+```
+
+A plain HPA with prometheus-adapter works the same way: an `External` metric on `max(screamer_runners_desired{stream="FooStream"})` with an `AverageValue` target of 1.
+
+Things that make this work well:
+
+- **Scale up fast, down slowly.** A new runner gets its share within a minute or two through fair share. A scale-down hands partitions back, which costs a second of delay on each and some redelivery, so don't do it every few minutes.
+- **Let runners stop cleanly.** On SIGTERM, cancel the context passed to `Subscribe` (the CLI does). The runner releases its leases with its last watermarks and others take over in about a second. Give pods a `terminationGracePeriodSeconds` of at least 30. A runner that is killed outright is taken over after the lease TTL (30 seconds) instead.
+- **Use the pod name as the runner ID** if you want to match metrics to pods. Runner rows expire after a day, so nothing builds up.
+- **Alert on lag, not on runner counts.** `screamer.watermark.lag` near the change stream's retention period means changes are about to be lost. `screamer.runners.desired > screamer.runners.live` for more than ten minutes means the autoscaler can't keep up (at its max, or pods are pending). `screamer.leases.lost` above zero means runners are pausing for longer than the lease TTL.
 
 ---
 

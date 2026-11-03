@@ -33,6 +33,7 @@ type config struct {
 	parking                 bool
 	parkInterval            time.Duration
 	parkIdleAfter           time.Duration
+	fairShare               bool
 }
 
 type (
@@ -329,4 +330,25 @@ func (o withParkIdleAfter) Apply(c *config) {
 // the heartbeat interval are raised to that when the subscriber starts.
 func WithParkIdleAfter(d time.Duration) Option {
 	return withParkIdleAfter(d)
+}
+
+type withFairShare bool
+
+func (o withFairShare) Apply(c *config) {
+	c.fairShare = bool(o)
+}
+
+// WithFairShare sets whether runners share the streaming partitions evenly. It
+// is on by default, and needs leases (see WithLeases) and a PartitionStorage
+// that implements PartitionStateCounter (both built-in storages do).
+//
+// Every 15 seconds each runner reads the number of live runners and of
+// partitions that are streaming or waiting to, and aims to hold at most
+// ceil(partitions / runners × 1.1). Below that it claims as usual. Above it,
+// it stops claiming and hands its quietest partitions back, about a fifth of
+// them a minute at most, so a runner that joins picks up work within a minute
+// or two instead of waiting for partitions to split. Off, a runner claims
+// whatever it has slots for, and the first runner to start keeps everything.
+func WithFairShare(enabled bool) Option {
+	return withFairShare(enabled)
 }

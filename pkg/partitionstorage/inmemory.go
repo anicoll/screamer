@@ -18,6 +18,8 @@ type InmemoryPartitionStorage struct {
 	// can be removed once they are older than retention.
 	finished  []finishedPartition
 	retention time.Duration
+
+	runners map[string]time.Time // last refresh of each runner
 }
 
 type finishedPartition struct {
@@ -51,6 +53,7 @@ func NewInmemory(opts ...InmemoryOption) *InmemoryPartitionStorage {
 	s := &InmemoryPartitionStorage{
 		m:         make(map[string]*screamer.PartitionMetadata),
 		retention: DefaultFinishedRetention,
+		runners:   make(map[string]time.Time),
 	}
 	for _, o := range opts {
 		o(s)
@@ -227,8 +230,12 @@ func (s *InmemoryPartitionStorage) UpdateWatermarks(ctx context.Context, waterma
 	return nil
 }
 
-// RefreshRunner is a no-op for in-memory storage.
+// RefreshRunner records that runnerID is alive, so that several subscribers
+// sharing one in-memory store (in tests, for example) count each other.
 func (s *InmemoryPartitionStorage) RefreshRunner(ctx context.Context, runnerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runners[runnerID] = time.Now()
 	return nil
 }
 
@@ -335,8 +342,15 @@ func (s *InmemoryPartitionStorage) ClaimPartitions(ctx context.Context, req scre
 	defer s.mu.Unlock()
 
 	now := time.Now().UTC()
+	exclude := make(map[string]bool, len(req.Exclude))
+	for _, t := range req.Exclude {
+		exclude[t] = true
+	}
 	var ready, expired, parked []*screamer.PartitionMetadata
 	for _, p := range s.m {
+		if exclude[p.PartitionToken] {
+			continue
+		}
 		free := p.LeaseExpiresAt == nil || !p.LeaseExpiresAt.After(now)
 		switch p.State {
 		case screamer.StateCreated:
@@ -486,11 +500,31 @@ func (s *InmemoryPartitionStorage) UpdateWatermark(ctx context.Context, partitio
 	return nil
 }
 
-// GetActiveRunnerCount returns 1 for in-memory storage since it only supports single runner.
-// This is a no-op implementation as in-memory storage doesn't track multiple runners.
+// GetActiveRunnerCount returns the number of runners that refreshed in the
+// last 5 seconds, and at least 1.
 func (s *InmemoryPartitionStorage) GetActiveRunnerCount(ctx context.Context) (int, error) {
-	// In-memory storage is always single-runner
-	return 1, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, at := range s.runners {
+		if time.Since(at) < 5*time.Second {
+			n++
+		}
+	}
+	return max(n, 1), nil
+}
+
+// CountPartitionsByState returns the number of unfinished partitions in each state.
+func (s *InmemoryPartitionStorage) CountPartitionsByState(ctx context.Context) (map[screamer.State]int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := map[screamer.State]int{}
+	for _, p := range s.m {
+		if p.State != screamer.StateFinished {
+			counts[p.State]++
+		}
+	}
+	return counts, nil
 }
 
 // CountUnfinishedPartitions returns the number of partitions that are not FINISHED.
@@ -513,6 +547,7 @@ var (
 	_ screamer.WatermarkBatchUpdater = (*InmemoryPartitionStorage)(nil)
 	_ screamer.PartitionLeaser       = (*InmemoryPartitionStorage)(nil)
 	_ screamer.PartitionParker       = (*InmemoryPartitionStorage)(nil)
+	_ screamer.PartitionStateCounter = (*InmemoryPartitionStorage)(nil)
 )
 
 // Assert that InmemoryPartitionStorage implements PartitionStorage.

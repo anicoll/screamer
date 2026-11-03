@@ -93,6 +93,12 @@ func ScreamerCommand() *cli.Command {
 			Value:   0,
 			Usage:   "How long a partition delivers only heartbeats before it is parked (0 = default, 1m).",
 		},
+		&cli.BoolFlag{
+			Name:    "fair-share",
+			Sources: cli.EnvVars("FAIR_SHARE"),
+			Value:   true,
+			Usage:   "Even out streaming partitions across runners: a runner holding more than its share hands its quietest partitions to others. --fair-share=false lets each runner keep what it claims.",
+		},
 		&cli.StringFlag{
 			Name:        "partition-dsn",
 			Sources:     cli.EnvVars("PARTITION_DSN"),
@@ -142,6 +148,7 @@ func buildConfig(c *cli.Command) (*screamer.Config, error) {
 	cfg.MaxConcurrentPartitions = int(c.Int("max-concurrent-partitions"))
 	cfg.LeaseTTL = c.Duration("lease-ttl")
 	cfg.DisableParking = !c.Bool("park")
+	cfg.DisableFairShare = !c.Bool("fair-share")
 	cfg.ParkInterval = c.Duration("park-interval")
 	cfg.ParkIdleAfter = c.Duration("park-idle-after")
 	cfg.MetadataTable = nillableString(c, "metadata-table")
@@ -251,6 +258,9 @@ func run(ctx context.Context, cfg *screamer.Config) error {
 	}
 	if cfg.LeaseTTL > 0 {
 		options = append(options, screamer.WithLeaseTTL(cfg.LeaseTTL))
+	}
+	if cfg.DisableFairShare {
+		options = append(options, screamer.WithFairShare(false))
 	}
 	if cfg.DisableParking {
 		options = append(options, screamer.WithParking(false))
