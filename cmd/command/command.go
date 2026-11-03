@@ -75,6 +75,24 @@ func ScreamerCommand() *cli.Command {
 			Value:    0,
 			Usage:    "How long a partition lease lasts without renewal (0 = default, 30s). A runner that dies is taken over after this long.",
 		},
+		&cli.BoolFlag{
+			Name:    "park",
+			Sources: cli.EnvVars("PARK"),
+			Value:   true,
+			Usage:   "Park idle partitions and read them in short catch-up queries, so a runner can look after more partitions than it streams at once. --park=false streams every partition.",
+		},
+		&cli.DurationFlag{
+			Name:    "park-interval",
+			Sources: cli.EnvVars("PARK_INTERVAL"),
+			Value:   0,
+			Usage:   "How long a parked partition waits between catch-up reads, and so the most extra delay for a change to an idle partition (0 = default, 10s).",
+		},
+		&cli.DurationFlag{
+			Name:    "park-idle-after",
+			Sources: cli.EnvVars("PARK_IDLE_AFTER"),
+			Value:   0,
+			Usage:   "How long a partition delivers only heartbeats before it is parked (0 = default, 1m).",
+		},
 		&cli.StringFlag{
 			Name:        "partition-dsn",
 			Sources:     cli.EnvVars("PARTITION_DSN"),
@@ -123,6 +141,9 @@ func buildConfig(c *cli.Command) (*screamer.Config, error) {
 
 	cfg.MaxConcurrentPartitions = int(c.Int("max-concurrent-partitions"))
 	cfg.LeaseTTL = c.Duration("lease-ttl")
+	cfg.DisableParking = !c.Bool("park")
+	cfg.ParkInterval = c.Duration("park-interval")
+	cfg.ParkIdleAfter = c.Duration("park-idle-after")
 	cfg.MetadataTable = nillableString(c, "metadata-table")
 	cfg.PartitionDSN = nillableString(c, "partition-dsn")
 	if cfg.PartitionDSN == nil {
@@ -230,6 +251,15 @@ func run(ctx context.Context, cfg *screamer.Config) error {
 	}
 	if cfg.LeaseTTL > 0 {
 		options = append(options, screamer.WithLeaseTTL(cfg.LeaseTTL))
+	}
+	if cfg.DisableParking {
+		options = append(options, screamer.WithParking(false))
+	}
+	if cfg.ParkInterval > 0 {
+		options = append(options, screamer.WithParkInterval(cfg.ParkInterval))
+	}
+	if cfg.ParkIdleAfter > 0 {
+		options = append(options, screamer.WithParkIdleAfter(cfg.ParkIdleAfter))
 	}
 	if cfg.Priority != int32(spannerpb.RequestOptions_PRIORITY_UNSPECIFIED) {
 		options = append(options, screamer.WithSpannerRequestPriotiry(spannerpb.RequestOptions_Priority(cfg.Priority)))

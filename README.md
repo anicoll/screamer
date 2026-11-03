@@ -107,6 +107,9 @@ OPTIONS:
    --start value               (default: Start timestamp with RFC3339 format, default: current timestamp) [$START]
    --end value                 (default: End timestamp with RFC3339 format default: indefinite) [$END]
    --heartbeat-interval value  (default: 3s) [$HEARTBEAT_INTERVAL]
+   --park                      Park idle partitions and read them in short catch-up queries (default: true) [$PARK]
+   --park-interval value       How long a parked partition waits between catch-up reads (0 = default, 10s) [$PARK_INTERVAL]
+   --park-idle-after value     How long a partition delivers only heartbeats before it is parked (0 = default, 1m) [$PARK_IDLE_AFTER]
    --lease-ttl value           How long a partition lease lasts without renewal (0 = default, 30s). A runner that dies is taken over after this long. (default: 0s) [$LEASE_TTL]
    --partition-dsn value       (default: Database dsn for use by the partition metadata table. If not provided, the main dsn will be used.) [$PARTITION_DSN]
    --help, -h                  show help
@@ -190,6 +193,24 @@ Lease expiry is compared with Spanner's clock, so runners' clocks don't need to 
 
 Before leases, a runner kept a partition for as long as it refreshed its `Runner` row, and any other runner took over a partition whose runner hadn't refreshed for 3 seconds. A pause longer than 3 seconds gave the partition two owners, and nothing stopped the old one writing an older watermark. `WithLeases(false)` goes back to that behaviour. Leases need the `Owner`, `Epoch` and `LeaseExpiresAt` columns, which `RunMigrations` adds; see [MIGRATION.md](MIGRATION.md).
 
+### Parking idle partitions
+
+On a large instance most partitions carry no writes at any moment, but each one still holds a change stream query open, and a runner can only hold so many (`WithMaxConcurrentPartitions`, gRPC streams, memory). Before parking, a partition over the limit was simply never read until it split, merged or the stream ended.
+
+Now a partition that has delivered nothing but heartbeats for a minute is **parked**: its query is closed and its lease released. Every 10 seconds, any runner claims it and reads it in a short catch-up query that ends at the current time. If that finds changes, the runner goes back to streaming the partition; if not, it parks it again. Runners claim whatever is furthest behind first, whether that is a new child, a parked partition that is due, or a partition whose lease expired, so the limit becomes a queue that drains.
+
+In the simulator, one runner with a limit of 20 reads all 200 partitions of a mostly idle stream. Without parking, more than half of them are never read.
+
+#### Latency vs capacity
+
+The cost is latency on idle partitions: a change to a parked partition is delivered up to one park interval (10s) later than it would be if it were streaming. Partitions with steady traffic never park, so their latency doesn't change. The first change after a quiet spell is the one that waits; once a catch-up read finds data, the partition streams again.
+
+- `WithParkInterval(d)` / `--park-interval` sets the worst case extra delay. Shorter means more catch-up queries.
+- `WithParkIdleAfter(d)` / `--park-idle-after` sets how long a partition must be quiet before it parks (default one minute).
+- `WithParking(false)` / `--park=false` streams every partition, as before. Use it when every change must arrive within a second or two and you can afford a query per partition.
+
+Parking needs leases. `screamer.watermark.lag` includes parked partitions, so expect it to sit at around the park interval on a quiet stream.
+
 ### Checkpoints
 
 After each batch is delivered, Screamer records the partition's watermark, the point it resumes from after a restart or a takeover. Watermarks are buffered in memory and written together once a second, in one transaction of up to 500 partitions, rather than once per batch per partition. With thousands of partitions that each heartbeat every few seconds, that turns thousands of small writes a second into one. Watermarks only ever move forward, and are written one last time when the subscriber stops.
@@ -212,6 +233,7 @@ Pass an OpenTelemetry `MeterProvider` with `WithMeterProvider` (the global provi
 | `screamer.leases.held` | runner | Partition leases this runner holds. |
 | `screamer.leases.lost` | runner | Leases this runner found taken by another runner, after a pause longer than the lease TTL. Should stay near zero. |
 | `screamer.leases.takeovers` | runner | Partitions this runner claimed after another runner's lease expired or was released. |
+| `screamer.partitions.parks` | runner | Times this runner parked an idle partition, including after a catch-up read found nothing. |
 
 Cluster metrics are read from the metadata table every 15 seconds, and every runner reports the same values, so aggregate them with `max`, not `sum`. Each runner also logs a warning when `desired_runners` is above `live_runners`.
 

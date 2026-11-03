@@ -67,6 +67,11 @@ func TestBaseline_DeliversEverythingThroughSplitsAndMerges(t *testing.T) {
 // Known problem 1: WithMaxConcurrentPartitions does not queue partitions, it
 // starves them. A partition only ends when it splits, merges or reaches the end
 // timestamp, so partitions over the cap are never read.
+//
+// Parking fixes this for idle partitions (see TestParking_LimitNoLongerStarvesIdlePartitions).
+// Here every partition is busy, so none of them parks: a runner that is short
+// of capacity for busy partitions still needs more runners, which is what
+// screamer.runners.desired is for.
 func TestBaseline_ConcurrencyCapStarvesPartitions(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		start := time.Now()

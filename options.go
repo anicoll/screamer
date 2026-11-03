@@ -30,6 +30,9 @@ type config struct {
 	checkpointInterval      time.Duration
 	leases                  bool
 	leaseTTL                time.Duration
+	parking                 bool
+	parkInterval            time.Duration
+	parkIdleAfter           time.Duration
 }
 
 type (
@@ -272,4 +275,58 @@ func WithLeaseTTL(d time.Duration) Option {
 		d = minLeaseTTL
 	}
 	return withLeaseTTL(d)
+}
+
+type withParking bool
+
+func (o withParking) Apply(c *config) {
+	c.parking = bool(o)
+}
+
+// WithParking sets whether idle partitions are parked. It is on by default,
+// and needs leases (see WithLeases) and a PartitionStorage that implements
+// PartitionParker (both built-in storages do).
+//
+// A partition that delivers nothing but heartbeats for WithParkIdleAfter (one
+// minute by default) is parked: its query is closed and its lease released.
+// Every WithParkInterval (10 seconds by default) any runner reads it up to the
+// current time. If that finds changes, the partition is streamed again;
+// otherwise it is parked again. Parked partitions hold no query and no slot of
+// WithMaxConcurrentPartitions, so a runner can look after far more partitions
+// than it can stream at once.
+//
+// The cost is latency: a change to a parked partition is delivered up to one
+// park interval later than it would be if the partition were streaming.
+// Turning parking off streams every partition, as releases before parking did.
+func WithParking(enabled bool) Option {
+	return withParking(enabled)
+}
+
+type withParkInterval time.Duration
+
+func (o withParkInterval) Apply(c *config) {
+	c.parkInterval = time.Duration(o)
+}
+
+// WithParkInterval sets how long a parked partition waits between catch-up
+// reads, and so the most extra delay a change to an idle partition sees.
+// Default is 10 seconds; values under 1 second are raised to 1 second.
+func WithParkInterval(d time.Duration) Option {
+	if d < time.Second {
+		d = time.Second
+	}
+	return withParkInterval(d)
+}
+
+type withParkIdleAfter time.Duration
+
+func (o withParkIdleAfter) Apply(c *config) {
+	c.parkIdleAfter = time.Duration(o)
+}
+
+// WithParkIdleAfter sets how long a streaming partition delivers nothing but
+// heartbeats before it is parked. Default is one minute; values under twice
+// the heartbeat interval are raised to that when the subscriber starts.
+func WithParkIdleAfter(d time.Duration) Option {
+	return withParkIdleAfter(d)
 }

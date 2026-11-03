@@ -399,3 +399,44 @@ func (s *IntegrationTestSuite) TestMultipleRunners() {
 	}
 	s.Greater(totalChanges, 0, "At least one runner should receive changes")
 }
+
+// A partition that goes idle is parked, then read again in catch-up queries
+// that end at the current time. Writes made while it is parked are still
+// delivered, through the real change stream reader.
+func (s *IntegrationTestSuite) TestParkedPartitionDeliversLaterWrites() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runnerID := uuid.NewString()
+	tableName, streamName := s.createTableAndStream(ctx, "parking")
+	storage := s.setupSpannerStorage(ctx, runnerID, tableName+"_meta")
+	consumer := &testConsumer{}
+
+	subscriber := screamer.NewSubscriber(
+		s.client,
+		streamName,
+		runnerID,
+		storage,
+		screamer.WithSerializedConsumer(true),
+		screamer.WithHeartbeatInterval(time.Second),
+		screamer.WithParkIdleAfter(2*time.Second),
+		screamer.WithParkInterval(time.Second),
+	)
+
+	go subscriber.Subscribe(ctx, consumer)
+	time.Sleep(time.Second)
+
+	s.executeDML(ctx, fmt.Sprintf(`INSERT INTO %s (Bool, Int64, Float64, String, Timestamp) VALUES (TRUE, 1, 0.5, 'first', CURRENT_TIMESTAMP())`, tableName))
+	s.Eventually(func() bool { return len(consumer.getChanges()) >= 1 }, 10*time.Second, 100*time.Millisecond)
+
+	// Idle long enough to be parked.
+	s.Eventually(func() bool { return subscriber.GetMetrics().PartitionsParked > 0 }, 15*time.Second, 100*time.Millisecond)
+
+	s.executeDML(ctx,
+		fmt.Sprintf(`INSERT INTO %s (Bool, Int64, Float64, String, Timestamp) VALUES (TRUE, 2, 0.5, 'second', CURRENT_TIMESTAMP())`, tableName),
+		fmt.Sprintf(`UPDATE %s SET Bool = FALSE WHERE Int64 = 2`, tableName),
+	)
+	s.Eventually(func() bool { return len(consumer.getChanges()) >= 3 }, 15*time.Second, 100*time.Millisecond,
+		"writes made while the partition was parked should be delivered")
+	cancel()
+}

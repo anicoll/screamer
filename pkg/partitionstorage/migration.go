@@ -75,7 +75,7 @@ func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 
 	stmts := []string{partitionStmt, partitionToRunnerStmt, runnerStmt, runnerIndexStmt, partitionMetaIndexStmt}
 
-	// Lease columns, added to tables created before leases. Spanner has no
+	// Lease and parking columns, added to tables created before them. Spanner has no
 	// ADD COLUMN IF NOT EXISTS, so add only the ones that are missing.
 	existing, err := s.columns(ctx)
 	if err != nil {
@@ -85,6 +85,7 @@ func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
 		{columnOwner, "STRING(MAX)"},
 		{columnEpoch, "INT64"},
 		{columnLeaseExpiresAt, "TIMESTAMP"},
+		{columnNextReadAt, "TIMESTAMP"},
 	} {
 		if !existing[c.name] {
 			stmts = append(stmts, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", s.tableName, c.name, c.ddl))

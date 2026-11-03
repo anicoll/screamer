@@ -70,6 +70,9 @@ type ClaimRequest struct {
 	// MinWatermark is the lowest StartTimestamp of a CREATED partition that may
 	// be claimed when ParentGating is false.
 	MinWatermark time.Time
+	// Parked also claims PARKED partitions whose NextReadAt has passed (see
+	// PartitionParker). Their state stays PARKED until UpdateToRunning.
+	Parked bool
 }
 
 // Lease identifies a lease held by a runner, with the watermark to write when
@@ -202,6 +205,7 @@ func (s *Subscriber) claimPartitions(ctx context.Context, minWatermark time.Time
 		Limit:        limit,
 		ParentGating: s.parentGating,
 		MinWatermark: minWatermark,
+		Parked:       s.parker != nil,
 	})
 	if err != nil {
 		return nil, err
