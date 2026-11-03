@@ -193,6 +193,27 @@ func (s *SpannerTestSuite) getPartitionState(ctx context.Context, storage *testS
 
 // --- Tests ---
 
+// Runners that start together all run migrations on the same new table. Each
+// sees the lease columns missing and adds them, and all but the first find
+// them already there.
+func (s *SpannerTestSuite) TestRunMigrationsConcurrently() {
+	ctx := context.Background()
+	client, err := spanner.NewClient(ctx, s.dsn)
+	s.Require().NoError(err)
+	defer client.Close()
+
+	errs := make(chan error, 4)
+	for range cap(errs) {
+		go func() {
+			storage := &SpannerPartitionStorage{client: client, tableName: "ConcurrentMigrations"}
+			errs <- storage.RunMigrations(ctx)
+		}()
+	}
+	for range cap(errs) {
+		s.NoError(<-errs)
+	}
+}
+
 func (s *SpannerTestSuite) TestRunMigrations() {
 	ctx := context.Background()
 	client, err := spanner.NewClient(ctx, s.dsn)
