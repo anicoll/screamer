@@ -51,7 +51,7 @@ At 5,000 partitions on one runner, Screamer itself holds about **1.6 KB of heap 
 
 The simulator does not include the Spanner client's per-stream state (gRPC flow-control windows, `RowIterator` buffers), which is likely larger and is worth measuring on a real instance. Parking idle partitions (step 5 of the partition scaling design) removes both costs for partitions with no traffic, which in most deployments is most of them.
 
-## 5. Metadata table load (not changed yet; measure on Spanner)
+## 5. Metadata table load
 
 These are the queries each runner sends to the metadata table:
 
@@ -66,10 +66,10 @@ These are the queries each runner sends to the metadata table:
 
 Recommendations, in order:
 
-1. **Index `State`.** Add `CREATE INDEX ... ON <table>(State) STORING (ParentTokens, StartTimestamp, Watermark)`, and rewrite `State != FINISHED` as `State IN (CREATED, SCHEDULED, RUNNING)` so it can use the index. Then scheduling, counting and the missing-parent check read only unfinished rows. Measure the query plans on a real instance first: the emulator does not show them.
+1. **Index `State`.** Done: `RunMigrations` creates `<table>_State_idx ON <table>(State, Watermark)`, and every query that skipped finished rows with `State != FINISHED` now asks for `State IN UNNEST(@unfinished)` so it can use the index. Scheduling, claiming, counting and the missing-parent check read only unfinished rows. The query plans still need checking on a real instance: the emulator does not show them.
 2. **Don't scan for CREATED rows when nothing new was added.** The runner that adds child partitions knows they exist. A cheap "any CREATED rows?" check, or scheduling right after `AddChildPartitions`, would save a read-write transaction per runner per second when nothing has split.
-3. **Lease-based ownership (step 4 of the design)** replaces the `PartitionToRunner` join in `GetInterruptedPartitions` with a single-row comparison.
+3. **Lease-based ownership.** Done: with leases (the default), `GetInterruptedPartitions` and its three-table join no longer run. Claiming an expired lease is part of the one claim transaction a second, and lease renewal rides on the checkpoint write.
 
 ## 6. In-memory storage at long uptimes
 
-`InmemoryPartitionStorage` never removes FINISHED partitions, so memory and the per-second scans grow with every split for the life of the process. Each entry is a few hundred bytes. Pruning partitions some time after they finish, as the Spanner storage does after a day, is safe with parent gating on: a missing parent counts as finished once nothing is behind the child. This is not done yet.
+`InmemoryPartitionStorage` used to keep FINISHED partitions forever, so memory and the per-second scans grew with every split for the life of the process. It now removes them an hour after they finish (`WithFinishedRetention`), as the Spanner storage does after a day. That is safe with parent gating on: a missing parent counts as finished once nothing is behind the child.

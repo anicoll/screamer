@@ -19,14 +19,22 @@ type basicStorage struct {
 }
 
 func TestParentGatingNeedsAGatedScheduler(t *testing.T) {
-	sub := screamer.NewSubscriber(nil, "Stream", "runner-1", basicStorage{partitionstorage.NewInmemory()})
+	sub := screamer.NewSubscriber(nil, "Stream", "runner-1", basicStorage{partitionstorage.NewInmemory()}, screamer.WithLeases(false))
 	err := sub.Subscribe(context.Background(), screamer.ConsumerFunc(func([]byte) error { return nil }))
 	require.ErrorContains(t, err, "ParentGatedScheduler")
 	require.ErrorContains(t, err, "WithParentGating(false)")
 }
 
-// A storage without the optional interfaces still works with parent gating off,
-// and batched checkpoints fall back to one UpdateWatermark per partition.
+func TestLeasesNeedAPartitionLeaser(t *testing.T) {
+	sub := screamer.NewSubscriber(nil, "Stream", "runner-1", basicStorage{partitionstorage.NewInmemory()}, screamer.WithParentGating(false))
+	err := sub.Subscribe(context.Background(), screamer.ConsumerFunc(func([]byte) error { return nil }))
+	require.ErrorContains(t, err, "PartitionLeaser")
+	require.ErrorContains(t, err, "WithLeases(false)")
+}
+
+// A storage without the optional interfaces still works with parent gating and
+// leases off, and batched checkpoints fall back to one UpdateWatermark per
+// partition.
 func TestBasicStorageWithoutParentGating(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		start := time.Now()
@@ -51,6 +59,7 @@ func TestBasicStorageWithoutParentGating(t *testing.T) {
 			screamer.WithStartTimestamp(start),
 			screamer.WithEndTimestamp(end),
 			screamer.WithParentGating(false),
+			screamer.WithLeases(false),
 		)
 		require.NoError(t, sub.Subscribe(context.Background(), checker))
 		r := checker.Report(end)

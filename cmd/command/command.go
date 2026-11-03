@@ -68,6 +68,13 @@ func ScreamerCommand() *cli.Command {
 			Value:    0,
 			Usage:    "Maximum partitions this runner reads at once (0 = unlimited). Also sizes the gRPC channel pool for change stream reads.",
 		},
+		&cli.DurationFlag{
+			Name:     "lease-ttl",
+			Sources:  cli.EnvVars("LEASE_TTL"),
+			Required: false,
+			Value:    0,
+			Usage:    "How long a partition lease lasts without renewal (0 = default, 30s). A runner that dies is taken over after this long.",
+		},
 		&cli.StringFlag{
 			Name:        "partition-dsn",
 			Sources:     cli.EnvVars("PARTITION_DSN"),
@@ -115,6 +122,7 @@ func buildConfig(c *cli.Command) (*screamer.Config, error) {
 	cfg.HeartbeatInterval = &dur
 
 	cfg.MaxConcurrentPartitions = int(c.Int("max-concurrent-partitions"))
+	cfg.LeaseTTL = c.Duration("lease-ttl")
 	cfg.MetadataTable = nillableString(c, "metadata-table")
 	cfg.PartitionDSN = nillableString(c, "partition-dsn")
 	if cfg.PartitionDSN == nil {
@@ -219,6 +227,9 @@ func run(ctx context.Context, cfg *screamer.Config) error {
 	}
 	if cfg.MaxConcurrentPartitions > 0 {
 		options = append(options, screamer.WithMaxConcurrentPartitions(cfg.MaxConcurrentPartitions))
+	}
+	if cfg.LeaseTTL > 0 {
+		options = append(options, screamer.WithLeaseTTL(cfg.LeaseTTL))
 	}
 	if cfg.Priority != int32(spannerpb.RequestOptions_PRIORITY_UNSPECIFIED) {
 		options = append(options, screamer.WithSpannerRequestPriotiry(spannerpb.RequestOptions_Priority(cfg.Priority)))

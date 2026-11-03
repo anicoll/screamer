@@ -176,6 +176,22 @@ func (s *Subscriber) registerMetrics(mp metric.MeterProvider) (metric.Registrati
 		return nil, err
 	}
 
+	leasesHeld, err := meter.Int64ObservableGauge("screamer.leases.held",
+		metric.WithDescription("Partition leases this runner holds."), metric.WithUnit("{lease}"))
+	if err != nil {
+		return nil, err
+	}
+	leasesLost, err := meter.Int64ObservableCounter("screamer.leases.lost",
+		metric.WithDescription("Leases this runner found taken by another runner, which stopped it reading those partitions. Should stay near zero."), metric.WithUnit("{lease}"))
+	if err != nil {
+		return nil, err
+	}
+	takeovers, err := meter.Int64ObservableCounter("screamer.leases.takeovers",
+		metric.WithDescription("Partitions this runner claimed after another runner's lease expired or was released. Spikes mean runners died or stopped."), metric.WithUnit("{partition}"))
+	if err != nil {
+		return nil, err
+	}
+
 	attrs := metric.WithAttributes(
 		attribute.String("stream", s.streamName),
 		attribute.String("runner_id", s.runnerID),
@@ -186,6 +202,11 @@ func (s *Subscriber) registerMetrics(mp metric.MeterProvider) (metric.Registrati
 		o.ObserveInt64(active, int64(s.getRunningPartitionCount()), attrs)
 		o.ObserveInt64(capacity, int64(s.maxConcurrentPartitions), attrs)
 		o.ObserveInt64(retries, s.partitionRetries.Load(), attrs)
+		if s.leaser != nil {
+			o.ObserveInt64(leasesHeld, int64(s.leases.count()), attrs)
+			o.ObserveInt64(leasesLost, s.leases.lostCount(), attrs)
+			o.ObserveInt64(takeovers, s.leases.takeoverCount(), attrs)
+		}
 
 		c := s.GetClusterMetrics()
 		if c.UpdatedAt.IsZero() {
@@ -200,5 +221,5 @@ func (s *Subscriber) registerMetrics(mp metric.MeterProvider) (metric.Registrati
 		}
 		o.ObserveFloat64(lag, c.WatermarkLag.Seconds(), clusterAttrs)
 		return nil
-	}, active, capacity, retries, unfinished, live, desired, lag)
+	}, active, capacity, retries, unfinished, live, desired, lag, leasesHeld, leasesLost, takeovers)
 }

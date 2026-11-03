@@ -25,8 +25,11 @@ type ParentGatedScheduler interface {
 }
 
 // schedulePartitions picks the next partitions to read, honouring parent gating
-// when it is on.
+// when it is on. With leases, it claims them.
 func (s *Subscriber) schedulePartitions(ctx context.Context, minWatermark time.Time, limit int) ([]*PartitionMetadata, error) {
+	if s.leaser != nil {
+		return s.claimPartitions(ctx, minWatermark, limit)
+	}
 	if s.gatedScheduler != nil {
 		return s.gatedScheduler.GetAndScheduleReadyPartitions(ctx, s.runnerID, limit)
 	}

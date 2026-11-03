@@ -107,6 +107,7 @@ OPTIONS:
    --start value               (default: Start timestamp with RFC3339 format, default: current timestamp) [$START]
    --end value                 (default: End timestamp with RFC3339 format default: indefinite) [$END]
    --heartbeat-interval value  (default: 3s) [$HEARTBEAT_INTERVAL]
+   --lease-ttl value           How long a partition lease lasts without renewal (0 = default, 30s). A runner that dies is taken over after this long. (default: 0s) [$LEASE_TTL]
    --partition-dsn value       (default: Database dsn for use by the partition metadata table. If not provided, the main dsn will be used.) [$PARTITION_DSN]
    --help, -h                  show help
 ```
@@ -115,7 +116,7 @@ OPTIONS:
 
 ## Built-in Distributed Locking for Scalability
 
-Screamer includes built-in distributed locking and runner liveness tracking. When you scale up and run multiple Screamer instances, partitions are automatically assigned to available runners, and failover is handled transparently. This enables robust, distributed processing of change streams with high availability.
+Screamer includes built-in distributed locking and runner liveness tracking. When you scale up and run multiple Screamer instances, partitions are automatically assigned to available runners, and failover is handled transparently. This enables robust, distributed processing of change streams with high availability. See [Partition leases](#partition-leases) for how ownership moves between runners.
 
 ---
 
@@ -176,6 +177,19 @@ When a partition splits or merges, its children carry on from where it ended. A 
 
 `WithParentGating(false)` turns it off and schedules a child as soon as any parent reports it, as releases before it did. Children then start sooner, but a key can be delivered out of order when one parent is behind. Parent gating needs a `PartitionStorage` that implements `screamer.ParentGatedScheduler`; both built-in storages do, and [MIGRATION.md](MIGRATION.md) covers custom ones.
 
+### Partition leases
+
+Each runner owns the partitions it reads through a lease stored on the partition's row: an owner, an epoch and an expiry time. A runner renews all its leases every 10 seconds, in the same write as its checkpoints, and a lease lasts 30 seconds without renewal (`WithLeaseTTL`, or `--lease-ttl` on the CLI).
+
+- **A runner that stops cleanly** (a rollout, a scale-down) releases its leases with its last watermarks. Other runners pick the partitions up on their next claim, about a second later.
+- **A runner that dies** (killed, OOM, lost its node) keeps its leases until they expire. After about 30 seconds, other runners claim its partitions and resume from its last checkpoint. The records after that checkpoint are delivered again, as with any restart.
+- **A runner that freezes** for longer than the TTL (a long GC pause, a suspended VM, a network partition) loses its leases while it is frozen. Each claim increments the partition's epoch, and every watermark write is conditional on the epoch, so when the frozen runner wakes up its next checkpoint is rejected. It stops reading those partitions and writes nothing for them: the new owner's progress is never overwritten. The frozen runner carries on and claims other work. Its last in-flight batches may still reach your consumer, which is the usual at-least-once redelivery.
+- **A pause shorter than about 20 seconds** changes nothing.
+
+Lease expiry is compared with Spanner's clock, so runners' clocks don't need to agree. `screamer.leases.held`, `screamer.leases.lost` and `screamer.leases.takeovers` show what is happening; `lost` should stay near zero, and a spike in `takeovers` means runners died or were stopped.
+
+Before leases, a runner kept a partition for as long as it refreshed its `Runner` row, and any other runner took over a partition whose runner hadn't refreshed for 3 seconds. A pause longer than 3 seconds gave the partition two owners, and nothing stopped the old one writing an older watermark. `WithLeases(false)` goes back to that behaviour. Leases need the `Owner`, `Epoch` and `LeaseExpiresAt` columns, which `RunMigrations` adds; see [MIGRATION.md](MIGRATION.md).
+
 ### Checkpoints
 
 After each batch is delivered, Screamer records the partition's watermark, the point it resumes from after a restart or a takeover. Watermarks are buffered in memory and written together once a second, in one transaction of up to 500 partitions, rather than once per batch per partition. With thousands of partitions that each heartbeat every few seconds, that turns thousands of small writes a second into one. Watermarks only ever move forward, and are written one last time when the subscriber stops.
@@ -195,6 +209,9 @@ Pass an OpenTelemetry `MeterProvider` with `WithMeterProvider` (the global provi
 | `screamer.partitions.active` | runner | Partitions this runner is reading. |
 | `screamer.partitions.capacity` | runner | This runner's partition limit. |
 | `screamer.partition.retries` | runner | Partition reads retried after a failure. |
+| `screamer.leases.held` | runner | Partition leases this runner holds. |
+| `screamer.leases.lost` | runner | Leases this runner found taken by another runner, after a pause longer than the lease TTL. Should stay near zero. |
+| `screamer.leases.takeovers` | runner | Partitions this runner claimed after another runner's lease expired or was released. |
 
 Cluster metrics are read from the metadata table every 15 seconds, and every runner reports the same values, so aggregate them with `max`, not `sum`. Each runner also logs a warning when `desired_runners` is above `live_runners`.
 

@@ -13,13 +13,49 @@ import (
 type InmemoryPartitionStorage struct {
 	mu sync.Mutex
 	m  map[string]*screamer.PartitionMetadata
+
+	// finished lists finished partitions in the order they finished, so they
+	// can be removed once they are older than retention.
+	finished  []finishedPartition
+	retention time.Duration
+}
+
+type finishedPartition struct {
+	token string
+	at    time.Time
+}
+
+// DefaultFinishedRetention is how long InmemoryPartitionStorage keeps a
+// partition after it finishes, unless WithFinishedRetention says otherwise.
+const DefaultFinishedRetention = time.Hour
+
+// InmemoryOption configures an InmemoryPartitionStorage.
+type InmemoryOption func(*InmemoryPartitionStorage)
+
+// WithFinishedRetention sets how long a finished partition is kept before it is
+// removed. Without removal, memory and the per-second scans grow with every
+// split for the life of the process. The Spanner storage does the same with a
+// row deletion policy of one day.
+//
+// Removing finished partitions is safe with parent gating on: a missing parent
+// counts as finished once no unfinished partition is behind its child. With
+// parent gating off, a merged child could be created again if one of its
+// parents reports it more than the retention after the child finished. 0 keeps
+// every partition, as releases before this option did.
+func WithFinishedRetention(d time.Duration) InmemoryOption {
+	return func(s *InmemoryPartitionStorage) { s.retention = d }
 }
 
 // NewInmemory creates a new instance of InmemoryPartitionStorage.
-func NewInmemory() *InmemoryPartitionStorage {
-	return &InmemoryPartitionStorage{
-		m: make(map[string]*screamer.PartitionMetadata),
+func NewInmemory(opts ...InmemoryOption) *InmemoryPartitionStorage {
+	s := &InmemoryPartitionStorage{
+		m:         make(map[string]*screamer.PartitionMetadata),
+		retention: DefaultFinishedRetention,
 	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // GetUnfinishedMinWatermarkPartition returns the unfinished partition with the minimum watermark.
@@ -243,7 +279,12 @@ func (s *InmemoryPartitionStorage) UpdateToRunning(ctx context.Context, partitio
 	defer s.mu.Unlock()
 
 	now := time.Now().UTC()
-	p := s.m[partition.PartitionToken]
+	p, ok := s.m[partition.PartitionToken]
+	if !ok || p.State == screamer.StateFinished {
+		// Never move a finished partition back to running: a runner that lost
+		// its lease while the new owner finished the partition may still retry.
+		return nil
+	}
 	p.RunningAt = &now
 	p.State = screamer.StateRunning
 
@@ -257,11 +298,157 @@ func (s *InmemoryPartitionStorage) UpdateToFinished(ctx context.Context, partiti
 
 	now := time.Now().UTC()
 
-	p := s.m[partition.PartitionToken]
+	p, ok := s.m[partition.PartitionToken]
+	if !ok || p.State == screamer.StateFinished {
+		return nil
+	}
 	p.FinishedAt = &now
 	p.State = screamer.StateFinished
+	if s.retention > 0 {
+		s.finished = append(s.finished, finishedPartition{token: p.PartitionToken, at: now})
+		s.prune(now)
+	}
 
 	return nil
+}
+
+// prune removes partitions that finished more than retention ago. s.mu must be held.
+func (s *InmemoryPartitionStorage) prune(now time.Time) {
+	n := 0
+	for n < len(s.finished) && now.Sub(s.finished[n].at) > s.retention {
+		if p, ok := s.m[s.finished[n].token]; ok && p.State == screamer.StateFinished {
+			delete(s.m, s.finished[n].token)
+		}
+		n++
+	}
+	if n > 0 {
+		s.finished = append(s.finished[:0], s.finished[n:]...)
+	}
+}
+
+// ClaimPartitions leases up to req.Limit partitions to req.RunnerID: CREATED
+// partitions that are ready, oldest first, then SCHEDULED or RUNNING partitions
+// whose lease has expired or that have none, lowest watermark first.
+func (s *InmemoryPartitionStorage) ClaimPartitions(ctx context.Context, req screamer.ClaimRequest) ([]*screamer.PartitionMetadata, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	var ready, expired []*screamer.PartitionMetadata
+	for _, p := range s.m {
+		switch p.State {
+		case screamer.StateCreated:
+			if req.ParentGating && s.parentsFinished(p) || !req.ParentGating && !req.MinWatermark.After(p.StartTimestamp) {
+				ready = append(ready, p)
+			}
+		case screamer.StateScheduled, screamer.StateRunning:
+			if p.LeaseExpiresAt == nil || !p.LeaseExpiresAt.After(now) {
+				expired = append(expired, p)
+			}
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool {
+		if !ready[i].StartTimestamp.Equal(ready[j].StartTimestamp) {
+			return ready[i].StartTimestamp.Before(ready[j].StartTimestamp)
+		}
+		return ready[i].PartitionToken < ready[j].PartitionToken
+	})
+	sort.Slice(expired, func(i, j int) bool {
+		if !expired[i].Watermark.Equal(expired[j].Watermark) {
+			return expired[i].Watermark.Before(expired[j].Watermark)
+		}
+		return expired[i].PartitionToken < expired[j].PartitionToken
+	})
+
+	expiresAt := now.Add(req.TTL)
+	out := make([]*screamer.PartitionMetadata, 0, min(req.Limit, len(ready)+len(expired)))
+	for _, p := range append(ready, expired...) {
+		if len(out) >= req.Limit {
+			break
+		}
+		if p.State == screamer.StateCreated {
+			p.State = screamer.StateScheduled
+			p.ScheduledAt = &now
+		}
+		owner := req.RunnerID
+		epoch := int64(1)
+		if p.Epoch != nil {
+			epoch = *p.Epoch + 1
+		}
+		p.Owner, p.Epoch, p.LeaseExpiresAt = &owner, &epoch, &expiresAt
+		out = append(out, copyPartition(p))
+	}
+	return out, nil
+}
+
+// RenewLeases extends the leases runnerID still holds and moves their
+// watermarks forward. It returns the tokens of the leases it no longer holds.
+func (s *InmemoryPartitionStorage) RenewLeases(ctx context.Context, runnerID string, ttl time.Duration, leases []screamer.Lease) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	expiresAt := time.Now().UTC().Add(ttl)
+	var lost []string
+	for _, l := range leases {
+		p, ok := s.held(runnerID, l)
+		if !ok {
+			lost = append(lost, l.PartitionToken)
+			continue
+		}
+		if l.Watermark.After(p.Watermark) {
+			p.Watermark = l.Watermark
+		}
+		e := expiresAt
+		p.LeaseExpiresAt = &e
+	}
+	return lost, nil
+}
+
+// ReleaseLeases moves the watermarks of the leases runnerID still holds forward
+// and ends those leases.
+func (s *InmemoryPartitionStorage) ReleaseLeases(ctx context.Context, runnerID string, leases []screamer.Lease) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, l := range leases {
+		p, ok := s.held(runnerID, l)
+		if !ok {
+			continue
+		}
+		if l.Watermark.After(p.Watermark) {
+			p.Watermark = l.Watermark
+		}
+		p.Owner, p.LeaseExpiresAt = nil, nil
+	}
+	return nil
+}
+
+// held returns the partition of l if runnerID still holds its lease at l's
+// epoch. s.mu must be held.
+func (s *InmemoryPartitionStorage) held(runnerID string, l screamer.Lease) (*screamer.PartitionMetadata, bool) {
+	p, ok := s.m[l.PartitionToken]
+	if !ok || p.State == screamer.StateFinished || p.Owner == nil || *p.Owner != runnerID || p.Epoch == nil || *p.Epoch != l.Epoch {
+		return nil, false
+	}
+	return p, true
+}
+
+// copyPartition returns a copy of p that shares nothing the store changes later.
+func copyPartition(p *screamer.PartitionMetadata) *screamer.PartitionMetadata {
+	c := *p
+	if p.Owner != nil {
+		o := *p.Owner
+		c.Owner = &o
+	}
+	if p.Epoch != nil {
+		e := *p.Epoch
+		c.Epoch = &e
+	}
+	if p.LeaseExpiresAt != nil {
+		t := *p.LeaseExpiresAt
+		c.LeaseExpiresAt = &t
+	}
+	return &c
 }
 
 // UpdateWatermark updates the watermark for the given partition.
@@ -299,6 +486,7 @@ var (
 	_ screamer.PartitionCounter      = (*InmemoryPartitionStorage)(nil)
 	_ screamer.ParentGatedScheduler  = (*InmemoryPartitionStorage)(nil)
 	_ screamer.WatermarkBatchUpdater = (*InmemoryPartitionStorage)(nil)
+	_ screamer.PartitionLeaser       = (*InmemoryPartitionStorage)(nil)
 )
 
 // Assert that InmemoryPartitionStorage implements PartitionStorage.

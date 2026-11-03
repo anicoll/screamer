@@ -13,4 +13,6 @@ type Config struct {
 	Priority          int32
 	// MaxConcurrentPartitions limits partitions read at once by this runner (0 = unlimited).
 	MaxConcurrentPartitions int
+	// LeaseTTL is how long a partition lease lasts without renewal (0 = default, 30s).
+	LeaseTTL time.Duration
 }

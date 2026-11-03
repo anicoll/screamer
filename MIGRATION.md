@@ -1,5 +1,45 @@
 # Migration guide
 
+## Partition leases
+
+### What changed
+
+Runners now own partitions through leases with fencing (see [Partition leases](README.md#partition-leases) in the README):
+
+- A runner that dies is taken over after its lease expires, **30 seconds** by default, not 3 seconds after its last `Runner` refresh. A runner that stops cleanly hands its partitions over within about a second. Tune with `WithLeaseTTL(d)` or `--lease-ttl`.
+- A runner that comes back from a pause longer than the TTL cannot write over the new owner's watermarks. It stops reading those partitions.
+- The checkpoint interval is capped at a third of the lease TTL, so leases are always renewed in time.
+- `PartitionToRunner` is no longer written. You can drop it once every runner runs this release.
+- `InmemoryPartitionStorage` now removes finished partitions an hour after they finish, so long-running processes don't grow without bound. `NewInmemory(partitionstorage.WithFinishedRetention(0))` keeps them all, as before.
+
+### Do I need to do anything?
+
+**If you use `partitionstorage.NewSpanner`**, the metadata table needs three new nullable columns and an index. `RunMigrations` adds them (the CLI calls it at start). If you manage the schema yourself, apply:
+
+```sql
+ALTER TABLE <metadata table> ADD COLUMN Owner STRING(MAX);
+ALTER TABLE <metadata table> ADD COLUMN Epoch INT64;
+ALTER TABLE <metadata table> ADD COLUMN LeaseExpiresAt TIMESTAMP;
+CREATE INDEX <metadata table>_State_idx ON <metadata table>(State, Watermark)
+  STORING (ParentTokens, StartTimestamp, Owner, Epoch, LeaseExpiresAt);
+```
+
+Until the columns exist, `Subscribe` fails with an error naming the missing column and pointing here.
+
+**If you use `partitionstorage.NewInmemory`**, nothing to do.
+
+**If you have your own `PartitionStorage`**, `Subscribe` now returns:
+
+```
+screamer: leases are on but *yourpkg.Storage does not implement screamer.PartitionLeaser; ...
+```
+
+Implement `screamer.PartitionLeaser` (`ClaimPartitions`, `RenewLeases`, `ReleaseLeases`; the interface documents what each must guarantee, and `pkg/partitionstorage/inmemory.go` is a plain Go version), or keep the old behaviour with `screamer.WithLeases(false)`.
+
+### Rolling out
+
+Runners from before this release don't use leases, and runners from this release treat a partition with no lease as free to claim. While both run at once, the same partition can be read by an old and a new runner, so some changes are delivered twice. To avoid that, stop every old runner before starting new ones. Either way nothing is lost, and the duplicates stop once the old runners are gone.
+
 ## Faster record decoding and encoding
 
 Change records are now decoded without reflection, and the JSON delivered to consumers is written directly. That's about 11x less CPU and 7x less garbage per record (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md)). Nothing to change in your code.
