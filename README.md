@@ -17,11 +17,14 @@ It is heavily inspired by the SpannerIO connector of the [Apache Beam SDK](https
 To read a change stream, Google Cloud offers a [Dataflow connector](https://cloud.google.com/spanner/docs/change-streams/use-dataflow) as a scalable and reliable solution, but in some cases the abstraction and capabilities of Dataflow pipelines can be too much (or is simply too expensive).
 This library aims to make reading change streams native for non beam/dataflow use cases.
 
+## Upgrading
+
+Recent releases change how partitions are scheduled and owned: parent gating, leases, parking idle partitions and fair share are all on by default, and the Spanner metadata table has new columns. `RunMigrations` adds them. Read [MIGRATION.md](MIGRATION.md) before upgrading, especially if you manage the schema yourself, have your own `PartitionStorage`, or run old and new runners side by side.
+
 ## Example Usage
 
 ```go
-package screamer
-
+package main
 
 import (
 	"context"
@@ -87,9 +90,14 @@ func (l *Logger) Consume(change []byte) error {
 
 ### Installation
 
+The CLI lives in `cmd`, so build it from a clone:
+
 ```console
-$ go install github.com/anicoll/screamer@latest
+$ git clone https://github.com/anicoll/screamer && cd screamer
+$ make build   # writes .bin/screamer
 ```
+
+`go install github.com/anicoll/screamer/cmd@latest` also works, but names the binary `cmd`.
 
 ### Usage
 
@@ -98,23 +106,26 @@ NAME:
    screamer screamer
 
 USAGE:
-   screamer screamer [command options]
+   screamer screamer [options]
 
 OPTIONS:
-   --dsn value                  [$DSN]
-   --stream value               [$STREAM]
-   --metadata-table value       [$METADATA_TABLE]
-   --start value               (default: Start timestamp with RFC3339 format, default: current timestamp) [$START]
-   --end value                 (default: End timestamp with RFC3339 format default: indefinite) [$END]
-   --heartbeat-interval value  (default: 3s) [$HEARTBEAT_INTERVAL]
-   --park                      Park idle partitions and read them in short catch-up queries (default: true) [$PARK]
-   --park-interval value       How long a parked partition waits between catch-up reads (0 = default, 10s) [$PARK_INTERVAL]
-   --park-idle-after value     How long a partition delivers only heartbeats before it is parked (0 = default, 1m) [$PARK_IDLE_AFTER]
-   --fair-share                Even out streaming partitions across runners (default: true) [$FAIR_SHARE]
-   --lease-ttl value           How long a partition lease lasts without renewal (0 = default, 30s). A runner that dies is taken over after this long. (default: 0s) [$LEASE_TTL]
-   --partition-dsn value       (default: Database dsn for use by the partition metadata table. If not provided, the main dsn will be used.) [$PARTITION_DSN]
-   --help, -h                  show help
+   --dsn string                      [$DSN]
+   --stream string                   [$STREAM]
+   --metadata-table string           [$METADATA_TABLE]
+   --start string                   (default: Start timestamp with RFC3339 format, default: current timestamp) [$START]
+   --end string                     (default: End timestamp with RFC3339 format default: indefinite) [$END]
+   --heartbeat-interval duration    (default: 3s) [$HEARTBEAT_INTERVAL]
+   --max-concurrent-partitions int  Maximum partitions this runner reads at once (0 = unlimited). Also sizes the gRPC channel pool for change stream reads. (default: 0) [$MAX_CONCURRENT_PARTITIONS]
+   --lease-ttl duration             How long a partition lease lasts without renewal (0 = default, 30s). A runner that dies is taken over after this long. (default: 0s) [$LEASE_TTL]
+   --park                           Park idle partitions and read them in short catch-up queries, so a runner can look after more partitions than it streams at once. --park=false streams every partition. [$PARK]
+   --park-interval duration         How long a parked partition waits between catch-up reads, and so the most extra delay for a change to an idle partition (0 = default, 10s). (default: 0s) [$PARK_INTERVAL]
+   --park-idle-after duration       How long a partition delivers only heartbeats before it is parked (0 = default, 1m). (default: 0s) [$PARK_IDLE_AFTER]
+   --fair-share                     Even out streaming partitions across runners: a runner holding more than its share hands its quietest partitions to others. --fair-share=false lets each runner keep what it claims. [$FAIR_SHARE]
+   --partition-dsn string           (default: Database dsn for use by the partition metadata table. If not provided, the main dsn will be used.) [$PARTITION_DSN]
+   --help, -h                       show help
 ```
+
+`--park` and `--fair-share` are on unless you pass `=false`. Without `--metadata-table`, partition metadata is kept in memory, so only one runner can read the stream and it starts from scratch on every restart.
 
 ---
 
@@ -143,7 +154,7 @@ This means:
 ### What does NOT drive partition count
 
 - **Write or read throughput on your tables.** Spanner splits based on data distribution across the key space and its internal load-balancing needs — not on the number of inserts, updates, or deletes per second flowing through a monitored table. A heavily-written table does not necessarily produce more partitions; a lightly-written table that holds a large key range may produce many. See: [Life of a Cloud Spanner read and write](https://docs.cloud.google.com/spanner/docs/whitepapers/life-of-reads-and-writes)
-- **The number of Screamer instances you run.** Scaling out Screamer runners increases your processing capacity, but does not influence how many partitions Spanner creates. Conversely, having more partitions than runners is safe — unassigned or interrupted partitions are picked up automatically via the built-in distributed locking mechanism.
+- **The number of Screamer instances you run.** Scaling out Screamer runners increases your processing capacity, but does not influence how many partitions Spanner creates. Conversely, having more partitions than runners is safe: partitions over a runner's limit wait their turn, idle ones are parked, and partitions whose runner stopped or died are picked up through their leases.
 
 ### Implications for capacity planning
 
@@ -151,7 +162,7 @@ Because partition count is externally driven and non-linear, you should design y
 
 - Do not hard-code an expected partition count.
 - Size your runner pool conservatively and rely on Screamer's automatic partition assignment to distribute work.
-- Monitor the `PartitionMetadata` table to observe the actual number of active partitions over time, and use this to inform scaling decisions rather than projecting from instance size alone.
+- Watch the [scaling metrics](#scaling-metrics) (`screamer.partitions.by_state`, `screamer.runners.desired`, `screamer.watermark.lag`) to see the actual number of partitions over time, and scale on those rather than projecting from instance size alone. [Autoscaling on Kubernetes](#autoscaling-on-kubernetes) shows how.
 
 ---
 
@@ -226,7 +237,9 @@ The trade-off: after a crash, a partition resumes from its last written watermar
 
 ### Scaling metrics
 
-Pass an OpenTelemetry `MeterProvider` with `WithMeterProvider` (the global provider is used otherwise). Screamer ships no exporter; use the OpenTelemetry Prometheus exporter or an OTLP exporter in your application.
+Pass an OpenTelemetry `MeterProvider` with `WithMeterProvider` (the global provider is used otherwise). Screamer ships no exporter; use the OpenTelemetry Prometheus exporter or an OTLP exporter in your application. The CLI doesn't set one up, so it reports no metrics; use the library if you need them.
+
+Every metric carries a `stream` attribute (the change stream name). Runner metrics also carry `runner_id`, and `screamer.partitions.by_state` carries `state`.
 
 | Metric | Scope | Meaning |
 | --- | --- | --- |
