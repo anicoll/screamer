@@ -328,13 +328,17 @@ sub := screamer.NewSubscriber(nil, "Stream", "runner-1", partitionstorage.NewInm
 
 Run it inside a `testing/synctest` bubble so simulated minutes take milliseconds. `checker.Report(cutoff)` returns missing, duplicate and out-of-order deliveries. See `pkg/simulator/baseline_test.go` for examples.
 
+## Soak testing on real Spanner
+
+The simulator models splits, merges and idle partitions, but only real Spanner shows real split behaviour, latencies and query plans. `cmd/soak` runs a soak on a real database: a writer that numbers every write to every key, runners that record each delivery before they acknowledge it, a checker that reports missing, duplicate and out-of-order deliveries, and a drill that keeps restarting, killing, freezing and scaling runners. See [docs/SOAK.md](docs/SOAK.md).
+
 ## Running the tests
 
 | Command | What it runs |
 | --- | --- |
 | `make test` | Everything. |
 | `make test-unit` | Unit tests in every package except the simulator. No Docker needed. |
-| `make test-integration` | `TestIntegrationTestSuite` and `TestSpannerTestSuite`, which start the Spanner emulator with testcontainers. Needs Docker. |
+| `make test-integration` | `TestIntegrationTestSuite`, `TestSpannerTestSuite` and `TestSoakTestSuite`, which start the Spanner emulator with testcontainers. Needs Docker. |
 | `make test-simulator` | `pkg/simulator`, including the baseline scale tests. |
 
 The three `test-*` targets each print a per-package table (pass, fail, skip, time, coverage) and the output of any failed test, and write `test-<group>.json` and `coverage-<group>.out`. CI runs them as separate jobs and posts the tables as one comment on the pull request.
