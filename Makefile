@@ -1,12 +1,13 @@
 .PHONY: build
 build:
 	go build -o .bin/screamer cmd/main.go
+	go build -o .bin/soak ./cmd/soak
 
 GO_TEST := go test -race -count=1 -covermode=atomic
 
 # Test suites that start the Spanner emulator with testcontainers (needs Docker).
-INTEGRATION_TESTS := ^(TestIntegrationTestSuite|TestSpannerTestSuite)$$
-INTEGRATION_PKGS := . ./pkg/partitionstorage
+INTEGRATION_TESTS := ^(TestIntegrationTestSuite|TestSpannerTestSuite|TestSoakTestSuite)$$
+INTEGRATION_PKGS := . ./pkg/partitionstorage ./internal/soak
 SIMULATOR_PKGS := ./pkg/simulator/...
 UNIT_PKGS = $(shell go list ./... | grep -v /pkg/simulator)
 

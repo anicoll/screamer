@@ -3,15 +3,50 @@ package partitionstorage
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
+// migrationAttempts is how many times RunMigrations tries before giving up
+// when another runner is migrating the same tables at the same time.
+const migrationAttempts = 5
+
 // RunMigrations creates or updates the necessary Spanner tables and indexes for partition and runner metadata management.
-// It is idempotent and can be safely called multiple times.
+// It is idempotent and can be safely called multiple times, including by
+// several runners starting at once.
 func (s *SpannerPartitionStorage) RunMigrations(ctx context.Context) error {
+	var err error
+	for attempt := 1; ; attempt++ {
+		if err = s.runMigrations(ctx); err == nil || attempt == migrationAttempts || !concurrentMigration(err) {
+			return err
+		}
+		// Another runner changed the schema between our read of it and our
+		// change: most often both added the same column, since Spanner has
+		// no ADD COLUMN IF NOT EXISTS. Read the schema again and retry.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+}
+
+// concurrentMigration says whether a schema change failed because another
+// schema change ran at the same time.
+func concurrentMigration(err error) bool {
+	switch status.Code(err) {
+	case codes.FailedPrecondition, codes.Aborted, codes.AlreadyExists:
+		return true
+	}
+	return false
+}
+
+func (s *SpannerPartitionStorage) runMigrations(ctx context.Context) error {
 	databaseAdminClient, err := database.NewDatabaseAdminClient(ctx)
 	if err != nil {
 		return err
